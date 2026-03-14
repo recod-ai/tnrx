@@ -81,15 +81,18 @@ do_slurm() {
     load_config
     local image=$(find_sif) || exit 1
 
-    if [ $# -eq 0 ]; then
-        echo "❌ Erro: Nenhum comando fornecido para o Slurm." >&2
-        exit 1
+    # Se não houver argumentos ou se o primeiro for 'bash', abre modo interativo
+    if [ $# -eq 0 ] || [ "$1" == "bash" ]; then
+        echo "🖥️  Sessão INTERATIVA no nó [$PARTITION]..."
+        srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
+             --mem="$MEM" --time="$TIME" --pty \
+             apptainer exec --nv "$image" /bin/bash
+    else
+        echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | Executando: $*"
+        srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
+             --mem="$MEM" --time="$TIME" \
+             apptainer exec --nv "$image" "$@"
     fi
-
-    echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | MEM:$MEM"
-    srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
-         --mem="$MEM" --time="$TIME" \
-         apptainer exec --nv "$image" "$@"
 }
 
 do_uvslurm() {
