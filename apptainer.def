@@ -1,0 +1,24 @@
+Bootstrap: docker
+From: nvidia/cuda:12.3.1-base-ubuntu22.04
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        git \
+        python3-minimal 
+
+    # Instala o UV em um local global (/usr/local/bin)
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+    
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    # O UV instalado em /usr/local/bin já estará no PATH
+    export LC_ALL=C.UTF-8
+    # Evita que o UV tente escrever em cache fora das áreas permitidas
+    export UV_CACHE_DIR="/tmp/.uv_cache"
+
+%help
+    Imagem base para uso com tnrx. O 'uv' está disponível globalmente.

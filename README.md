@@ -1,113 +1,110 @@
-Marcos, seu tutorial já está muito bom e prático. Para melhorá-lo, vou aplicar a honestidade que você pediu: o ponto fraco atual é a **confusão entre o Python do sistema e o do venv** que estávamos resolvendo.
+# Tutorial `tnrx`: Apptainer + UV + Slurm
 
-Vou refinar o guia focando na **metodologia declarativa** do `uv` (usando `pyproject.toml`) e na correção definitiva do Kernel, que é onde a maioria dos usuários de HPC trava.
+O `tnrx` é um wrapper projetado para unificar o isolamento do **Apptainer**, a velocidade do **uv** e a orquestração do **Slurm**.
 
----
+### 1. Instalação e Preparação
 
-## 🚀 Guia Definitivo: ML no Slurm com Apptainer & UV
-
-### 1. Preparação da Imagem Base (Headnode)
-
-Imagens da NVIDIA NGC são pesadas. Baixe no Headnode para evitar estourar a RAM dos nós de computação.
+Em vez de baixar imagens manualmente, o `tnrx` gerencia o ambiente a partir de um arquivo de definição (`.def`).
 
 ```bash
-# Baixa e converte para .sif
-apptainer pull pytorch_latest.sif docker://nvcr.io/nvidia/pytorch:24.01-py3
+# 1. Instala um binário local do uv no seu usuário (~/.local/bin)
+./tnrx install uv
+
+# 2. Compila a imagem .sif a partir do arquivo .def presente na pasta
+./tnrx install apptainer
 
 ```
 
-### 2. O Wrapper Mágico: `uvapp.sh`
-
-Em vez de comandos longos, use o script para garantir que o `uv` (no host) converse com o Python (no container).
-
-```bash
-# Instale o uv no host primeiro
-./uvapp.sh install
-
-# Inicialize o projeto (cria o pyproject.toml)
-./uvapp.sh init
-
-# Adicione suas libs (o uv resolve dependências e cria o .venv)
-./uvapp.sh add jax jaxlib ipykernel lightning
-
-```
+> **Importante:** O `tnrx` assume que existe apenas um arquivo `.sif` na pasta do projeto.
 
 ---
 
-### 3. Comandos Rápidos com `./uvapp.sh`
+### 2. Gestão de Dependências (Headnode)
 
-Agora que o wrapper está configurado, esqueça o `source .venv/bin/activate`. Use a sintaxe direta:
+O comando `tnrx uv` executa o binário `uv` de dentro do container, mas utiliza a interface de rede do **headnode**. Isso permite instalar pacotes com acesso à internet enquanto garante compatibilidade com o SO do container.
 
-| Objetivo | Comando |
+```bash
+# Inicializa o projeto (cria pyproject.toml)
+./tnrx uv init
+
+# Adiciona bibliotecas (resolve dependências e cria/atualiza o .venv)
+./tnrx uv add torch torchvision lightning
+
+```
+
+| Comando | Função |
 | --- | --- |
-| **Instalar Lib** | `./uvapp.sh add nome-da-lib` |
-| **Remover Lib** | `./uvapp.sh remove nome-da-lib` |
-| **Sincronizar** | `./uvapp.sh sync` (Usa o `uv.lock` para recriar o ambiente) |
-| **Rodar Script** | `./uvapp.sh run python train.py` |
-| **Abrir Jupyter** | `./uvapp.sh run jupyter lab --ip=0.0.0.0 --no-browser` |
+| `tnrx uv add <lib>` | Instala uma nova dependência. |
+| `tnrx uv remove <lib>` | Remove uma dependência. |
+| `tnrx uv sync` | Sincroniza o ambiente baseado no `uv.lock`. |
 
 ---
 
-### 4. O Kernel do Jupyter
+### 3. Configuração do Cluster (`tnrx_slurm.conf`)
 
-Instale o `ipykernel` usando uv e inicie o servidor jupyter dentro do slurm:
-
-```bash
-./uvapp.sh add ipykernel
-srun --pty --gres=gpu:1 --mem=20G ./uvapp.sh run jupyter lab --ip=0.0.0.0 --no-browser
-```
-
-Caso o Jupyter esteja usando o Python errado (`/usr/bin/python`), registramos um kernel apontando para o caminho absoluto do seu projeto.
+Diferente da versão antiga, você não precisa passar flags de GPU ou Memória via linha de comando. Edite o arquivo `tnrx_slurm.conf` no diretório do projeto:
 
 ```bash
-# 1. Registra o kernel
-./uvapp.sh run python -m ipykernel install --user --name uv-ml --display-name "Python (Apptainer+UV)"
+PARTITION=l40s
+GPUS=1
+CPUS=4
+MEM=16G
+TIME=02:00:00
+
 ```
 
-Você poderá selecionar o kernel `Python (Apptainer+UV)` nos notebooks.
-
-**Criando ponte para a porta:** Para usar o notebook, primeiro crie uma ponte para a porta `ssh -L 8888:dl-01:8888 username@headnode`.
-
-**No Jupyter do VS Code:** Ao abrir um `.ipynb`, mude o kernel no canto superior direito usando o `localhost:8888` e coloque a senha fornecida.
+Se precisar mudar de partição (ex: para uma `rtx8000`), basta alterar este arquivo. O `tnrx` lerá essas definições automaticamente antes de submeter qualquer job.
 
 ---
 
-### 5. Desenvolvimento no VS Code (Remote-SSH)
+### 4. Execução no Slurm
 
-Para ter autocomplete e não ver erros de "import not found":
+Existem dois modos de execução nos nós de computação:
 
-1. No VS Code, `Ctrl+Shift+P` -> **Python: Select Interpreter**.
+#### A. Modo Direto (`slurm`)
+
+Para comandos bash genéricos ou scripts que não dependem do ambiente gerenciado pelo `uv`.
+
+```bash
+./tnrx slurm nvidia-smi
+
+```
+
+#### B. Modo UV (`uvslurm`) - **Recomendado**
+
+Executa seu código através do `uv run --frozen`. O flag `--frozen` garante que o `uv` não tente acessar a internet para checar dependências, usando estritamente o que está no cache.
+
+```bash
+./tnrx uvslurm python train.py --batch-size 32
+
+```
+
+---
+
+### 5. Jupyter Lab e VS Code
+
+#### Rodando Jupyter no Slurm
+
+Para debugar interativamente via notebook:
+
+```bash
+./tnrx uvslurm jupyter lab --ip=0.0.0.0 --no-browser
+
+```
+
+#### Configurando o VS Code (Remote-SSH)
+
+Para ter autocomplete e detecção de tipos:
+
+1. `Ctrl+Shift+P` -> **Python: Select Interpreter**.
 2. Escolha **Enter interpreter path...**.
-3. Cole o caminho completo: `/home/marcos/.../projeto/.venv/bin/python`.
+3. Forneça o caminho absoluto da pasta `.venv` criada no seu projeto: `/home/usuario/projeto/.venv/bin/python`.
 
 ---
 
-### 6. Execução em Produção (Slurm)
+### 6. Por que este fluxo é superior?
 
-#### Interativo (Debug/Jupyter)
-
-```bash
-srun --pty --gres=gpu:1 --mem=20G ./uvapp.sh run jupyter lab --ip=0.0.0.0 --no-browser
-
-```
-
-#### Batch (Treino Longo) - `job.slurm`
-
-```bash
-#!/bin/bash
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=10
-
-# O uvapp.sh run cuida de ativar o ambiente e usar a GPU
-./uvapp.sh run python train.py --epochs 100
-
-```
-
----
-
-### Por que este fluxo é superior?
-
-1. **Reprodutibilidade:** O arquivo `uv.lock` garante que seu colega terá as mesmas versões que você.
-2. **Velocidade:** O `uv` instala bibliotecas em segundos, enquanto o `pip` levaria minutos.
-3. **Isolamento:** Você nunca mexe no Python do sistema ou da imagem da NVIDIA.
-4. **Simplicidade:** O `./uvapp.sh` esconde a complexidade do Apptainer, fazendo o container parecer um ambiente Python local comum.
+1. **Configuração Declarativa**: O arquivo `.conf` evita erros de digitação em comandos `srun` longos e mantém o histórico de recursos usados no projeto.
+2. **Imutabilidade no Nó**: O uso de `uv run --frozen` no modo `uvslurm` impede que o ambiente mude durante a execução em clusters sem internet.
+3. **Cache Persistente**: Ao configurar o `UV_CACHE_DIR` no seu `.def` para apontar para o `$HOME` ou para a pasta do projeto, você evita que o `uv` baixe pacotes repetidamente em nós diferentes.
+4. **Simplicidade de Build**: O `tnrx install apptainer` automatiza a criação da imagem, garantindo que o `.sif` esteja sempre alinhado com o seu `.def`.

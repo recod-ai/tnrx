@@ -1,0 +1,124 @@
+#!/bin/bash
+
+# --- Configurações Fixas ---
+CONFIG_FILE="tnrx_slurm.conf"
+
+# --- Defaults (Caso o .conf esteja incompleto ou ausente) ---
+DEFAULT_PARTITION="l40s"
+DEFAULT_GPUS="1"
+DEFAULT_CPUS="2"
+DEFAULT_MEM="4G"
+DEFAULT_TIME="00:10:00"
+
+# --- Helpers ---
+
+load_config() {
+    # Carrega o arquivo se existir
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    fi
+    
+    # Garante que variáveis tenham valor (via default se necessário)
+    PARTITION=${PARTITION:-$DEFAULT_PARTITION}
+    GPUS=${GPUS:-$DEFAULT_GPUS}
+    CPUS=${CPUS:-$DEFAULT_CPUS}
+    MEM=${MEM:-$DEFAULT_MEM}
+    TIME=${TIME:-$DEFAULT_TIME}
+}
+
+find_sif() {
+    local sifs=( *.sif )
+    if [ ! -e "${sifs[0]}" ]; then
+        echo "❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install apptainer'." >&2
+        exit 1
+    elif [ ${#sifs[@]} -gt 1 ]; then
+        echo "❌ Erro: Mais de um .sif encontrado. Mantenha apenas um no diretório." >&2
+        exit 1
+    fi
+    echo "${sifs[0]}"
+}
+
+# --- Comandos Principais ---
+
+do_install() {
+    case $1 in
+        apptainer)
+            local def_file=$(ls *.def 2>/dev/null | head -n 1)
+            [ -z "$def_file" ] && { echo "❌ Erro: Nenhum .def encontrado."; exit 1; }
+            local sif_name="${def_file%.def}.sif"
+            echo "🛠️  Building Apptainer image: $sif_name..."
+            apptainer build "$sif_name" "$def_file"
+            ;;
+        uv)
+            echo "📦 Instalando UV em ~/.local/bin..."
+            curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="$HOME/.local/bin" sh
+            ;;
+        *)
+            echo "Uso: tnrx install {apptainer|uv}"
+            ;;
+    esac
+}
+
+do_uv() {
+    local cmd=$1
+    case $cmd in
+        add|remove|sync|init|lock|tree|export)
+            local image=$(find_sif) || exit 1
+            echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
+            apptainer exec --nv "$image" uv "$@"
+            ;;
+        run|python|pip)
+            echo "⚠️  Erro: Comandos de execução devem usar 'tnrx uvslurm'."
+            exit 1
+            ;;
+        *)
+            echo "Uso: tnrx uv {add|remove|sync|init|...}"
+            ;;
+    esac
+}
+
+do_slurm() {
+    load_config
+    local image=$(find_sif) || exit 1
+
+    if [ $# -eq 0 ]; then
+        echo "❌ Erro: Nenhum comando fornecido para o Slurm." >&2
+        exit 1
+    fi
+
+    echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | MEM:$MEM"
+    srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
+         --mem="$MEM" --time="$TIME" \
+         apptainer exec --nv "$image" "$@"
+}
+
+do_uvslurm() {
+    load_config
+    local image=$(find_sif) || exit 1
+
+    if [ $# -eq 0 ]; then
+        echo "❌ Erro: Nenhum comando/script fornecido para o UV+Slurm." >&2
+        exit 1
+    fi
+
+    echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $*"
+    srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
+         --mem="$MEM" --time="$TIME" \
+         apptainer exec --nv "$image" uv run --frozen "$@"
+}
+
+# --- Lógica de Entrada ---
+
+case $1 in
+    install) shift; do_install "$@" ;;
+    uv)      shift; do_uv "$@" ;;
+    slurm)   shift; do_slurm "$@" ;;
+    uvslurm) shift; do_uvslurm "$@" ;;
+    *)
+        echo "Uso: tnrx {install|uv|slurm|uvslurm}"
+        echo "  tnrx install apptainer      -> Cria o .sif"
+        echo "  tnrx uv add <pkg>           -> Gerencia dependências no Headnode"
+        echo "  tnrx slurm <cmd>            -> Roda comando genérico no Slurm"
+        echo "  tnrx uvslurm <script>       -> Roda script Python via UV no Slurm"
+        ;;
+esac
