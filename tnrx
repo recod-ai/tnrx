@@ -65,7 +65,7 @@ do_uv() {
         add|remove|sync|init|lock|tree|export)
             local image=$(find_sif) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
-            apptainer exec --nv "$image" uv "$@"
+            apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" uv "$@"
             ;;
         run|python|pip)
             echo "⚠️  Erro: Comandos de execução devem usar 'tnrx uvslurm'."
@@ -86,12 +86,12 @@ do_slurm() {
         echo "🖥️  Sessão INTERATIVA no nó [$PARTITION]..."
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" --pty \
-             apptainer exec --nv "$image" /bin/bash
+             apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" /bin/bash
     else
         echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | Executando: $*"
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" \
-             apptainer exec --nv "$image" "$@"
+             apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" "$@"
     fi
 }
 
@@ -107,7 +107,7 @@ do_uvslurm() {
     echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $*"
     srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
          --mem="$MEM" --time="$TIME" \
-         apptainer exec --nv "$image" uv run --frozen "$@"
+         apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" uv run --frozen "$@"
 }
 
 # --- Lógica de Entrada ---
