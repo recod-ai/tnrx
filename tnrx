@@ -110,6 +110,74 @@ do_uvslurm() {
          apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" uv run --frozen "$@"
 }
 
+# ... (outras funções do tnrx)
+
+do_huggingface() {
+    local type=$1   # model ou dataset
+    local repo=$2   # author/repo
+    
+    # 1. Validação de Argumentos
+    if [[ -z "$type" || -z "$repo" ]]; then
+        echo "❌ Uso: tnrx huggingface {model|dataset} author/repo"
+        exit 1
+    fi
+
+    # 2. Verificação de existência do Token
+    if [[ -z "$HF_TOKEN" ]]; then
+        echo "❌ Erro: Variável de ambiente HF_TOKEN não encontrada."
+        echo "Adicione ao seu ~/.bashrc: export HF_TOKEN='seu_token_aqui'"
+        echo "Ou adicione ao arquivo $CONFIG_FILE"
+        exit 1
+    fi
+
+    # 3. Teste rápido de validade do Token (API whoami)
+    echo "🔍 Validando HF_TOKEN..."
+    local check_token
+    check_token=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $HF_TOKEN" https://huggingface.co/api/whoami-v2)
+    
+    if [ "$check_token" != "200" ]; then
+        echo "❌ Erro: HF_TOKEN inválido ou expirado (HTTP $check_token)."
+        exit 1
+    fi
+    echo "✅ Token validado com sucesso."
+
+    local image=$(find_sif) || exit 1
+
+    # Nota: Removi o 'uv sync' para tornar o download mais direto, 
+    # partindo do princípio que o usuário já preparou o ambiente.
+    
+    echo "🌐 [HEADNODE] Iniciando download do Hugging Face..."
+    # Usamos APPTAINERENV_ para garantir que a env chegue intacta ao container
+    export APPTAINERENV_HF_TOKEN="$HF_TOKEN"
+    
+    apptainer exec --bind /hadatasets/:/hadatasets/ \
+                   --nv "$image" \
+                   uv run download_huggingface "$type" "$repo"
+}
+
+do_uninstall() {
+    echo "🗑️  Removendo links simbólicos do ambiente local..."
+    
+    # Lista de links criados em ~/.local/bin/
+    local links=("tnrx" "download_huggingface")
+    local bin_dir="$HOME/.local/bin"
+    local found=false
+
+    for link in "${links[@]}"; do
+        if [ -L "$bin_dir/$link" ]; then
+            rm "$bin_dir/$link"
+            echo "✅ Removido: $bin_dir/$link"
+            found=true
+        fi
+    done
+
+    if ! $found; then
+        echo "phi  Nenhum link simbólico do tnrx foi encontrado em $bin_dir."
+    else
+        echo "✨ Desinstalação concluída. Os arquivos originais permanecem intactos."
+    fi
+}
+
 # --- Lógica de Entrada ---
 
 case $1 in
@@ -117,11 +185,15 @@ case $1 in
     uv)      shift; do_uv "$@" ;;
     slurm)   shift; do_slurm "$@" ;;
     uvslurm) shift; do_uvslurm "$@" ;;
+    huggingface) shift; do_huggingface "$@" ;;
+    hf) shift; do_huggingface "$@" ;;
+    uninstall) shift; do_uninstall ;; 
     *)
-        echo "Uso: tnrx {install|uv|slurm|uvslurm}"
+        echo "Uso: tnrx {install|uninstall|uv|slurm|uvslurm|hf}"
         echo "  tnrx install apptainer      -> Cria o .sif"
         echo "  tnrx uv add <pkg>           -> Gerencia dependências no Headnode"
         echo "  tnrx slurm <cmd>            -> Roda comando genérico no Slurm"
         echo "  tnrx uvslurm <script>       -> Roda script Python via UV no Slurm"
+        echo "  tnrx hf model author/repo -> Baixa modelo do Hugging Face"
         ;;
 esac

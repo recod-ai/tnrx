@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+from huggingface_hub import snapshot_download
+
+# Base directory for the shared hub
+HUB_ROOT: str = "/hadatasets/huggingface_hub"
+
+def download_to_hub(repo_id: str, repo_type: str = "model") -> str:
+    """
+    Downloads a repository from Hugging Face to a centralized shared directory.
+    Uses exist_ok=True but avoids touching parent directories with no permission.
+    """
+    # Define subfolders: models/author/repo or datasets/author/repo
+    subfolder_path: str = os.path.join(f"{repo_type}s", repo_id)
+    target_dir: str = os.path.join(HUB_ROOT, subfolder_path)
+    
+    print(f"📥 Downloading {repo_type}: {repo_id}")
+    print(f"📍 Target: {target_dir}")
+    
+    # Validation: Ensure we are not trying to create the HUB_ROOT itself
+    if not os.path.exists(HUB_ROOT):
+        print(f"❌ Error: Base directory {HUB_ROOT} does not exist or is not mounted.")
+        exit(1)
+    
+    # Fix: Navigate to HUB_ROOT first and create subfolders from there
+    # This prevents os.makedirs from checking '/hadatasets'
+    current_dir: str = os.getcwd()
+    try:
+        os.chdir(HUB_ROOT)
+        # Create the relative path within HUB_ROOT
+        os.makedirs(subfolder_path, exist_ok=True)
+    finally:
+        os.chdir(current_dir)
+    
+    snapshot_download(
+        repo_id=repo_id,
+        repo_type=repo_type,
+        local_dir=target_dir,
+        local_dir_use_symlinks=False, 
+        token=os.getenv("HF_TOKEN")
+    )
+    return target_dir
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="HF Shared Hub Mirror")
+    parser.add_argument("type", choices=["model", "dataset"], help="Tipo do repo")
+    parser.add_argument("repo", help="ID do repositório (ex: google/siglip2...)")
+    
+    args = parser.parse_args()
+    download_to_hub(args.repo, args.type)

@@ -151,3 +151,66 @@ Para ter autocomplete e detecção de tipos:
 2. Escolha **Enter interpreter path...**.
 3. Forneça o caminho absoluto da pasta `.venv` criada no seu projeto: `/home/usuario/projeto/.venv/bin/python`.
 4. Se você estiver em um remote, o jupyter vai indicar o "link" interno como `http://dl-05:8888/lab?token=4312`
+
+## 6. Hugging Face Shared Hub (Central de Modelos/Datasets)
+
+O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado (`/hadatasets/huggingface_hub`). Isso economiza espaço no seu `/home` e evita downloads duplicados.
+
+### A. Preparação e Instalação do Comando
+
+Para que o `tnrx` consiga invocar o utilitário de download independentemente da pasta onde você está, siga estes passos para torná-lo um binário global:
+
+#### Crie link e  dê permissão: Transforme o script em um executável chamado apenas `download_huggingface` (sem o `.py`) dentro da sua pasta de binários local:
+```bash
+chmod +x download_huggingface
+ln -sf "$(pwd)/download_huggingface" ~/.local/bin/download_huggingface
+```
+
+
+
+### B. Configurando sua Autenticação
+
+Para baixar modelos (especialmente os privados ou com restrições), você deve fornecer seu Token do Hugging Face.
+
+1. Vá em **Hugging Face Settings -> Tokens** e crie um token de leitura.
+2. Adicione-o ao seu ambiente no Headnode (adicione esta linha no seu `~/.bashrc` para persistir):
+```bash
+export HF_TOKEN="hf_seu_token_aqui"
+
+```
+
+Obs: esse export irá "morrer" em cada sessão, então quando for usar de novo, se quiser manter fixo. Aplique a mudança: `source ~/.bashrc`.
+
+O `tnrx` detectará automaticamente esta variável e a repassará com segurança para dentro do container durante o download.
+
+### C. Baixando Modelos e Datasets
+
+Os downloads ocorrem obrigatoriamente no **Headnode**, pois os nós de computação não possuem acesso à internet.
+
+```bash
+# Baixar um modelo
+tnrx hf model google/siglip2-base-patch16-224
+
+# Baixar um dataset
+tnrx hf dataset jxie/flickr8k
+
+```
+
+| Comando | Descrição | Destino no Host |
+| --- | --- | --- |
+| `tnrx hf model <id>` | Baixa um modelo do HF. | `/hadatasets/huggingface_hub/models/` |
+| `tnrx hf dataset <id>` | Baixa um dataset do HF. | `/hadatasets/huggingface_hub/datasets/` |
+
+### D. Como usar no seu código
+
+Como o diretório `/hadatasets` é montado automaticamente pelo `tnrx` em todos os nós via `--bind`, você pode carregar os modelos diretamente apontando para o caminho absoluto. O `tnrx` cuida do mapeamento do volume para você:
+
+```python
+from transformers import AutoModel
+
+# O caminho segue a estrutura: /hadatasets/huggingface_hub/tipo/autor/repo
+model_path = "/hadatasets/huggingface_hub/models/google/siglip2-base-patch16-224"
+
+model = AutoModel.from_pretrained(model_path)
+
+```
