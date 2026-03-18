@@ -58,10 +58,9 @@ tnrx install singularity
 
 O comando `tnrx uv` executa o binário `uv` de dentro do container, mas utiliza a interface de rede do **headnode**. Isso permite instalar pacotes com acesso à internet enquanto garante compatibilidade com o SO do container.
 
-```bash
-# Inicializa o projeto (cria pyproject.toml)
-tnrx uv init
+Como já temos um ``pyproject.toml` inicial, não precisamos inicializar o repositório, mas sim podemos diretamente adicionar novas bibliotecas.
 
+```bash
 # Adiciona bibliotecas (resolve dependências e cria/atualiza o .venv)
 tnrx uv add torch torchvision lightning
 
@@ -69,6 +68,7 @@ tnrx uv add torch torchvision lightning
 
 | Comando | Função |
 | --- | --- |
+| `tnrx uv init` | Inicializa o projeto (cria pyproject.toml). |
 | `tnrx uv add <lib>` | Instala uma nova dependência. |
 | `tnrx uv remove <lib>` | Remove uma dependência. |
 | `tnrx uv sync` | Sincroniza o ambiente baseado no `uv.lock`. |
@@ -80,7 +80,7 @@ tnrx uv add torch torchvision lightning
 Você não precisa passar flags de GPU ou Memória via linha de comando. Edite o arquivo `tnrx_slurm.conf` no diretório do projeto:
 
 ```bash
-PARTITION=l40s
+PARTITION=h200
 GPUS=1
 CPUS=4
 MEM=16G
@@ -88,7 +88,7 @@ TIME=02:00:00
 
 ```
 
-Se precisar mudar de partição (ex: para uma `rtx8000`), basta alterar este arquivo. O `tnrx` lerá essas definições automaticamente antes de submeter qualquer job.
+Se precisar mudar de partição (ex: para a `l40s`), basta alterar este arquivo. O `tnrx` lerá essas definições automaticamente antes de submeter qualquer job.
 
 ---
 
@@ -138,7 +138,7 @@ tnrx uvslurm jupyter lab
 
 1. Para conectar seu notebook ao servidor rodando na GPU:
 
-    * Abra seu arquivo `.ipynb`.
+    * Abra seu arquivo `deep_check.ipynb`.
 
     * Clique em **Select Kernel** (canto superior direito) -> **Existing Jupyter Server**.
 
@@ -156,7 +156,7 @@ Para que o VS Code reconheça as bibliotecas do ambiente enquanto você escreve 
 
 1. `Ctrl+Shift+P` -> Python: Select Interpreter.
 
-2. O VS Code deve detectar automaticamente o ambiente em `./.venv/bin/python`. Caso não apareça, escolha Enter interpreter path... e forneça o caminho absoluto.
+2. O VS Code deve detectar automaticamente o ambiente em `./.venv/bin/python`. Caso não apareça, escolha **Enter interpreter path...** e forneça o caminho absoluto.
 
 ---
 
@@ -196,7 +196,7 @@ Os downloads ocorrem obrigatoriamente no **Headnode**, pois os nós de computaç
 
 ```bash
 # Baixar um modelo
-tnrx hf model google/siglip2-base-patch16-224
+tnrx hf model google/siglip1-base-patch16-224
 
 # Baixar um dataset
 tnrx hf dataset jxie/flickr8k
