@@ -1,8 +1,8 @@
-# Tutorial `tnrx`: Apptainer + UV + Slurm
+# Tutorial `tnrx`: Singularity + UV + Slurm no Abaporu
 
-O `tnrx` é um wrapper projetado para unificar o isolamento do **Apptainer**, a velocidade do **uv** e a orquestração do **Slurm**.
+O `tnrx` é um wrapper projetado para unificar o isolamento do **Singularity**, a velocidade do **uv** e a orquestração do **Slurm**.
 
-## 0. 🚀 Instalando o `tnrx` no seu usuário
+## 🚀 Instalando o `tnrx` no seu usuário
 
 Como você já possui a pasta `~/.local/bin` no seu `PATH`, basta transformar o script em um comando global.
 
@@ -15,7 +15,6 @@ Navegue até a pasta onde o arquivo `tnrx` está e execute:
 ```bash
 chmod +x tnrx
 ln -sf "$(pwd)/tnrx" ~/.local/bin/tnrx
-
 ```
 
 #### 2. Teste
@@ -29,8 +28,8 @@ tnrx slurm nvidia-smi
 Saída esperada (antes de outras configurações)
 
 ```
-❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install apptainer'.
-⚙️  Slurm: l40s | GPU:1 | MEM:16G
+❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install singularity'.
+⚙️  Slurm: h200 | GPU:1 | MEM:16G
 ```
 
 #### 🧠 Comportamento do Comando Global
@@ -44,18 +43,14 @@ Isso permite que você mude de projeto no terminal e o `tnrx` se comporte de aco
 
 ## 1. Instalação e Preparação
 
-Em vez de baixar imagens manualmente, o `tnrx` gerencia o ambiente a partir de um arquivo de definição (`.def`).
+Neste ambiente, o gerenciamento é feito utilizando uma imagem SIF pronta, otimizada para performance em GPUs. O `tnrx` facilita a configuração do binário do `uv` e a busca da imagem necessária.
+
+O projeto utiliza o arquivo `tnrx_config.yaml` para definir a imagem base. Para preparar o ambiente:
 
 ```bash
-# 1. Instala um binário local do uv no seu usuário (~/.local/bin)
 tnrx install uv
-
-# 2. Compila a imagem .sif a partir do arquivo .def presente na pasta
-tnrx install apptainer
-
+tnrx install singularity
 ```
-
-> **Importante:** O `tnrx` assume que existe apenas um arquivo `.sif` na pasta do projeto.
 
 ---
 
@@ -82,7 +77,7 @@ tnrx uv add torch torchvision lightning
 
 ## 3. Configuração do Cluster (`tnrx_slurm.conf`)
 
-Diferente da versão antiga, você não precisa passar flags de GPU ou Memória via linha de comando. Edite o arquivo `tnrx_slurm.conf` no diretório do projeto:
+Você não precisa passar flags de GPU ou Memória via linha de comando. Edite o arquivo `tnrx_slurm.conf` no diretório do projeto:
 
 ```bash
 PARTITION=l40s
@@ -107,7 +102,6 @@ Para comandos bash genéricos ou scripts que não dependem do ambiente gerenciad
 
 ```bash
 tnrx slurm nvidia-smi
-
 ```
 
 #### B. Modo UV (`uvslurm`) - **Recomendado**
@@ -115,8 +109,7 @@ tnrx slurm nvidia-smi
 Executa seu código através do `uv run --frozen`. O flag `--frozen` garante que o `uv` não tente acessar a internet para checar dependências, usando estritamente o que está no cache.
 
 ```bash
-tnrx uvslurm python train.py --batch-size 32
-
+tnrx uvslurm python deep_check.py
 ```
 
 ---
@@ -125,32 +118,45 @@ tnrx uvslurm python train.py --batch-size 32
 
 #### Rodando Jupyter no Slurm
 
-Para debugar interativamente via notebook:
+O comando `tnrx` automatiza a alocação de GPU, o isolamento via Singularity e a configuração do ambiente Python.
+
+⚠️ Importante: Antes de rodar o Jupyter pela primeira vez, você deve instalar o pacote ipykernel no seu ambiente virtual através do container. Sem ele, o Jupyter não conseguirá conectar ao seu código:
 
 ```bash
-tnrx uvslurm jupyter lab --ip=0.0.0.0 --no-browser
+tnrx uv add ipykernel
 ```
 
-Caso queira já colocar uma senha:
+ Para iniciar o servidor no cluster:
 
 ```bash
-tnrx uvslurm jupyter lab --ip=0.0.0.0 --no-browser --IdentityProvider.token='sua_senha_aqui'
+tnrx uvslurm jupyter lab
 ```
 
-Mas para acessar dentro do seu computador é necessário fazer uma ponte ssh:
+**Nota**: O script detecta o comando jupyter e injeta automaticamente as flags --ip=0.0.0.0, --no-browser e as permissões de acesso, além de criar um kernel para o ambiente em `.venv`, cujo nome será `Python (TNRX-nome_da_pasta)`
 
-```
-ssh -L 8888:dl-01:8888 username@headnode
-```
 
-#### Configurando o VS Code (Remote-SSH)
+#### Acessando via VS Code (Remote-SSH)
 
-Para ter autocomplete e detecção de tipos:
+1. Para conectar seu notebook ao servidor rodando na GPU:
 
-1. `Ctrl+Shift+P` -> **Python: Select Interpreter**.
-2. Escolha **Enter interpreter path...**.
-3. Forneça o caminho absoluto da pasta `.venv` criada no seu projeto: `/home/usuario/projeto/.venv/bin/python`.
-4. Se você estiver em um remote, o jupyter vai indicar o "link" interno como `http://dl-05:8888/lab?token=4312`
+    - Abra seu arquivo `.ipynb`.
+
+    - Clique em **Select Kernel** (canto superior direito) -> **Existing Jupyter Server**.
+
+    - Cole a URL completa com o token gerado no terminal, substituindo o `hostname` pelo **nome do nó** (verificar com o comando `squeue`) (ex: `http://gpu03:8888/lab?token=...`).
+
+2. Selecionar o Kernel do Projeto:
+
+    - Após conectar ao servidor, clique novamente no Kernel e escolha o kernel específico do projeto: `Python (TNRX-nome_da_pasta)`.
+
+    - Este kernel aponta diretamente para o seu `.venv`, garantindo que o import torch funcione com a versão correta.
+
+#### Autocomplete e Tipagem
+Para que o VS Code reconheça as bibliotecas do ambiente enquanto você escreve código:
+
+1. `Ctrl+Shift+P` -> Python: Select Interpreter.
+
+2. O VS Code deve detectar automaticamente o ambiente em `./.venv/bin/python`. Caso não apareça, escolha Enter interpreter path... e forneça o caminho absoluto.
 
 ## 6. Hugging Face Shared Hub (Central de Modelos/Datasets)
 

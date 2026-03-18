@@ -29,7 +29,7 @@ load_config() {
 find_sif() {
     local sifs=( *.sif )
     if [ ! -e "${sifs[0]}" ]; then
-        echo "❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install apptainer'." >&2
+        echo "❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install singularity'." >&2
         exit 1
     elif [ ${#sifs[@]} -gt 1 ]; then
         echo "❌ Erro: Mais de um .sif encontrado. Mantenha apenas um no diretório." >&2
@@ -40,24 +40,51 @@ find_sif() {
 
 # --- Comandos Principais ---
 
+get_config() {
+    local key=$1
+    grep "$key:" tnrx_config.yaml | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
 do_install() {
     case $1 in
-        apptainer)
-            local def_file=$(ls *.def 2>/dev/null | head -n 1)
-            [ -z "$def_file" ] && { echo "❌ Erro: Nenhum .def encontrado."; exit 1; }
-            local sif_name="${def_file%.def}.sif"
-            echo "🛠️  Building Apptainer image: $sif_name..."
-            apptainer build "$sif_name" "$def_file"
-            ;;
         uv)
             echo "📦 Instalando UV em ~/.local/bin..."
             curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="$HOME/.local/bin" sh
+            echo "✅ uv instalado."
             ;;
+            
+        singularity)
+            # Lê as configurações do arquivo YAML
+            local sif_name=$(get_config "name")
+            local docker_url=$(get_config "source")
+
+            if [ -z "$sif_name" ] || [ -z "$docker_url" ]; then
+                echo "❌ Erro: Verifique se tnrx_config.yaml contém 'name' e 'source'."
+                exit 1
+            fi
+
+            # Verifica se a imagem já existe para não baixar de novo à toa
+            if [ -f "$sif_name" ]; then
+                echo "ℹ️  A imagem $sif_name já existe localmente."
+                read -p "Deseja baixar novamente? (y/N) " resp
+                [[ "$resp" != "y" ]] && return
+            fi
+
+            echo "📥 Baixando imagem: $docker_url"
+            echo "💾 Destino: $sif_name"
+            
+            # O comando 'pull' funciona em clusters sem fakeroot
+            singularity pull "$sif_name" "$docker_url"
+            
+            echo "✅ Instalação concluída."
+            ;;
+            
         *)
-            echo "Uso: tnrx install {apptainer|uv}"
+            echo "Uso: ./tnrx install {uv|singularity}"
             ;;
     esac
 }
+
 
 do_uv() {
     local cmd=$1
@@ -65,7 +92,7 @@ do_uv() {
         add|remove|sync|init|lock|tree|export)
             local image=$(find_sif) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
-            apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" uv "$@"
+            singularity exec --bind /data/:/data/ "$image" $HOME/.local/bin/uv "$@"
             ;;
         run|python|pip)
             echo "⚠️  Erro: Comandos de execução devem usar 'tnrx uvslurm'."
@@ -86,29 +113,58 @@ do_slurm() {
         echo "🖥️  Sessão INTERATIVA no nó [$PARTITION]..."
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" --pty \
-             apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" /bin/bash
+             singularity exec --bind /data/:/data/ --nv "$image" /bin/bash
     else
         echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | Executando: $*"
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" \
-             apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" "$@"
+             singularity exec --bind /data/:/data/ --nv "$image" "$@"
     fi
 }
+
 
 do_uvslurm() {
     load_config
     local image=$(find_sif) || exit 1
+    local UV_BIN="$HOME/.local/bin/uv"
 
     if [ $# -eq 0 ]; then
         echo "❌ Erro: Nenhum comando/script fornecido para o UV+Slurm." >&2
         exit 1
     fi
 
-    echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $*"
-    srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
-         --mem="$MEM" --time="$TIME" \
-         apptainer exec --bind /hadatasets/:/hadatasets/ --nv "$image" uv run --frozen "$@"
+    local EXTRA_FLAGS=""
+    # Se o comando contiver "jupyter", fazemos a configuração especial
+    if [[ "$*" == *"jupyter"* ]]; then
+        echo "🔧 [Jupyter Detectado] Configurando Kernel e Rede..."
+        
+        # 1. Registra o kernel para garantir que o Notebook veja o .venv
+        # Usamos o nome da pasta atual para o kernel ser único por projeto
+        echo local project_name=$(basename "$PWD")
+        local project_name=$(basename "$PWD")
+        echo singularity exec --bind /data/:/data/ --nv "$image" \
+            "$UV_BIN" run python -m ipykernel install --user \
+            --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
+        singularity exec --bind /data/:/data/ --nv "$image" \
+            "$UV_BIN" run python -m ipykernel install --user \
+            --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
+        
+        # 2. Adiciona as flags de IP e Origem para evitar o erro 403 Forbidden
+        EXTRA_FLAGS="--ip=0.0.0.0 --no-browser"
+    fi
+
+    echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $* $EXTRA_FLAGS"
+    
+    # Execução única do srun
+    srun --partition="$PARTITION" \
+         --gres=gpu:"$GPUS" \
+         --cpus-per-task="$CPUS" \
+         --mem="$MEM" \
+         --time="$TIME" \
+         singularity exec --bind /data/:/data/ --nv "$image" \
+         "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
 }
+
 
 # ... (outras funções do tnrx)
 
@@ -147,10 +203,10 @@ do_huggingface() {
     # partindo do princípio que o usuário já preparou o ambiente.
     
     echo "🌐 [HEADNODE] Iniciando download do Hugging Face..."
-    # Usamos APPTAINERENV_ para garantir que a env chegue intacta ao container
-    export APPTAINERENV_HF_TOKEN="$HF_TOKEN"
+    # Usamos singularityENV_ para garantir que a env chegue intacta ao container
+    export singularityENV_HF_TOKEN="$HF_TOKEN"
     
-    apptainer exec --bind /hadatasets/:/hadatasets/ \
+    singularity exec --bind /data/:/data/ \
                    --nv "$image" \
                    uv run download_huggingface "$type" "$repo"
 }
@@ -190,7 +246,7 @@ case $1 in
     uninstall) shift; do_uninstall ;; 
     *)
         echo "Uso: tnrx {install|uninstall|uv|slurm|uvslurm|hf}"
-        echo "  tnrx install apptainer      -> Cria o .sif"
+        echo "  tnrx install singularity      -> Cria o .sif"
         echo "  tnrx uv add <pkg>           -> Gerencia dependências no Headnode"
         echo "  tnrx slurm <cmd>            -> Roda comando genérico no Slurm"
         echo "  tnrx uvslurm <script>       -> Roda script Python via UV no Slurm"
