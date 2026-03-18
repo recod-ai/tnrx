@@ -27,7 +27,7 @@ tnrx slurm nvidia-smi
 
 Saída esperada (antes de outras configurações)
 
-```
+```bash
 ❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install singularity'.
 ⚙️  Slurm: h200 | GPU:1 | MEM:16G
 ```
