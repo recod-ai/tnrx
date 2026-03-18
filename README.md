@@ -23,7 +23,7 @@ Agora, entre em qualquer pasta de projeto que contenha um arquivo `.sif` e um `t
 
 ```bash
 tnrx slurm nvidia-smi
-``` 
+```
 
 Saída esperada (antes de outras configurações)
 
@@ -227,3 +227,81 @@ Para verificarmos que isso funciona:
 tnrx uv add transformers
 tnrx uvslurm python load_model.py /data/huggingface_hub/models/google/siglip2-base-patch16-224
 ```
+
+---
+
+## 7. Qualidade de Código e Pre-commit
+
+Para garantir que o código segue os padrões do projeto (Black, Isort) e que as dependências no `uv.lock` estão sempre sincronizadas com o `pyproject.toml`, utilizamos o **pre-commit**.
+
+#### Instalação
+
+Os hooks do pre-commit devem ser instalados no teu ambiente local (nó de login) para que o VS Code os execute instantaneamente ao realizar um commit:
+
+1. **Instale o pre-commit:**
+
+```bash
+tnrx uv add pre-commit
+```
+
+2. **Instale os hooks do Git**
+
+Como o versionamento (normalmente) é feito fora do container, a instalação deve também ser feita fora.
+
+```
+./.venv/bin/pre-commit install
+```
+
+**O que o Pre-commit atual (`.pre-commit-config.yaml`) faz?**
+
+Sempre que tentar realizar um git commit (seja via terminal ou interface do VS Code), os seguintes passos são validados:
+
+- `uv-lock-check`: Verifica se o ficheiro `uv.lock` está sincronizado com o `pyproject.toml`. Se adicionaste algo ao projeto e esqueceste de rodar o sync, o commit falhará.
+
+- `Black`: Formata automaticamente o teu código Python para seguir as normas PEP8.
+
+- `Isort`: Organiza os teus imports por ordem alfabética e por secções (standard, third-party, local).
+
+- `Checkers`: Valida a sintaxe de ficheiros YAML e TOML e impede que subas ficheiros de pesos/dados superiores a 10MB para o repositório.
+
+**Demonstração**
+
+1. Altere exclusivamente o `pyproject.toml`
+
+```bash
+echo 'scipy = ">=1.10.0"' >> pyproject.toml
+```
+
+2. Tente o commit
+
+Pode ser tanto na linha de comando quanto no vscode - deve funcionar em ambos
+
+```bash
+git add pyproject.toml
+git commit -m "teste"
+```
+
+O pre-commit vai interceptar o comando e produzir um output semelhante a este
+
+```bash
+Check if uv.lock is out of sync..........................................Failed
+- hook id: uv-lock-check
+- exit code: 1
+error: The lock file is out of sync with the project file. Run `uv lock` to update.
+```
+
+O Git **não** criou o commit. Mais especificamente, O `uv-lock-check` impediu que enviasse um projeto que "quebraria" na mão de outro colega porque havia inconsistência entre o `pyproject.toml` e o `uv.lock`.
+
+**Como Resolver Falhas**
+
+Se o pre-commit bloquear um commit:
+
+1. Erro de Sincronização (`uv.lock`): Significa que o teu ambiente mudou. Faça o comando de sincronização via tnrx:
+
+```Bash
+tnrx uvslurm uv sync
+```
+
+Depois, adicione o `uv.lock` alterado ao commit.
+
+2. Erros de Formatação: O Black/Isort corrigirá os ficheiros automaticamente. Basta adicionar as alterações (`git add .`) e tentar o commit novamente.
