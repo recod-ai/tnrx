@@ -8,7 +8,7 @@ Como você já possui a pasta `~/.local/bin` no seu `PATH`, basta transformar o 
 
 **Recomendo usar um link simbólico.** Dessa forma, você pode manter o código-fonte original em uma pasta de desenvolvimento (ou Git) e as alterações refletirão instantaneamente no comando global sem precisar copiar o arquivo novamente.
 
-#### 1. Torne o script executável e crie o link
+### 1. Torne o script executável e crie o link
 
 Navegue até a pasta onde o arquivo `tnrx` está e execute:
 
@@ -17,7 +17,7 @@ chmod +x tnrx
 ln -sf "$(pwd)/tnrx" ~/.local/bin/tnrx
 ```
 
-#### 2. Teste
+### 2. Teste
 
 Agora, entre em qualquer pasta de projeto que contenha um arquivo `.sif` e um `tnrx_slurm.conf` e digite:
 
@@ -96,7 +96,7 @@ Se precisar mudar de partição (ex: para uma `rtx8000`), basta alterar este arq
 
 Existem dois modos de execução nos nós de computação:
 
-#### A. Modo Direto (`slurm`)
+### A. Modo Direto (`slurm`)
 
 Para comandos bash genéricos ou scripts que não dependem do ambiente gerenciado pelo `uv`.
 
@@ -104,7 +104,7 @@ Para comandos bash genéricos ou scripts que não dependem do ambiente gerenciad
 tnrx slurm nvidia-smi
 ```
 
-#### B. Modo UV (`uvslurm`) - **Recomendado**
+### B. Modo UV (`uvslurm`) - **Recomendado**
 
 Executa seu código através do `uv run --frozen`. O flag `--frozen` garante que o `uv` não tente acessar a internet para checar dependências, usando estritamente o que está no cache.
 
@@ -116,7 +116,7 @@ tnrx uvslurm python deep_check.py
 
 ## 5. Jupyter Lab e VS Code
 
-#### Rodando Jupyter no Slurm
+### Rodando Jupyter no Slurm
 
 O comando `tnrx` automatiza a alocação de GPU, o isolamento via Singularity e a configuração do ambiente Python.
 
@@ -134,24 +134,24 @@ tnrx uvslurm jupyter lab
 
 **Nota**: O script detecta o comando jupyter e injeta automaticamente as flags --ip=0.0.0.0, --no-browser e as permissões de acesso, além de criar um kernel para o ambiente em `.venv`, cujo nome será `Python (TNRX-nome_da_pasta)`
 
-
-#### Acessando via VS Code (Remote-SSH)
+### Acessando via VS Code (Remote-SSH)
 
 1. Para conectar seu notebook ao servidor rodando na GPU:
 
-    - Abra seu arquivo `.ipynb`.
+    * Abra seu arquivo `.ipynb`.
 
-    - Clique em **Select Kernel** (canto superior direito) -> **Existing Jupyter Server**.
+    * Clique em **Select Kernel** (canto superior direito) -> **Existing Jupyter Server**.
 
-    - Cole a URL completa com o token gerado no terminal, substituindo o `hostname` pelo **nome do nó** (verificar com o comando `squeue`) (ex: `http://gpu03:8888/lab?token=...`).
+    * Cole a URL completa com o token gerado no terminal, substituindo o `hostname` pelo **nome do nó** (verificar com o comando `squeue`) (ex: `http://gpu03:8888/lab?token=...`).
 
 2. Selecionar o Kernel do Projeto:
 
-    - Após conectar ao servidor, clique novamente no Kernel e escolha o kernel específico do projeto: `Python (TNRX-nome_da_pasta)`.
+    * Após conectar ao servidor, clique novamente no Kernel e escolha o kernel específico do projeto: `Python (TNRX-nome_da_pasta)`.
 
-    - Este kernel aponta diretamente para o seu `.venv`, garantindo que o import torch funcione com a versão correta.
+    * Este kernel aponta diretamente para o seu `.venv`, garantindo que o import torch funcione com a versão correta.
 
-#### Autocomplete e Tipagem
+### Autocomplete e Tipagem
+
 Para que o VS Code reconheça as bibliotecas do ambiente enquanto você escreve código:
 
 1. `Ctrl+Shift+P` -> Python: Select Interpreter.
@@ -168,13 +168,12 @@ O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging 
 
 Para que o `tnrx` consiga invocar o utilitário de download independentemente da pasta onde você está, siga estes passos para torná-lo um binário global:
 
-#### Crie link e  dê permissão: Transforme o script em um executável chamado apenas `download_huggingface` (sem o `.py`) dentro da sua pasta de binários local:
+#### Crie link e  dê permissão: Transforme o script em um executável chamado apenas `download_huggingface` (sem o `.py`) dentro da sua pasta de binários local
+
 ```bash
 chmod +x download_huggingface
 ln -sf "$(pwd)/download_huggingface" ~/.local/bin/download_huggingface
 ```
-
-
 
 ### B. Configurando sua Autenticação
 
@@ -182,6 +181,7 @@ Para baixar modelos (especialmente os privados ou com restrições), você deve 
 
 1. Vá em **Hugging Face Settings -> Tokens** e crie um token de leitura.
 2. Adicione-o ao seu ambiente no Headnode (adicione esta linha no seu `~/.bashrc` para persistir):
+
 ```bash
 export HF_TOKEN="hf_seu_token_aqui"
 ```
@@ -234,7 +234,7 @@ tnrx uvslurm python load_model.py /data/huggingface_hub/models/google/siglip2-ba
 
 Para garantir que o código segue os padrões do projeto (Black, Isort) e que as dependências no `uv.lock` estão sempre sincronizadas com o `pyproject.toml`, utilizamos o **pre-commit**.
 
-#### Instalação
+### Instalação
 
 Os hooks do pre-commit devem ser instalados no teu ambiente local (nó de login) para que o VS Code os execute instantaneamente ao realizar um commit:
 
@@ -244,11 +244,11 @@ Os hooks do pre-commit devem ser instalados no teu ambiente local (nó de login)
 tnrx uv add pre-commit
 ```
 
-2. **Instale os hooks do Git**
+1. **Instale os hooks do Git**
 
 Como o versionamento (normalmente) é feito fora do container, a instalação deve também ser feita fora.
 
-```
+```bash
 ./.venv/bin/pre-commit install
 ```
 
@@ -256,15 +256,15 @@ Como o versionamento (normalmente) é feito fora do container, a instalação de
 
 Sempre que tentar realizar um git commit (seja via terminal ou interface do VS Code), os seguintes passos são validados:
 
-- `uv-lock-check`: Verifica se o ficheiro `uv.lock` está sincronizado com o `pyproject.toml`. Se adicionaste algo ao projeto e esqueceste de rodar o sync, o commit falhará.
+* `uv-lock-check`: Verifica se o ficheiro `uv.lock` está sincronizado com o `pyproject.toml`. Se adicionaste algo ao projeto e esqueceste de rodar o sync, o commit falhará.
 
-- `Black`: Formata automaticamente o teu código Python para seguir as normas PEP8.
+* `Black`: Formata automaticamente o teu código Python para seguir as normas PEP8.
 
-- `Isort`: Organiza os teus imports por ordem alfabética e por secções (standard, third-party, local).
+* `Isort`: Organiza os teus imports por ordem alfabética e por secções (standard, third-party, local).
 
-- `Checkers`: Valida a sintaxe de ficheiros YAML e TOML e impede que subas ficheiros de pesos/dados superiores a 10MB para o repositório.
+* `Checkers`: Valida a sintaxe de ficheiros YAML e TOML e impede que subas ficheiros de pesos/dados superiores a 10MB para o repositório.
 
-**Demonstração**
+### Demonstração
 
 1. Altere exclusivamente o `pyproject.toml`
 
@@ -272,7 +272,7 @@ Sempre que tentar realizar um git commit (seja via terminal ou interface do VS C
 echo 'scipy = ">=1.10.0"' >> pyproject.toml
 ```
 
-2. Tente o commit
+1. Tente o commit
 
 Pode ser tanto na linha de comando quanto no vscode - deve funcionar em ambos
 
@@ -292,7 +292,7 @@ error: The lock file is out of sync with the project file. Run `uv lock` to upda
 
 O Git **não** criou o commit. Mais especificamente, O `uv-lock-check` impediu que enviasse um projeto que "quebraria" na mão de outro colega porque havia inconsistência entre o `pyproject.toml` e o `uv.lock`.
 
-**Como Resolver Falhas**
+### Como Resolver Falhas
 
 Se o pre-commit bloquear um commit:
 
@@ -304,4 +304,4 @@ tnrx uvslurm uv sync
 
 Depois, adicione o `uv.lock` alterado ao commit.
 
-2. Erros de Formatação: O Black/Isort corrigirá os ficheiros automaticamente. Basta adicionar as alterações (`git add .`) e tentar o commit novamente.
+1. Erros de Formatação: O Black/Isort corrigirá os ficheiros automaticamente. Basta adicionar as alterações (`git add .`) e tentar o commit novamente.
