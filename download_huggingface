@@ -5,7 +5,7 @@ import argparse
 from huggingface_hub import snapshot_download
 
 # Base directory for the shared hub
-HUB_ROOT: str = "/hadatasets/huggingface_hub"
+HUB_ROOT: str = "/data/huggingface_hub"
 
 def download_to_hub(repo_id: str, repo_type: str = "model") -> str:
     """
@@ -25,7 +25,7 @@ def download_to_hub(repo_id: str, repo_type: str = "model") -> str:
         exit(1)
     
     # Fix: Navigate to HUB_ROOT first and create subfolders from there
-    # This prevents os.makedirs from checking '/hadatasets'
+    # This prevents os.makedirs from checking '/data'
     current_dir: str = os.getcwd()
     try:
         os.chdir(HUB_ROOT)

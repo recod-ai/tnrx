@@ -120,7 +120,7 @@ tnrx uvslurm python deep_check.py
 
 O comando `tnrx` automatiza a alocação de GPU, o isolamento via Singularity e a configuração do ambiente Python.
 
-⚠️ Importante: Antes de rodar o Jupyter pela primeira vez, você deve instalar o pacote ipykernel no seu ambiente virtual através do container. Sem ele, o Jupyter não conseguirá conectar ao seu código:
+⚠️ Importante: Antes de rodar o Jupyter pela primeira vez, você deve instalar o pacote `ipykernel` no seu ambiente virtual através do container. Sem ele, o Jupyter não conseguirá conectar ao seu código:
 
 ```bash
 tnrx uv add ipykernel
@@ -158,9 +158,11 @@ Para que o VS Code reconheça as bibliotecas do ambiente enquanto você escreve 
 
 2. O VS Code deve detectar automaticamente o ambiente em `./.venv/bin/python`. Caso não apareça, escolha Enter interpreter path... e forneça o caminho absoluto.
 
+---
+
 ## 6. Hugging Face Shared Hub (Central de Modelos/Datasets)
 
-O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado (`/hadatasets/huggingface_hub`). Isso economiza espaço no seu `/home` e evita downloads duplicados.
+O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado (`/data/huggingface_hub`). Isso economiza espaço no seu `/home` e evita downloads duplicados.
 
 ### A. Preparação e Instalação do Comando
 
@@ -182,7 +184,6 @@ Para baixar modelos (especialmente os privados ou com restrições), você deve 
 2. Adicione-o ao seu ambiente no Headnode (adicione esta linha no seu `~/.bashrc` para persistir):
 ```bash
 export HF_TOKEN="hf_seu_token_aqui"
-
 ```
 
 Obs: esse export irá "morrer" em cada sessão, então quando for usar de novo, se quiser manter fixo. Aplique a mudança: `source ~/.bashrc`.
@@ -199,24 +200,30 @@ tnrx hf model google/siglip2-base-patch16-224
 
 # Baixar um dataset
 tnrx hf dataset jxie/flickr8k
-
 ```
 
 | Comando | Descrição | Destino no Host |
 | --- | --- | --- |
-| `tnrx hf model <id>` | Baixa um modelo do HF. | `/hadatasets/huggingface_hub/models/` |
-| `tnrx hf dataset <id>` | Baixa um dataset do HF. | `/hadatasets/huggingface_hub/datasets/` |
+| `tnrx hf model <id>` | Baixa um modelo do HF. | `/data/huggingface_hub/models/` |
+| `tnrx hf dataset <id>` | Baixa um dataset do HF. | `/data/huggingface_hub/datasets/` |
 
 ### D. Como usar no seu código
 
-Como o diretório `/hadatasets` é montado automaticamente pelo `tnrx` em todos os nós via `--bind`, você pode carregar os modelos diretamente apontando para o caminho absoluto. O `tnrx` cuida do mapeamento do volume para você:
+Como o diretório `/data` é montado automaticamente pelo `tnrx` em todos os nós via `--bind`, você pode carregar os modelos diretamente apontando para o caminho absoluto. O `tnrx` cuida do mapeamento do volume para você:
 
 ```python
 from transformers import AutoModel
 
-# O caminho segue a estrutura: /hadatasets/huggingface_hub/tipo/autor/repo
-model_path = "/hadatasets/huggingface_hub/models/google/siglip2-base-patch16-224"
+# O caminho segue a estrutura: /data/huggingface_hub/tipo/autor/repo
+model_path = "/data/huggingface_hub/models/google/siglip2-base-patch16-224"
 
 model = AutoModel.from_pretrained(model_path)
 
+```
+
+Para verificarmos que isso funciona:
+
+```bash
+tnrx uv add transformers
+tnrx uvslurm python load_model.py /data/huggingface_hub/models/google/siglip2-base-patch16-224
 ```
