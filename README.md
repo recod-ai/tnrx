@@ -1,36 +1,35 @@
-# Tutorial `tnrx`: Apptainer + UV + Slurm
+# Tutorial `tnrx`: Singularity + UV + Slurm no Abaporu
 
-O `tnrx` é um wrapper projetado para unificar o isolamento do **Apptainer**, a velocidade do **uv** e a orquestração do **Slurm**.
+O `tnrx` é um wrapper projetado para unificar o isolamento do **Singularity**, a velocidade do **uv** e a orquestração do **Slurm**.
 
-## 0. 🚀 Instalando o `tnrx` no seu usuário
+## 🚀 Instalando o `tnrx` no seu usuário
 
 Como você já possui a pasta `~/.local/bin` no seu `PATH`, basta transformar o script em um comando global.
 
 **Recomendo usar um link simbólico.** Dessa forma, você pode manter o código-fonte original em uma pasta de desenvolvimento (ou Git) e as alterações refletirão instantaneamente no comando global sem precisar copiar o arquivo novamente.
 
-#### 1. Torne o script executável e crie o link
+### 1. Torne o script executável e crie o link
 
 Navegue até a pasta onde o arquivo `tnrx` está e execute:
 
 ```bash
 chmod +x tnrx
 ln -sf "$(pwd)/tnrx" ~/.local/bin/tnrx
-
 ```
 
-#### 2. Teste
+### 2. Teste
 
 Agora, entre em qualquer pasta de projeto que contenha um arquivo `.sif` e um `tnrx_slurm.conf` e digite:
 
 ```bash
 tnrx slurm nvidia-smi
-``` 
+```
 
 Saída esperada (antes de outras configurações)
 
-```
-❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install apptainer'.
-⚙️  Slurm: l40s | GPU:1 | MEM:16G
+```bash
+❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install singularity'.
+⚙️  Slurm: h200 | GPU:1 | MEM:16G
 ```
 
 #### 🧠 Comportamento do Comando Global
@@ -44,18 +43,14 @@ Isso permite que você mude de projeto no terminal e o `tnrx` se comporte de aco
 
 ## 1. Instalação e Preparação
 
-Em vez de baixar imagens manualmente, o `tnrx` gerencia o ambiente a partir de um arquivo de definição (`.def`).
+Neste ambiente, o gerenciamento é feito utilizando uma imagem SIF pronta, otimizada para performance em GPUs. O `tnrx` facilita a configuração do binário do `uv` e a busca da imagem necessária.
+
+O projeto utiliza o arquivo `tnrx_config.yaml` para definir a imagem base. Para preparar o ambiente:
 
 ```bash
-# 1. Instala um binário local do uv no seu usuário (~/.local/bin)
 tnrx install uv
-
-# 2. Compila a imagem .sif a partir do arquivo .def presente na pasta
-tnrx install apptainer
-
+tnrx install singularity
 ```
-
-> **Importante:** O `tnrx` assume que existe apenas um arquivo `.sif` na pasta do projeto.
 
 ---
 
@@ -63,10 +58,9 @@ tnrx install apptainer
 
 O comando `tnrx uv` executa o binário `uv` de dentro do container, mas utiliza a interface de rede do **headnode**. Isso permite instalar pacotes com acesso à internet enquanto garante compatibilidade com o SO do container.
 
-```bash
-# Inicializa o projeto (cria pyproject.toml)
-tnrx uv init
+Como já temos um ``pyproject.toml` inicial, não precisamos inicializar o repositório, mas sim podemos diretamente adicionar novas bibliotecas.
 
+```bash
 # Adiciona bibliotecas (resolve dependências e cria/atualiza o .venv)
 tnrx uv add torch torchvision lightning
 
@@ -74,6 +68,7 @@ tnrx uv add torch torchvision lightning
 
 | Comando | Função |
 | --- | --- |
+| `tnrx uv init` | Inicializa o projeto (cria pyproject.toml). |
 | `tnrx uv add <lib>` | Instala uma nova dependência. |
 | `tnrx uv remove <lib>` | Remove uma dependência. |
 | `tnrx uv sync` | Sincroniza o ambiente baseado no `uv.lock`. |
@@ -82,10 +77,10 @@ tnrx uv add torch torchvision lightning
 
 ## 3. Configuração do Cluster (`tnrx_slurm.conf`)
 
-Diferente da versão antiga, você não precisa passar flags de GPU ou Memória via linha de comando. Edite o arquivo `tnrx_slurm.conf` no diretório do projeto:
+Você não precisa passar flags de GPU ou Memória via linha de comando. Edite o arquivo `tnrx_slurm.conf` no diretório do projeto:
 
 ```bash
-PARTITION=l40s
+PARTITION=h200
 GPUS=1
 CPUS=4
 MEM=16G
@@ -93,7 +88,7 @@ TIME=02:00:00
 
 ```
 
-Se precisar mudar de partição (ex: para uma `rtx8000`), basta alterar este arquivo. O `tnrx` lerá essas definições automaticamente antes de submeter qualquer job.
+Se precisar mudar de partição (ex: para a `l40s`), basta alterar este arquivo. O `tnrx` lerá essas definições automaticamente antes de submeter qualquer job.
 
 ---
 
@@ -101,72 +96,84 @@ Se precisar mudar de partição (ex: para uma `rtx8000`), basta alterar este arq
 
 Existem dois modos de execução nos nós de computação:
 
-#### A. Modo Direto (`slurm`)
+### A. Modo Direto (`slurm`)
 
 Para comandos bash genéricos ou scripts que não dependem do ambiente gerenciado pelo `uv`.
 
 ```bash
 tnrx slurm nvidia-smi
-
 ```
 
-#### B. Modo UV (`uvslurm`) - **Recomendado**
+### B. Modo UV (`uvslurm`) - **Recomendado**
 
 Executa seu código através do `uv run --frozen`. O flag `--frozen` garante que o `uv` não tente acessar a internet para checar dependências, usando estritamente o que está no cache.
 
 ```bash
-tnrx uvslurm python train.py --batch-size 32
-
+tnrx uvslurm python deep_check.py
 ```
 
 ---
 
 ## 5. Jupyter Lab e VS Code
 
-#### Rodando Jupyter no Slurm
+### Rodando Jupyter no Slurm
 
-Para debugar interativamente via notebook:
+O comando `tnrx` automatiza a alocação de GPU, o isolamento via Singularity e a configuração do ambiente Python.
 
-```bash
-tnrx uvslurm jupyter lab --ip=0.0.0.0 --no-browser
-```
-
-Caso queira já colocar uma senha:
+⚠️ Importante: Antes de rodar o Jupyter pela primeira vez, você deve instalar o pacote `ipykernel` no seu ambiente virtual através do container. Sem ele, o Jupyter não conseguirá conectar ao seu código:
 
 ```bash
-tnrx uvslurm jupyter lab --ip=0.0.0.0 --no-browser --IdentityProvider.token='sua_senha_aqui'
+tnrx uv add ipykernel
 ```
 
-Mas para acessar dentro do seu computador é necessário fazer uma ponte ssh:
+ Para iniciar o servidor no cluster:
 
+```bash
+tnrx uvslurm jupyter lab
 ```
-ssh -L 8888:dl-01:8888 username@headnode
-```
 
-#### Configurando o VS Code (Remote-SSH)
+**Nota**: O script detecta o comando jupyter e injeta automaticamente as flags --ip=0.0.0.0, --no-browser e as permissões de acesso, além de criar um kernel para o ambiente em `.venv`, cujo nome será `Python (TNRX-nome_da_pasta)`
 
-Para ter autocomplete e detecção de tipos:
+### Acessando via VS Code (Remote-SSH)
 
-1. `Ctrl+Shift+P` -> **Python: Select Interpreter**.
-2. Escolha **Enter interpreter path...**.
-3. Forneça o caminho absoluto da pasta `.venv` criada no seu projeto: `/home/usuario/projeto/.venv/bin/python`.
-4. Se você estiver em um remote, o jupyter vai indicar o "link" interno como `http://dl-05:8888/lab?token=4312`
+1. Para conectar seu notebook ao servidor rodando na GPU:
+
+    * Abra seu arquivo `deep_check.ipynb`.
+
+    * Clique em **Select Kernel** (canto superior direito) -> **Existing Jupyter Server**.
+
+    * Cole a URL completa com o token gerado no terminal, substituindo o `hostname` pelo **nome do nó** (verificar com o comando `squeue`) (ex: `http://gpu03:8888/lab?token=...`).
+
+2. Selecionar o Kernel do Projeto:
+
+    * Após conectar ao servidor, clique novamente no Kernel e escolha o kernel específico do projeto: `Python (TNRX-nome_da_pasta)`.
+
+    * Este kernel aponta diretamente para o seu `.venv`, garantindo que o import torch funcione com a versão correta.
+
+### Autocomplete e Tipagem
+
+Para que o VS Code reconheça as bibliotecas do ambiente enquanto você escreve código:
+
+1. `Ctrl+Shift+P` -> Python: Select Interpreter.
+
+2. O VS Code deve detectar automaticamente o ambiente em `./.venv/bin/python`. Caso não apareça, escolha **Enter interpreter path...** e forneça o caminho absoluto.
+
+---
 
 ## 6. Hugging Face Shared Hub (Central de Modelos/Datasets)
 
-O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado (`/hadatasets/huggingface_hub`). Isso economiza espaço no seu `/home` e evita downloads duplicados.
+O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado (`/data/huggingface_hub`). Isso economiza espaço no seu `/home` e evita downloads duplicados.
 
 ### A. Preparação e Instalação do Comando
 
 Para que o `tnrx` consiga invocar o utilitário de download independentemente da pasta onde você está, siga estes passos para torná-lo um binário global:
 
-#### Crie link e  dê permissão: Transforme o script em um executável chamado apenas `download_huggingface` (sem o `.py`) dentro da sua pasta de binários local:
+#### Crie link e  dê permissão: Transforme o script em um executável chamado apenas `download_huggingface` (sem o `.py`) dentro da sua pasta de binários local
+
 ```bash
 chmod +x download_huggingface
 ln -sf "$(pwd)/download_huggingface" ~/.local/bin/download_huggingface
 ```
-
-
 
 ### B. Configurando sua Autenticação
 
@@ -174,9 +181,9 @@ Para baixar modelos (especialmente os privados ou com restrições), você deve 
 
 1. Vá em **Hugging Face Settings -> Tokens** e crie um token de leitura.
 2. Adicione-o ao seu ambiente no Headnode (adicione esta linha no seu `~/.bashrc` para persistir):
+
 ```bash
 export HF_TOKEN="hf_seu_token_aqui"
-
 ```
 
 Obs: esse export irá "morrer" em cada sessão, então quando for usar de novo, se quiser manter fixo. Aplique a mudança: `source ~/.bashrc`.
@@ -189,28 +196,112 @@ Os downloads ocorrem obrigatoriamente no **Headnode**, pois os nós de computaç
 
 ```bash
 # Baixar um modelo
-tnrx hf model google/siglip2-base-patch16-224
+tnrx hf model google/siglip1-base-patch16-224
 
 # Baixar um dataset
 tnrx hf dataset jxie/flickr8k
-
 ```
 
 | Comando | Descrição | Destino no Host |
 | --- | --- | --- |
-| `tnrx hf model <id>` | Baixa um modelo do HF. | `/hadatasets/huggingface_hub/models/` |
-| `tnrx hf dataset <id>` | Baixa um dataset do HF. | `/hadatasets/huggingface_hub/datasets/` |
+| `tnrx hf model <id>` | Baixa um modelo do HF. | `/data/huggingface_hub/models/` |
+| `tnrx hf dataset <id>` | Baixa um dataset do HF. | `/data/huggingface_hub/datasets/` |
 
 ### D. Como usar no seu código
 
-Como o diretório `/hadatasets` é montado automaticamente pelo `tnrx` em todos os nós via `--bind`, você pode carregar os modelos diretamente apontando para o caminho absoluto. O `tnrx` cuida do mapeamento do volume para você:
+Como o diretório `/data` é montado automaticamente pelo `tnrx` em todos os nós via `--bind`, você pode carregar os modelos diretamente apontando para o caminho absoluto. O `tnrx` cuida do mapeamento do volume para você:
 
 ```python
 from transformers import AutoModel
 
-# O caminho segue a estrutura: /hadatasets/huggingface_hub/tipo/autor/repo
-model_path = "/hadatasets/huggingface_hub/models/google/siglip2-base-patch16-224"
+# O caminho segue a estrutura: /data/huggingface_hub/tipo/autor/repo
+model_path = "/data/huggingface_hub/models/google/siglip2-base-patch16-224"
 
 model = AutoModel.from_pretrained(model_path)
 
 ```
+
+Para verificarmos que isso funciona:
+
+```bash
+tnrx uv add transformers
+tnrx uvslurm python load_model.py /data/huggingface_hub/models/google/siglip2-base-patch16-224
+```
+
+---
+
+## 7. Qualidade de Código e Pre-commit
+
+Para garantir que o código segue os padrões do projeto (Black, Isort) e que as dependências no `uv.lock` estão sempre sincronizadas com o `pyproject.toml`, utilizamos o **pre-commit**.
+
+### Instalação
+
+Os hooks do pre-commit devem ser instalados no teu ambiente local (nó de login) para que o VS Code os execute instantaneamente ao realizar um commit:
+
+1. **Instale o pre-commit:**
+
+```bash
+tnrx uv add pre-commit
+```
+
+1. **Instale os hooks do Git**
+
+Como o versionamento (normalmente) é feito fora do container, a instalação deve também ser feita fora.
+
+```bash
+./.venv/bin/pre-commit install
+```
+
+**O que o Pre-commit atual (`.pre-commit-config.yaml`) faz?**
+
+Sempre que tentar realizar um git commit (seja via terminal ou interface do VS Code), os seguintes passos são validados:
+
+* `uv-lock-check`: Verifica se o ficheiro `uv.lock` está sincronizado com o `pyproject.toml`. Se adicionaste algo ao projeto e esqueceste de rodar o sync, o commit falhará.
+
+* `Black`: Formata automaticamente o teu código Python para seguir as normas PEP8.
+
+* `Isort`: Organiza os teus imports por ordem alfabética e por secções (standard, third-party, local).
+
+* `Checkers`: Valida a sintaxe de ficheiros YAML e TOML e impede que subas ficheiros de pesos/dados superiores a 10MB para o repositório.
+
+### Demonstração
+
+1. Altere exclusivamente o `pyproject.toml`
+
+```bash
+echo 'scipy = ">=1.10.0"' >> pyproject.toml
+```
+
+1. Tente o commit
+
+Pode ser tanto na linha de comando quanto no vscode - deve funcionar em ambos
+
+```bash
+git add pyproject.toml
+git commit -m "teste"
+```
+
+O pre-commit vai interceptar o comando e produzir um output semelhante a este
+
+```bash
+Check if uv.lock is out of sync..........................................Failed
+- hook id: uv-lock-check
+- exit code: 1
+error: The lock file is out of sync with the project file. Run `uv lock` to update.
+```
+
+O Git **não** criou o commit. Mais especificamente, O `uv-lock-check` impediu que enviasse um projeto que "quebraria" na mão de outro colega porque havia inconsistência entre o `pyproject.toml` e o `uv.lock`.
+
+### Como Resolver Falhas
+
+Se o pre-commit bloquear um commit:
+
+1. Erro de Sincronização (`uv.lock`): Significa que o teu ambiente mudou. Faça o comando de sincronização via tnrx:
+
+```Bash
+tnrx uvslurm uv sync
+```
+
+Depois, adicione o `uv.lock` alterado ao commit.
+
+1. Erros de Formatação: O Black/Isort corrigirá os ficheiros automaticamente. Basta adicionar as alterações (`git add .`) e tentar o commit novamente.
