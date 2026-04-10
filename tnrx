@@ -3,22 +3,23 @@
 # --- Configurações Fixas ---
 CONFIG_FILE="tnrx_slurm.conf"
 
-# --- Defaults (Caso o .conf esteja incompleto ou ausente) ---
+# --- Defaults ---
 DEFAULT_PARTITION="l40s"
 DEFAULT_GPUS="1"
 DEFAULT_CPUS="2"
 DEFAULT_MEM="4G"
 DEFAULT_TIME="00:10:00"
 
+# --- Alteração 1: Defaults da Imagem Singularity ---
+DEFAULT_SIF_NAME="pytorch_devel.sif"
+DEFAULT_DOCKER_SOURCE="docker://nvcr.io/nvidia/pytorch:24.01-py3"
+
 # --- Helpers ---
 
 load_config() {
-    # Carrega o arquivo se existir
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
     fi
-    
-    # Garante que variáveis tenham valor (via default se necessário)
     PARTITION=${PARTITION:-$DEFAULT_PARTITION}
     GPUS=${GPUS:-$DEFAULT_GPUS}
     CPUS=${CPUS:-$DEFAULT_CPUS}
@@ -40,11 +41,6 @@ find_sif() {
 
 # --- Comandos Principais ---
 
-get_config() {
-    local key=$1
-    grep "$key:" tnrx_config.yaml | sed -E 's/.*"([^"]+)".*/\1/'
-}
-
 do_install() {
     case $1 in
         uv)
@@ -52,18 +48,12 @@ do_install() {
             curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR="$HOME/.local/bin" sh
             echo "✅ uv instalado."
             ;;
-            
+
         singularity)
-            # Lê as configurações do arquivo YAML
-            local sif_name=$(get_config "name")
-            local docker_url=$(get_config "source")
+            # Alteração 1: Uso de parâmetros com fallback para defaults
+            local sif_name="${2:-$DEFAULT_SIF_NAME}"
+            local docker_url="${3:-$DEFAULT_DOCKER_SOURCE}"
 
-            if [ -z "$sif_name" ] || [ -z "$docker_url" ]; then
-                echo "❌ Erro: Verifique se tnrx_config.yaml contém 'name' e 'source'."
-                exit 1
-            fi
-
-            # Verifica se a imagem já existe para não baixar de novo à toa
             if [ -f "$sif_name" ]; then
                 echo "ℹ️  A imagem $sif_name já existe localmente."
                 read -p "Deseja baixar novamente? (y/N) " resp
@@ -72,13 +62,10 @@ do_install() {
 
             echo "📥 Baixando imagem: $docker_url"
             echo "💾 Destino: $sif_name"
-            
-            # O comando 'pull' funciona em clusters sem fakeroot
             singularity pull "$sif_name" "$docker_url"
-            
             echo "✅ Instalação concluída."
             ;;
-            
+
         *)
             echo "Uso: ./tnrx install {uv|singularity}"
             ;;
@@ -137,7 +124,7 @@ do_uvslurm() {
     # Se o comando contiver "jupyter", fazemos a configuração especial
     if [[ "$*" == *"jupyter"* ]]; then
         echo "🔧 [Jupyter Detectado] Configurando Kernel e Rede..."
-        
+
         # 1. Registra o kernel para garantir que o Notebook veja o .venv
         # Usamos o nome da pasta atual para o kernel ser único por projeto
         echo local project_name=$(basename "$PWD")
@@ -148,13 +135,13 @@ do_uvslurm() {
         singularity exec --bind /data/:/data/ --nv "$image" \
             "$UV_BIN" run python -m ipykernel install --user \
             --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
-        
+
         # 2. Adiciona as flags de IP e Origem para evitar o erro 403 Forbidden
         EXTRA_FLAGS="--ip=0.0.0.0 --no-browser"
     fi
 
     echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $* $EXTRA_FLAGS"
-    
+
     # Execução única do srun
     srun --partition="$PARTITION" \
          --gres=gpu:"$GPUS" \
@@ -171,7 +158,7 @@ do_uvslurm() {
 do_huggingface() {
     local type=$1   # model ou dataset
     local repo=$2   # author/repo
-    
+
     # 1. Validação de Argumentos
     if [[ -z "$type" || -z "$repo" ]]; then
         echo "❌ Uso: tnrx huggingface {model|dataset} author/repo"
@@ -190,7 +177,7 @@ do_huggingface() {
     echo "🔍 Validando HF_TOKEN..."
     local check_token
     check_token=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $HF_TOKEN" https://huggingface.co/api/whoami-v2)
-    
+
     if [ "$check_token" != "200" ]; then
         echo "❌ Erro: HF_TOKEN inválido ou expirado (HTTP $check_token)."
         exit 1
@@ -199,13 +186,13 @@ do_huggingface() {
 
     local image=$(find_sif) || exit 1
 
-    # Nota: Removi o 'uv sync' para tornar o download mais direto, 
+    # Nota: Removi o 'uv sync' para tornar o download mais direto,
     # partindo do princípio que o usuário já preparou o ambiente.
-    
+
     echo "🌐 [HEADNODE] Iniciando download do Hugging Face..."
     # Usamos singularityENV_ para garantir que a env chegue intacta ao container
     export singularityENV_HF_TOKEN="$HF_TOKEN"
-    
+
     echo singularity exec --bind /data/:/data/ \
                    "$image" \
                    $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
@@ -216,7 +203,7 @@ do_huggingface() {
 
 do_uninstall() {
     echo "🗑️  Removendo links simbólicos do ambiente local..."
-    
+
     # Lista de links criados em ~/.local/bin/
     local links=("tnrx" "download_huggingface")
     local bin_dir="$HOME/.local/bin"
@@ -241,7 +228,7 @@ do_uninstall() {
 
 do_uninstall() {
     echo "🗑️  Removendo links simbólicos do ambiente local..."
-    
+
     # Lista de links criados em ~/.local/bin/
     local links=("tnrx" "download_huggingface")
     local bin_dir="$HOME/.local/bin"
@@ -269,9 +256,8 @@ case $1 in
     uv)      shift; do_uv "$@" ;;
     slurm)   shift; do_slurm "$@" ;;
     uvslurm) shift; do_uvslurm "$@" ;;
-    huggingface) shift; do_huggingface "$@" ;;
-    hf) shift; do_huggingface "$@" ;;
-    uninstall) shift; do_uninstall ;; 
+    huggingface|hf) shift; do_huggingface "$@" ;;
+    uninstall) shift; do_uninstall ;;
     *)
         echo "Uso: tnrx {install|uninstall|uv|slurm|uvslurm|hf}"
         echo "  tnrx install singularity      -> Cria o .sif"
