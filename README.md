@@ -92,7 +92,33 @@ Se precisar mudar de partição (ex: para a `l40s`), basta alterar este arquivo.
 
 ---
 
-## 4. Execução no Slurm
+## 4. Variáveis de Ambiente Customizadas (`.tnrx_env`)
+
+Caso precise alterar ou adicionar variáveis de ambiente dentro do container (ex: configurar Proxy, mudar o cache do NLTK ou ajustar certificados SSL), você pode criar um arquivo chamado `.tnrx_env` na raiz do seu projeto.
+
+O tnrx carregará esse arquivo automaticamente e injetará as variáveis no container.
+
+### Como usar
+
+Crie o arquivo `.tnrx_env` e defina as variáveis no formato `CHAVE=VALOR`:
+
+```Bash
+# Exemplo de conteúdo do .tnrx_env
+SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+REQUESTS_CA_BUNDLE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+NLTK_DATA=/data/nltk_data
+DEBUG_MODE=true
+```
+
+### Comportamentos Específicos:
+
+* **Anular uma variável**: Se você quiser que uma variável seja lida como vazia pelo Python (""), basta deixá-la sem valor: `MINHA_VAR=`.
+
+* **Persistência**: O arquivo é opcional. Se ele não existir, o tnrx seguirá as configurações padrão do sistema.
+
+* **Segurança**: Por padrão, o `.tnrx_env` está no `.gitignore`, já que ele pode conter chaves de API ou tokens sensíveis.
+
+## 5. Execução no Slurm
 
 Existem dois modos de execução nos nós de computação:
 
@@ -114,7 +140,7 @@ tnrx uvslurm python deep_check.py
 
 ---
 
-## 5. Jupyter Lab e VS Code
+## 6. Jupyter Lab e VS Code
 
 ### Rodando Jupyter no Slurm
 
@@ -160,7 +186,7 @@ Para que o VS Code reconheça as bibliotecas do ambiente enquanto você escreve 
 
 ---
 
-## 6. Hugging Face Shared Hub (Central de Modelos/Datasets)
+## 7. Hugging Face Shared Hub (Central de Modelos/Datasets)
 
 O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado (`/data/huggingface_hub`). Isso economiza espaço no seu `/home` e evita downloads duplicados.
 
@@ -230,7 +256,7 @@ tnrx uvslurm python load_model.py /data/huggingface_hub/models/google/siglip2-ba
 
 ---
 
-## 7. Qualidade de Código e Pre-commit
+## 8. Qualidade de Código e Pre-commit
 
 Para garantir que o código segue os padrões do projeto (Black, Isort) e que as dependências no `uv.lock` estão sempre sincronizadas com o `pyproject.toml`, utilizamos o **pre-commit**.
 
@@ -296,7 +322,7 @@ O Git **não** criou o commit. Mais especificamente, O `uv-lock-check` impediu q
 
 Se o pre-commit bloquear um commit:
 
-1. Erro de Sincronização (`uv.lock`): Significa que o teu ambiente mudou. Faça o comando de sincronização via tnrx:
+* Erro de Sincronização (`uv.lock`): Significa que o teu ambiente mudou. Faça o comando de sincronização via tnrx:
 
 ```Bash
 tnrx uvslurm uv sync
@@ -304,4 +330,4 @@ tnrx uvslurm uv sync
 
 Depois, adicione o `uv.lock` alterado ao commit.
 
-1. Erros de Formatação: O Black/Isort corrigirá os ficheiros automaticamente. Basta adicionar as alterações (`git add .`) e tentar o commit novamente.
+* Erros de Formatação: O Black/Isort corrigirá os ficheiros automaticamente. Basta adicionar as alterações (`git add .`) e tentar o commit novamente.
