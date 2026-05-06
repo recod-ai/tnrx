@@ -1,4 +1,0 @@
-# Configurações do Projeto TNRX
-image:
-  name: "pytorch_devel.sif"
-  source: "docker://nvcr.io/nvidia/pytorch:24.01-py3"

@@ -3,22 +3,23 @@
 # --- Configurações Fixas ---
 CONFIG_FILE="tnrx_slurm.conf"
 
-# --- Defaults (Caso o .conf esteja incompleto ou ausente) ---
+# --- Defaults ---
 DEFAULT_PARTITION="l40s"
 DEFAULT_GPUS="1"
 DEFAULT_CPUS="2"
 DEFAULT_MEM="4G"
 DEFAULT_TIME="00:10:00"
 
+# --- Alteração 1: Defaults da Imagem Singularity ---
+DEFAULT_SIF_NAME="pytorch_devel.sif"
+DEFAULT_DOCKER_SOURCE="docker://nvcr.io/nvidia/pytorch:24.01-py3"
+
 # --- Helpers ---
 
 load_config() {
-    # Carrega o arquivo se existir
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
     fi
-
-    # Garante que variáveis tenham valor (via default se necessário)
     PARTITION=${PARTITION:-$DEFAULT_PARTITION}
     GPUS=${GPUS:-$DEFAULT_GPUS}
     CPUS=${CPUS:-$DEFAULT_CPUS}
@@ -60,11 +61,6 @@ load_env_vars() {
 
 # --- Comandos Principais ---
 
-get_config() {
-    local key=$1
-    grep "$key:" tnrx_config.yaml | sed -E 's/.*"([^"]+)".*/\1/'
-}
-
 do_install() {
     case $1 in
         uv)
@@ -74,16 +70,10 @@ do_install() {
             ;;
 
         singularity)
-            # Lê as configurações do arquivo YAML
-            local sif_name=$(get_config "name")
-            local docker_url=$(get_config "source")
+            # Alteração 1: Uso de parâmetros com fallback para defaults
+            local sif_name="${2:-$DEFAULT_SIF_NAME}"
+            local docker_url="${3:-$DEFAULT_DOCKER_SOURCE}"
 
-            if [ -z "$sif_name" ] || [ -z "$docker_url" ]; then
-                echo "❌ Erro: Verifique se tnrx_config.yaml contém 'name' e 'source'."
-                exit 1
-            fi
-
-            # Verifica se a imagem já existe para não baixar de novo à toa
             if [ -f "$sif_name" ]; then
                 echo "ℹ️  A imagem $sif_name já existe localmente."
                 read -p "Deseja baixar novamente? (y/N) " resp
@@ -92,10 +82,7 @@ do_install() {
 
             echo "📥 Baixando imagem: $docker_url"
             echo "💾 Destino: $sif_name"
-
-            # O comando 'pull' funciona em clusters sem fakeroot
             singularity pull "$sif_name" "$docker_url"
-
             echo "✅ Instalação concluída."
             ;;
 
@@ -237,7 +224,7 @@ do_huggingface() {
     # Usamos singularityENV_ para garantir que a env chegue intacta ao container
     export singularityENV_HF_TOKEN="$HF_TOKEN"
 
-    echo singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ \
+    echo singularity exec --bind /data/:/data/ \
                    "$image" \
                    $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
     singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ \
@@ -300,8 +287,7 @@ case $1 in
     uv)      shift; do_uv "$@" ;;
     slurm)   shift; do_slurm "$@" ;;
     uvslurm) shift; do_uvslurm "$@" ;;
-    huggingface) shift; do_huggingface "$@" ;;
-    hf) shift; do_huggingface "$@" ;;
+    huggingface|hf) shift; do_huggingface "$@" ;;
     uninstall) shift; do_uninstall ;;
     *)
         echo "Uso: tnrx {install|uninstall|uv|slurm|uvslurm|hf}"
