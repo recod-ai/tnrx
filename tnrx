@@ -10,7 +10,6 @@ DEFAULT_CPUS="2"
 DEFAULT_MEM="4G"
 DEFAULT_TIME="00:10:00"
 
-# --- Alteração 1: Defaults da Imagem Singularity ---
 DEFAULT_SIF_NAME="pytorch_devel.sif"
 DEFAULT_DOCKER_SOURCE="docker://nvcr.io/nvidia/pytorch:24.01-py3"
 
@@ -285,8 +284,6 @@ do_uninstall() {
         echo "✨ Desinstalação concluída. Os arquivos originais permanecem intactos."
     fi
 }
-
-# --- Lógica de Entrada ---
 
 do_uninstall() {
     echo "🗑️  Removendo links simbólicos do ambiente local..."
