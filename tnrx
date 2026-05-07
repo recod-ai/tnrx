@@ -27,6 +27,29 @@ load_config() {
     TIME=${TIME:-$DEFAULT_TIME}
 }
 
+get_bind_path() {
+    local hostname=$(hostname)
+
+    if [ "$hostname" == "abaporu" ]; then
+        echo "/data/:/data/"
+    elif [ "$hostname" == "headnode" ]; then
+        echo "/hadatasets/:/hadatasets/"
+    else
+        return 1
+    fi
+}
+
+check_hostname() {
+    local hostname=$(hostname)
+
+    if [ "$hostname" != "abaporu" ] && [ "$hostname" != "headnode" ]; then
+        echo "⚠️  AVISO: Hostname '$hostname' não é reconhecido." >&2
+        echo "⚠️  Hostnames suportados: 'abaporu' ou 'headnode'." >&2
+        echo "❌ Execução abortada por segurança." >&2
+        exit 1
+    fi
+}
+
 find_sif() {
     local sifs=( *.sif )
     if [ ! -e "${sifs[0]}" ]; then
@@ -97,10 +120,12 @@ do_uv() {
     local cmd=$1
     case $cmd in
         add|remove|sync|init|lock|tree|export)
+            check_hostname
             load_env_vars
             local image=$(find_sif) || exit 1
+            local bind_path=$(get_bind_path) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
-            singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ "$image" $HOME/.local/bin/uv "$@"
+            singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" "$image" $HOME/.local/bin/uv "$@"
             ;;
         run|python|pip)
             echo "⚠️  Erro: Comandos de execução devem usar 'tnrx uvslurm'."
@@ -113,29 +138,33 @@ do_uv() {
 }
 
 do_slurm() {
+    check_hostname
     load_env_vars
     load_config
     local image=$(find_sif) || exit 1
+    local bind_path=$(get_bind_path) || exit 1
 
     # Se não houver argumentos ou se o primeiro for 'bash', abre modo interativo
     if [ $# -eq 0 ] || [ "$1" == "bash" ]; then
         echo "🖥️  Sessão INTERATIVA no nó [$PARTITION]..."
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" --pty \
-             singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ --nv "$image" /bin/bash
+             singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" /bin/bash
     else
         echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | Executando: $*"
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" \
-             singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ --nv "$image" "$@"
+             singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" "$@"
     fi
 }
 
 
 do_uvslurm() {
+    check_hostname
     load_env_vars
     load_config
     local image=$(find_sif) || exit 1
+    local bind_path=$(get_bind_path) || exit 1
     local UV_BIN="$HOME/.local/bin/uv"
 
     if [ $# -eq 0 ]; then
@@ -152,10 +181,10 @@ do_uvslurm() {
         # Usamos o nome da pasta atual para o kernel ser único por projeto
         echo local project_name=$(basename "$PWD")
         local project_name=$(basename "$PWD")
-        echo singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ --nv "$image" \
+        echo singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
             "$UV_BIN" run python -m ipykernel install --user \
             --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
-        singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ --nv "$image" \
+        singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
             "$UV_BIN" run python -m ipykernel install --user \
             --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
 
@@ -171,14 +200,14 @@ do_uvslurm() {
          --cpus-per-task="$CPUS" \
          --mem="$MEM" \
          --time="$TIME" \
-         singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ --nv "$image" \
+         singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
          "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
     srun --partition="$PARTITION" \
          --gres=gpu:"$GPUS" \
          --cpus-per-task="$CPUS" \
          --mem="$MEM" \
          --time="$TIME" \
-         singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ --nv "$image" \
+         singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
          "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
 }
 
@@ -186,9 +215,11 @@ do_uvslurm() {
 # ... (outras funções do tnrx)
 
 do_huggingface() {
+    check_hostname
     load_env_vars
     local type=$1   # model ou dataset
     local repo=$2   # author/repo
+    local bind_path=$(get_bind_path) || exit 1
 
     # 1. Validação de Argumentos
     if [[ -z "$type" || -z "$repo" ]]; then
@@ -224,10 +255,10 @@ do_huggingface() {
     # Usamos singularityENV_ para garantir que a env chegue intacta ao container
     export singularityENV_HF_TOKEN="$HF_TOKEN"
 
-    echo singularity exec --bind /data/:/data/ \
+    echo singularity exec --bind "$bind_path" \
                    "$image" \
                    $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
-    singularity exec $SINGULARITY_ENV_FLAGS --bind /data/:/data/ \
+    singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" \
                    "$image" \
                    $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
 }
