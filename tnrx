@@ -62,23 +62,44 @@ find_sif() {
 }
 
 load_env_vars() {
-    # Carrega variáveis de ambiente do arquivo .tnrx_env e prepara flags para singularity
-    SINGULARITY_ENV_FLAGS=""
+    # Carrega variáveis de ambiente do arquivo .tnrx_env e as exporta como
+    # SINGULARITYENV_* para que o Singularity as injete no container.
+    ENV_VAR_KEYS=()
     if [ -f ".tnrx_env" ]; then
         # Lê o arquivo e processa cada linha
         mapfile -t env_lines < ".tnrx_env"
         for line in "${env_lines[@]}"; do
             # Ignora linhas vazias e comentários
-            [[ -z "$line" || "$line" =~ ^# ]] && continue
-            # Separa chave e valor
-            IFS='=' read -r key value <<< "$line"
-            # Remove espaços em branco nas extremidades
-            key=$(echo "$key" | xargs)
-            value=$(echo "$value" | xargs)
-            # Constrói flags para passar ao singularity exec
-            SINGULARITY_ENV_FLAGS="$SINGULARITY_ENV_FLAGS --env $key=$value"
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            # Ignora linhas sem "="
+            [[ "$line" != *"="* ]] && continue
+
+            local key="${line%%=*}"
+            local value="${line#*=}"
+
+            # Remove espaços em branco nas extremidades sem usar xargs
+            # (xargs reinterpreta o valor como argumentos de shell, o que
+            # pode corromper tokens contendo aspas, barras ou glob).
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+
+            [[ -z "$key" ]] && continue
+
+            export "SINGULARITYENV_${key}=${value}"
+            ENV_VAR_KEYS+=("$key")
         done
     fi
+}
+
+unset_env_vars() {
+    # Remove do ambiente do processo as variáveis carregadas por load_env_vars,
+    # evitando que segredos permaneçam expostos além do necessário.
+    local key
+    for key in "${ENV_VAR_KEYS[@]}"; do
+        unset "SINGULARITYENV_${key}"
+    done
 }
 
 # --- Comandos Principais ---
@@ -124,7 +145,8 @@ do_uv() {
             local image=$(find_sif) || exit 1
             local bind_path=$(get_bind_path) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
-            singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" "$image" $HOME/.local/bin/uv "$@"
+            singularity exec --bind "$bind_path" "$image" $HOME/.local/bin/uv "$@"
+            unset_env_vars
             ;;
         run|python|pip)
             echo "⚠️  Erro: Comandos de execução devem usar 'tnrx uvslurm'."
@@ -148,13 +170,14 @@ do_slurm() {
         echo "🖥️  Sessão INTERATIVA no nó [$PARTITION]..."
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" --pty \
-             singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" /bin/bash
+             singularity exec --bind "$bind_path" --nv "$image" /bin/bash
     else
         echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | Executando: $*"
         srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" \
-             singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" "$@"
+             singularity exec --bind "$bind_path" --nv "$image" "$@"
     fi
+    unset_env_vars
 }
 
 
@@ -180,10 +203,10 @@ do_uvslurm() {
         # Usamos o nome da pasta atual para o kernel ser único por projeto
         echo local project_name=$(basename "$PWD")
         local project_name=$(basename "$PWD")
-        echo singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
+        echo singularity exec --bind "$bind_path" --nv "$image" \
             "$UV_BIN" run python -m ipykernel install --user \
             --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
-        singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
+        singularity exec --bind "$bind_path" --nv "$image" \
             "$UV_BIN" run python -m ipykernel install --user \
             --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
 
@@ -193,21 +216,21 @@ do_uvslurm() {
 
     echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $* $EXTRA_FLAGS"
 
-    # Execução única do srun
     echo srun --partition="$PARTITION" \
          --gres=gpu:"$GPUS" \
          --cpus-per-task="$CPUS" \
          --mem="$MEM" \
          --time="$TIME" \
-         singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
+         singularity exec --bind "$bind_path" --nv "$image" \
          "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
     srun --partition="$PARTITION" \
          --gres=gpu:"$GPUS" \
          --cpus-per-task="$CPUS" \
          --mem="$MEM" \
          --time="$TIME" \
-         singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" --nv "$image" \
+         singularity exec --bind "$bind_path" --nv "$image" \
          "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
+    unset_env_vars
 }
 
 
@@ -251,15 +274,18 @@ do_huggingface() {
     # partindo do princípio que o usuário já preparou o ambiente.
 
     echo "🌐 [HEADNODE] Iniciando download do Hugging Face..."
-    # Usamos singularityENV_ para garantir que a env chegue intacta ao container
-    export singularityENV_HF_TOKEN="$HF_TOKEN"
+    # Usamos SINGULARITYENV_ para garantir que a env chegue intacta ao container
+    # sem expor o token na linha de comando do singularity.
+    export SINGULARITYENV_HF_TOKEN="$HF_TOKEN"
 
     echo singularity exec --bind "$bind_path" \
                    "$image" \
                    $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
-    singularity exec $SINGULARITY_ENV_FLAGS --bind "$bind_path" \
+    singularity exec --bind "$bind_path" \
                    "$image" \
                    $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
+    unset SINGULARITYENV_HF_TOKEN
+    unset_env_vars
 }
 
 do_uninstall() {
