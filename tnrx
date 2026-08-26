@@ -13,7 +13,23 @@ DEFAULT_TIME="00:10:00"
 DEFAULT_SIF_NAME="pytorch_devel.sif"
 DEFAULT_DOCKER_SOURCE="docker://nvcr.io/nvidia/pytorch:24.01-py3"
 
+# --- Flag global de debug ---
+DEBUG=0
+
 # --- Helpers ---
+
+run_cmd() {
+    # Executa o comando recebido, imprimindo-o antes se DEBUG estiver ativo.
+    if [ "$DEBUG" -eq 1 ]; then
+        local part
+        printf '🔎 [DEBUG] Comando real: '
+        for part in "$@"; do
+            printf '%q ' "$part"
+        done
+        printf '\n'
+    fi
+    "$@"
+}
 
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
@@ -145,7 +161,7 @@ do_uv() {
             local image=$(find_sif) || exit 1
             local bind_path=$(get_bind_path) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
-            singularity exec --bind "$bind_path" "$image" $HOME/.local/bin/uv "$@"
+            run_cmd singularity exec --bind "$bind_path" "$image" "$HOME/.local/bin/uv" "$@"
             unset_env_vars
             ;;
         run|python|pip)
@@ -168,12 +184,12 @@ do_slurm() {
     # Se não houver argumentos ou se o primeiro for 'bash', abre modo interativo
     if [ $# -eq 0 ] || [ "$1" == "bash" ]; then
         echo "🖥️  Sessão INTERATIVA no nó [$PARTITION]..."
-        srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
+        run_cmd srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" --pty \
              singularity exec --bind "$bind_path" --nv "$image" /bin/bash
     else
         echo "⚙️  Slurm: $PARTITION | GPU:$GPUS | Executando: $*"
-        srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
+        run_cmd srun --partition="$PARTITION" --gres=gpu:"$GPUS" --cpus-per-task="$CPUS" \
              --mem="$MEM" --time="$TIME" \
              singularity exec --bind "$bind_path" --nv "$image" "$@"
     fi
@@ -201,12 +217,8 @@ do_uvslurm() {
 
         # 1. Registra o kernel para garantir que o Notebook veja o .venv
         # Usamos o nome da pasta atual para o kernel ser único por projeto
-        echo local project_name=$(basename "$PWD")
         local project_name=$(basename "$PWD")
-        echo singularity exec --bind "$bind_path" --nv "$image" \
-            "$UV_BIN" run python -m ipykernel install --user \
-            --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
-        singularity exec --bind "$bind_path" --nv "$image" \
+        run_cmd singularity exec --bind "$bind_path" --nv "$image" \
             "$UV_BIN" run python -m ipykernel install --user \
             --name="tnrx-$project_name" --display-name="Python (TNRX-$project_name)" > /dev/null 2>&1
 
@@ -216,14 +228,7 @@ do_uvslurm() {
 
     echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $* $EXTRA_FLAGS"
 
-    echo srun --partition="$PARTITION" \
-         --gres=gpu:"$GPUS" \
-         --cpus-per-task="$CPUS" \
-         --mem="$MEM" \
-         --time="$TIME" \
-         singularity exec --bind "$bind_path" --nv "$image" \
-         "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
-    srun --partition="$PARTITION" \
+    run_cmd srun --partition="$PARTITION" \
          --gres=gpu:"$GPUS" \
          --cpus-per-task="$CPUS" \
          --mem="$MEM" \
@@ -278,12 +283,9 @@ do_huggingface() {
     # sem expor o token na linha de comando do singularity.
     export SINGULARITYENV_HF_TOKEN="$HF_TOKEN"
 
-    echo singularity exec --bind "$bind_path" \
+    run_cmd singularity exec --bind "$bind_path" \
                    "$image" \
-                   $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
-    singularity exec --bind "$bind_path" \
-                   "$image" \
-                   $HOME/.local/bin/uv run $HOME/.local/bin/download_huggingface "$type" "$repo"
+                   "$HOME/.local/bin/uv" run "$HOME/.local/bin/download_huggingface" "$type" "$repo"
     unset SINGULARITYENV_HF_TOKEN
     unset_env_vars
 }
@@ -336,6 +338,12 @@ do_uninstall() {
 
 # --- Lógica de Entrada ---
 
+# Flag global de debug: pode vir antes do subcomando, em qualquer ordem/quantidade
+while [[ "$1" == "--debug" || "$1" == "-x" ]]; do
+    DEBUG=1
+    shift
+done
+
 case $1 in
     install) shift; do_install "$@" ;;
     uv)      shift; do_uv "$@" ;;
@@ -344,7 +352,8 @@ case $1 in
     huggingface|hf) shift; do_huggingface "$@" ;;
     uninstall) shift; do_uninstall ;;
     *)
-        echo "Uso: tnrx {install|uninstall|uv|slurm|uvslurm|hf}"
+        echo "Uso: tnrx [--debug|-x] {install|uninstall|uv|slurm|uvslurm|hf}"
+        echo "  --debug, -x                 -> Imprime o comando real (srun/singularity) antes de executá-lo"
         echo "  tnrx install singularity      -> Cria o .sif"
         echo "  tnrx uv add <pkg>           -> Gerencia dependências no Headnode"
         echo "  tnrx slurm <cmd>            -> Roda comando genérico no Slurm"

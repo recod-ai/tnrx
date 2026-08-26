@@ -16,6 +16,17 @@ repos:
         language: system
         files: ^pyproject.toml$
 
+      # Bateria de testes do wrapper tnrx (test_tnrx.sh)
+      # TNRX_SKIP_RUNTIME_TEST evita que o teste de runtime submeta um job
+      # real de Slurm/GPU a cada commit; rode `./test_tnrx.sh test_runtime_env_injection`
+      # manualmente para incluir esse teste.
+      - id: tnrx-test-suite
+        name: Run tnrx test suite
+        entry: env TNRX_SKIP_RUNTIME_TEST=1 bash test_tnrx.sh
+        language: system
+        always_run: true
+        pass_filenames: false
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
