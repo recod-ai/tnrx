@@ -4,8 +4,10 @@ import sys
 import argparse
 from huggingface_hub import snapshot_download
 
-# Base directory for the shared hub
-HUB_ROOT: str = "/data/huggingface_hub"
+# Base directory for the shared hub. Injetado pelo tnrx (via TNRX_HUB_ROOT)
+# a partir das particularidades do host em tnrx_hosts.conf; "/data/huggingface_hub"
+# é usado apenas se o script for chamado fora do wrapper tnrx.
+HUB_ROOT: str = os.getenv("TNRX_HUB_ROOT", "/data/huggingface_hub")
 
 def download_to_hub(repo_id: str, repo_type: str = "model") -> str:
     """

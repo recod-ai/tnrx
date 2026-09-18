@@ -45,12 +45,26 @@ Isso permite que você mude de projeto no terminal e o `tnrx` se comporte de aco
 
 Neste ambiente, o gerenciamento é feito utilizando uma imagem SIF pronta, otimizada para performance em GPUs. O `tnrx` facilita a configuração do binário do `uv` e a busca da imagem necessária.
 
-O projeto utiliza o arquivo `tnrx_config.yaml` para definir a imagem base. Para preparar o ambiente:
-
 ```bash
 tnrx install uv
 tnrx install singularity
 ```
+
+---
+
+## 1.1 Particularidades de cada servidor (`tnrx_hosts.conf`)
+
+Bind path, binário do runtime (`singularity`/`apptainer`) e o diretório compartilhado do Hugging Face Hub variam de servidor para servidor (ex.: Abaporu usa `/data/` e Headnode usa `/hadatasets/`). Em vez de ficarem hardcoded no script, essas particularidades ficam centralizadas em `tnrx_hosts.conf`, na mesma pasta do script `tnrx`:
+
+```
+# HOSTNAME | BIND_PATH | RUNTIME | HUB_ROOT
+abaporu|/data/:/data/|singularity|/data/huggingface_hub
+headnode|/hadatasets/:/hadatasets/|singularity|/hadatasets/huggingface_hub
+```
+
+O `tnrx` identifica o servidor atual via `hostname` e busca a linha correspondente nesse arquivo antes de qualquer comando que dependa do container. Hoje todos os servidores do grupo usam `singularity` (o Abaporu não tem `apptainer` instalado), mas o campo `RUNTIME` existe justamente para não travar o projeto nesse binário caso outro servidor use `apptainer` no futuro — basta adicionar uma linha nova, sem tocar no script.
+
+Se o hostname atual não estiver listado, o `tnrx` recusa a execução e mostra quais hosts estão configurados.
 
 ---
 

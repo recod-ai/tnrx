@@ -1,18 +1,22 @@
 repos:
   - repo: local
     hooks:
-      # Garante que o uv.lock esteja atualizado antes do commit
+      # Garante que o uv.lock esteja atualizado antes do commit.
+      # Reusa o próprio wrapper tnrx, que já resolve bind path/runtime/uv
+      # corretos a partir de tnrx_hosts.conf conforme o host do committer.
       - id: uv-lock-check
         name: Check if uv.lock is out of sync
-        entry: bash -c 'singularity exec --bind /data/:/data/ pytorch_devel.sif /home/users/jose.nascimento/.local/bin/uv lock --check'
+        entry: bash -c './tnrx uv lock --check'
         language: system
         always_run: true
         pass_filenames: false
 
-      # Opcional: Auto-formatar o pyproject.toml
+      # Opcional: Auto-formatar o pyproject.toml.
+      # Só lê/compila o pyproject.toml (sem tocar em /data ou /hadatasets),
+      # então dispensa o --bind por servidor.
       - id: uv-format-toml
         name: Format pyproject.toml
-        entry: bash -c 'singularity exec --bind /data/:/data/ pytorch_devel.sif /home/users/jose.nascimento/.local/bin/uv pip compile pyproject.toml -o /dev/null'
+        entry: bash -c 'singularity exec pytorch_devel.sif "$HOME/.local/bin/uv" pip compile pyproject.toml -o /dev/null'
         language: system
         files: ^pyproject.toml$
 

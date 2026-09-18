@@ -158,21 +158,47 @@ test_unknown_command() {
     cleanup_test_env
 }
 
+test_hosts_config_file() {
+    log_test "tnrx_hosts.conf exists and is well-formed"
+
+    local hosts_file="$SCRIPT_DIR/tnrx_hosts.conf"
+
+    if [[ ! -f "$hosts_file" ]]; then
+        fail_test "tnrx_hosts.conf not found next to tnrx"
+        return
+    fi
+    pass_test "tnrx_hosts.conf found"
+
+    local line host bind runtime hub_root bad_lines=0
+    while IFS='|' read -r host bind runtime hub_root; do
+        [[ -z "$host" || "$host" =~ ^[[:space:]]*# ]] && continue
+        if [[ -z "$bind" || -z "$hub_root" ]]; then
+            ((bad_lines++))
+        fi
+    done < "$hosts_file"
+
+    if [[ "$bad_lines" -eq 0 ]]; then
+        pass_test "All tnrx_hosts.conf entries have BIND_PATH and HUB_ROOT"
+    else
+        fail_test "tnrx_hosts.conf has malformed entries" "$bad_lines line(s) missing fields"
+    fi
+}
+
 test_hostname_validation() {
     log_test "Hostname validation feature"
     setup_test_env
 
-    # Create a minimal test that sources the functions
     local current_hostname=$(hostname)
+    local hosts_file="$SCRIPT_DIR/tnrx_hosts.conf"
 
-    # Test that hostname is recognized as either abaporu or headnode
-    # This test validates that the check_hostname function would work
-    if [[ "$current_hostname" == "abaporu" ]] || [[ "$current_hostname" == "headnode" ]]; then
-        pass_test "Running on recognized hostname" "Hostname: $current_hostname"
+    # Test that the current hostname has a matching entry in tnrx_hosts.conf
+    # (this is what check_hostname()/load_host_config() rely on)
+    if grep -q "^${current_hostname}|" "$hosts_file" 2>/dev/null; then
+        pass_test "Running on a hostname configured in tnrx_hosts.conf" "Hostname: $current_hostname"
     else
         # The test should still pass if we're on a different machine
         # but we should note that the feature will reject execution
-        pass_test "Hostname check logic available" "Note: Current hostname '$current_hostname' not abaporu/headnode"
+        pass_test "Hostname check logic available" "Note: Current hostname '$current_hostname' not in tnrx_hosts.conf"
     fi
 
     cleanup_test_env
@@ -321,14 +347,16 @@ test_bind_path_selection() {
     setup_test_env
 
     local current_hostname=$(hostname)
+    local hosts_file="$SCRIPT_DIR/tnrx_hosts.conf"
+    local entry bind
 
-    # Document the expected behavior
-    if [[ "$current_hostname" == "abaporu" ]]; then
-        pass_test "Hostname is abaporu" "Will use bind path: /data/:/data/"
-    elif [[ "$current_hostname" == "headnode" ]]; then
-        pass_test "Hostname is headnode" "Will use bind path: /hadatasets/:/hadatasets/"
+    entry=$(grep "^${current_hostname}|" "$hosts_file" 2>/dev/null)
+
+    if [[ -n "$entry" ]]; then
+        bind=$(echo "$entry" | cut -d'|' -f2)
+        pass_test "Hostname '$current_hostname' found in tnrx_hosts.conf" "Will use bind path: $bind"
     else
-        pass_test "Hostname check implemented" "Note: Not on recognized host, feature will reject execution"
+        pass_test "Hostname check implemented" "Note: Not on a host listed in tnrx_hosts.conf, feature will reject execution"
     fi
 
     cleanup_test_env
@@ -492,6 +520,7 @@ run_all_tests() {
     test_pyproject_toml_exists
 
     # Feature tests
+    test_hosts_config_file
     test_hostname_validation
     test_bind_path_selection
     test_uv_command_validation
