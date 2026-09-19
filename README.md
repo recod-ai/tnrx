@@ -2,6 +2,8 @@
 
 O `tnrx` é um wrapper projetado para unificar o isolamento do **Singularity**, a velocidade do **uv** e a orquestração do **Slurm**.
 
+> Editando código localmente (ex.: com o Claude Code) e só usando o servidor pra rodar? Veja [`tnrx-connect`](#12-trabalhando-localmente-com-claude-code-tnrx-connect), o companion do `tnrx` que roda no seu laptop.
+
 ## 🚀 Instalando o `tnrx` no seu usuário
 
 Como você já possui a pasta `~/.local/bin` no seu `PATH`, basta transformar o script em um comando global.
@@ -269,7 +271,9 @@ Para que o VS Code reconheça as bibliotecas do ambiente enquanto você escreve 
 
 ## 7. Hugging Face Shared Hub (Central de Modelos/Datasets)
 
-O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado (`/data/huggingface_hub`). Isso economiza espaço no seu `/home` e evita downloads duplicados.
+O `tnrx` possui um comando dedicado para espelhar modelos e datasets do Hugging Face em um diretório compartilhado. Isso economiza espaço no seu `/home` e evita downloads duplicados.
+
+O caminho desse diretório é definido pelo campo `HUB_ROOT` de [`tnrx_hosts.conf`](#11-particularidades-de-cada-servidor-tnrx_hostsconf) — **varia por servidor** (ex.: `/data/huggingface_hub` no Abaporu, `/hadatasets/huggingface_hub` no Headnode), então os exemplos abaixo usam o caminho do Abaporu; ajuste conforme o servidor em que você está.
 
 ### A. Preparação e Instalação do Comando
 
@@ -363,7 +367,11 @@ Como o versionamento (normalmente) é feito fora do container, a instalação de
 
 Sempre que tentar realizar um git commit (seja via terminal ou interface do VS Code), os seguintes passos são validados:
 
-* `uv-lock-check`: Verifica se o ficheiro `uv.lock` está sincronizado com o `pyproject.toml`. Se adicionaste algo ao projeto e esqueceste de rodar o sync, o commit falhará.
+* `uv-lock-check`: Verifica se o ficheiro `uv.lock` está sincronizado com o `pyproject.toml`, reaproveitando o próprio `./tnrx uv lock --check` (que já resolve bind path/runtime/uv certos a partir de `tnrx_hosts.conf`). Por isso, precisa rodar num host reconhecido nesse arquivo. Se adicionaste algo ao projeto e esqueceste de rodar o sync, o commit falhará.
+
+* `uv-format-toml` (opcional): compila o `pyproject.toml` com `uv pip compile` só pra validar que ele resolve, sem tocar em `/data`/`/hadatasets`.
+
+* `tnrx-test-suite` / `tnrx-connect-test-suite`: rodam `test_tnrx.sh`/`test_tnrx_connect.sh` a cada commit — cobrem parsing de config, mensagens de erro e a montagem dos comandos `singularity`/`rsync` (via `--debug`), sem depender de GPU/rede real.
 
 * `Black`: Formata automaticamente o teu código Python para seguir as normas PEP8.
 
