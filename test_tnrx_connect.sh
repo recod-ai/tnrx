@@ -215,7 +215,7 @@ test_init_creates_config() {
     log_test "init cria .tnrx_connect a partir das respostas"
     setup_test_env
 
-    printf "meuhost\n/home/user/meuprojeto\n" | "$TNRX_CONNECT" init > /dev/null 2>&1
+    printf "meuhost\nn\n/home/user/meuprojeto\n" | "$TNRX_CONNECT" init > /dev/null 2>&1
 
     if [[ -f .tnrx_connect ]]; then
         pass_test ".tnrx_connect created by init"

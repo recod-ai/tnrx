@@ -95,7 +95,7 @@ HOST=abaporu                                     # alvo SSH, resolvido a partir 
 REMOTE_PATH=/home/seu_usuario/projetos/seu_projeto   # caminho absoluto no servidor
 ```
 
-Ou gere interativamente com `tnrx-connect init`.
+Ou gere interativamente com `tnrx-connect init` — ele pergunta o `HOST` e oferece navegar pelas pastas do servidor (subir/descer diretórios por SSH) pra escolher o `REMOTE_PATH`, em vez de você ter que saber/colar o caminho absoluto de cabeça. A navegação autentica uma única vez no início (mesmo esquema de senha/2FA da seção abaixo) e reaproveita essa conexão pra cada passo de navegar entre pastas, não pede de novo a cada pasta.
 
 **Atenção:** `HOST` aqui **não é o mesmo campo** que `HOSTNAME` em `tnrx_hosts.conf`. Aquele é a saída de `hostname` *dentro* do servidor (usado pelo `tnrx` pra resolver bind path/runtime); `HOST` em `.tnrx_connect` precisa ser algo que o **seu laptop** consiga resolver via SSH — idealmente um alias do seu `~/.ssh/config`. Use o mesmo nome nos dois só por consistência mental; são arquivos independentes, em máquinas diferentes.
 
@@ -108,7 +108,7 @@ Ou gere interativamente com `tnrx-connect init`.
 | `tnrx-connect` | Sincroniza uma vez e abre um terminal SSH no servidor; mantém a sincronização ativa em background enquanto essa sessão estiver aberta (default: `connect`) |
 | `tnrx-connect sync` | Sincroniza uma vez (local → remoto), sem abrir SSH — útil antes de um `tnrx slurm`/`tnrx uvslurm` pontual |
 | `tnrx-connect pull` | Puxa do servidor pro local uma vez, sem apagar nada local — pra recuperar um resultado pequeno gerado manualmente no projeto |
-| `tnrx-connect init` | Cria o `.tnrx_connect` deste projeto interativamente |
+| `tnrx-connect init` | Cria o `.tnrx_connect` deste projeto interativamente — pergunta o `HOST` e deixa você **navegar pelas pastas do servidor** (via SSH) pra escolher o `REMOTE_PATH`, em vez de colar o caminho de cabeça |
 | `tnrx-connect uninstall` | Remove o symlink local |
 
 No dia a dia: rode `tnrx-connect` no seu laptop, edite os arquivos localmente com o Claude Code, e use o terminal do servidor que ele abriu pra disparar `tnrx slurm`/`tnrx uvslurm`/`tnrx uvslurm jupyter lab` normalmente — exatamente como documentado no resto deste README. A sincronização continua rodando em background e some sozinha quando você sai da sessão (`exit`, `Ctrl-D` ou queda de conexão).

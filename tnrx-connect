@@ -49,6 +49,14 @@ project_id() {
     pwd -P | cksum | awk '{print $1}'
 }
 
+compute_ctrl_path() {
+    # Path do socket de multiplexação SSH (ControlMaster), por HOST: permite
+    # autenticar uma vez (senha/2FA) e reaproveitar a conexão em todas as
+    # chamadas seguintes, sem prompt de novo. Ver ensure_master()/resolve_ssh_cmd().
+    mkdir -p "$CACHE_DIR"
+    CTRL_PATH="$CACHE_DIR/ssh-$(printf '%s' "$HOST" | cksum | awk '{print $1}').sock"
+}
+
 load_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo "❌ Erro: $CONFIG_FILE não encontrado nesta pasta." >&2
@@ -62,11 +70,7 @@ load_config() {
     SYNC_DELETE="${SYNC_DELETE:-$DEFAULT_SYNC_DELETE}"
     POLL_INTERVAL="${POLL_INTERVAL:-$DEFAULT_POLL_INTERVAL}"
 
-    mkdir -p "$CACHE_DIR"
-    # Path do socket de multiplexação SSH (ControlMaster), por HOST: permite
-    # autenticar uma vez (senha/2FA) e reaproveitar a conexão em todas as
-    # chamadas seguintes, sem prompt de novo. Ver ensure_master()/resolve_ssh_cmd().
-    CTRL_PATH="$CACHE_DIR/ssh-$(printf '%s' "$HOST" | cksum | awk '{print $1}').sock"
+    compute_ctrl_path
 }
 
 validate_config() {
@@ -82,6 +86,65 @@ validate_config() {
             exit 1
             ;;
     esac
+}
+
+browse_remote_dir() {
+    # Navega interativamente pelas pastas de $HOST via SSH (reaproveitando a
+    # conexão mestra) e ecoa em stdout o caminho absoluto escolhido. Todo o
+    # menu/prompt vai para stderr, então o chamador só precisa capturar
+    # $(browse_remote_dir) para pegar o resultado.
+    local current
+    current=$(ssh -o ControlPath="$CTRL_PATH" "$HOST" 'echo $HOME' 2>/dev/null)
+    [ -z "$current" ] && current="/"
+
+    while true; do
+        echo "" >&2
+        echo "📂 $current" >&2
+
+        local dirs
+        dirs=$(ssh -o ControlPath="$CTRL_PATH" "$HOST" "cd '$current' 2>/dev/null && ls -1d */ 2>/dev/null | sed 's#/\$##'")
+
+        local -a dir_array=()
+        if [ -n "$dirs" ]; then
+            local i=1 d
+            while IFS= read -r d; do
+                dir_array+=("$d")
+                echo "  [$i] $d/" >&2
+                ((i++))
+            done <<< "$dirs"
+        else
+            echo "  (sem subpastas aqui, ou sem permissão pra listar)" >&2
+        fi
+
+        echo "" >&2
+        echo "  [n] usar esta pasta ($current)" >&2
+        echo "  [..] subir um nível" >&2
+        echo "  [q] cancelar" >&2
+        read -r -p "Escolha: " choice
+
+        case "$choice" in
+            n|N)
+                echo "$current"
+                return 0
+                ;;
+            ..)
+                current=$(ssh -o ControlPath="$CTRL_PATH" "$HOST" "cd '$current/..' 2>/dev/null && pwd")
+                ;;
+            q|Q)
+                return 1
+                ;;
+            ''|*[!0-9]*)
+                echo "⚠️  Opção inválida." >&2
+                ;;
+            *)
+                if [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le "${#dir_array[@]}" ]; then
+                    current="$current/${dir_array[$((choice - 1))]}"
+                else
+                    echo "⚠️  Opção inválida." >&2
+                fi
+                ;;
+        esac
+    done
 }
 
 ensure_master() {
@@ -229,14 +292,30 @@ do_init() {
     fi
 
     read -p "HOST (alias SSH resolvível a partir deste laptop, ex. abaporu): " host
-    read -p "REMOTE_PATH (caminho absoluto do projeto no servidor): " remote_path
+    HOST="$host"
+    compute_ctrl_path
+
+    local remote_path=""
+    read -p "Navegar pelas pastas de $host pra escolher o REMOTE_PATH? (Y/n) " nav
+    if [[ "$nav" != "n" && "$nav" != "N" ]]; then
+        ensure_master
+        remote_path=$(browse_remote_dir)
+        local browse_status=$?
+        [ "$MASTER_OWNED" == "true" ] && ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" 2>/dev/null
+        if [ "$browse_status" -ne 0 ] || [ -z "$remote_path" ]; then
+            echo "Cancelado."
+            return
+        fi
+    else
+        read -p "REMOTE_PATH (caminho absoluto do projeto no servidor): " remote_path
+    fi
 
     cat > "$CONFIG_FILE" <<EOF
 # .tnrx_connect — configuração local de sincronização (NÃO versionar)
 HOST=$host
 REMOTE_PATH=$remote_path
 EOF
-    echo "✅ $CONFIG_FILE criado."
+    echo "✅ $CONFIG_FILE criado (REMOTE_PATH=$remote_path)."
 }
 
 do_uninstall() {
@@ -267,7 +346,7 @@ case "$1" in
         echo "  tnrx-connect              -> Sincroniza e abre um terminal SSH no servidor (default: connect)"
         echo "  tnrx-connect sync         -> Sincroniza uma vez (push local -> remoto), sem abrir SSH"
         echo "  tnrx-connect pull         -> Puxa do servidor pro local uma vez, sem --delete"
-        echo "  tnrx-connect init         -> Cria o .tnrx_connect deste projeto (HOST/REMOTE_PATH)"
+        echo "  tnrx-connect init         -> Cria o .tnrx_connect deste projeto (HOST + navegação de pastas pro REMOTE_PATH)"
         echo "  tnrx-connect uninstall    -> Remove o symlink local"
         ;;
 esac
