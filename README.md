@@ -68,6 +68,73 @@ Se o hostname atual não estiver listado, o `tnrx` recusa a execução e mostra 
 
 ---
 
+## 1.2 Trabalhando localmente com Claude Code (`tnrx-connect`)
+
+Os nós de computação do Slurm não têm acesso à internet, e ferramentas como o Claude Code precisam de internet o tempo todo — então elas não podem rodar lá. Rodar essas ferramentas direto no headnode também não é uma boa ideia: é uma máquina compartilhada por todo o time, e um agente de coding facilmente a sobrecarrega. Um proxy de rede pelo headnode resolveria o problema tecnicamente, mas reabriria de propósito o isolamento de rede que os nós têm por motivo de segurança — não é uma decisão pra tomar dentro de um script.
+
+A solução é editar localmente, no seu laptop (com internet plena), e manter o diretório do projeto sincronizado com o servidor. `tnrx-connect` é o companion do `tnrx` que faz isso: roda no **seu laptop**, não no servidor, e não exige instalar nada novo lá — só usa `ssh`/`rsync`, que já existem em qualquer Linux padrão.
+
+### Instalação (no laptop)
+
+```bash
+chmod +x tnrx-connect
+ln -sf "$(pwd)/tnrx-connect" ~/.local/bin/tnrx-connect
+```
+
+### Configuração por projeto (`.tnrx_connect`)
+
+Na raiz do seu projeto (no laptop), copie o template e ajuste:
+
+```bash
+cp .tnrx_connect.example /caminho/do/seu/projeto/.tnrx_connect
+```
+
+```bash
+# .tnrx_connect — configuração local de sincronização (NÃO versionar)
+HOST=abaporu                                     # alvo SSH, resolvido a partir do laptop
+REMOTE_PATH=/home/seu_usuario/projetos/seu_projeto   # caminho absoluto no servidor
+```
+
+Ou gere interativamente com `tnrx-connect init`.
+
+**Atenção:** `HOST` aqui **não é o mesmo campo** que `HOSTNAME` em `tnrx_hosts.conf`. Aquele é a saída de `hostname` *dentro* do servidor (usado pelo `tnrx` pra resolver bind path/runtime); `HOST` em `.tnrx_connect` precisa ser algo que o **seu laptop** consiga resolver via SSH — idealmente um alias do seu `~/.ssh/config`. Use o mesmo nome nos dois só por consistência mental; são arquivos independentes, em máquinas diferentes.
+
+`.tnrx_connect` fica no `.gitignore` (como o `.tnrx_env`): `REMOTE_PATH` depende do `$HOME` de cada pessoa no servidor, não é algo pra versionar.
+
+### Uso
+
+| Comando | O que faz |
+| --- | --- |
+| `tnrx-connect` | Sincroniza uma vez e abre um terminal SSH no servidor; mantém a sincronização ativa em background enquanto essa sessão estiver aberta (default: `connect`) |
+| `tnrx-connect sync` | Sincroniza uma vez (local → remoto), sem abrir SSH — útil antes de um `tnrx slurm`/`tnrx uvslurm` pontual |
+| `tnrx-connect pull` | Puxa do servidor pro local uma vez, sem apagar nada local — pra recuperar um resultado pequeno gerado manualmente no projeto |
+| `tnrx-connect init` | Cria o `.tnrx_connect` deste projeto interativamente |
+| `tnrx-connect uninstall` | Remove o symlink local |
+
+No dia a dia: rode `tnrx-connect` no seu laptop, edite os arquivos localmente com o Claude Code, e use o terminal do servidor que ele abriu pra disparar `tnrx slurm`/`tnrx uvslurm`/`tnrx uvslurm jupyter lab` normalmente — exatamente como documentado no resto deste README. A sincronização continua rodando em background e some sozinha quando você sai da sessão (`exit`, `Ctrl-D` ou queda de conexão).
+
+### Como a sincronização funciona
+
+- Só sincroniza **do laptop pro servidor** por padrão (o laptop é a fonte da verdade do código). `pull` é manual e não apaga nada.
+- Usa o **próprio `.gitignore` do seu projeto** como lista de exclusão do `rsync` — `.venv/`, `*.sif`, `slurm-*.out` etc. nunca são enviados nem apagados no servidor, exatamente como já são ignorados pelo git.
+- Resultados de treino/logs devem ir para o storage compartilhado já bind-montado (`/data`/`/hadatasets`, o mesmo `HUB_ROOT` do `tnrx hf`), não para dentro do diretório do projeto — assim nunca precisam "voltar" pro laptop.
+- É um polling simples (a cada alguns segundos, configurável via `POLL_INTERVAL` em `.tnrx_connect`), não um watcher instantâneo — o `rsync` já faz diff incremental por conta própria, então isso é barato.
+
+### Login com senha + 2FA (ex.: Abaporu)
+
+Se o `HOST` exige senha e segundo fator (não só chave SSH), o `tnrx-connect connect` pede isso **uma única vez**, no início: ele abre uma conexão SSH "mestra" (multiplexada) e todo o resto da sessão — o `mkdir` inicial, cada rodada do sync em background, o terminal interativo — reaproveita essa mesma conexão já autenticada, sem pedir senha/2FA de novo. Ao sair (`exit`/`Ctrl-D`), essa conexão mestra é encerrada junto.
+
+`tnrx-connect sync`/`tnrx-connect pull` usados sozinhos (sem uma sessão `connect` aberta) pedem senha/2FA normalmente a cada chamada, como um `ssh` manual — mas se você já tem um `tnrx-connect connect` aberto em outra aba pro mesmo `HOST`, eles detectam e reaproveitam essa conexão também, sem prompt.
+
+### Cuidados
+
+- **`--delete` está ligado por padrão** (`SYNC_DELETE=true` em `.tnrx_connect`): arquivos apagados localmente somem do servidor no próximo sync. Um arquivo criado manualmente no servidor, dentro do projeto, e não coberto pelo `.gitignore` pode ser apagado — desative com `SYNC_DELETE=false` se isso for um problema pro seu fluxo.
+- **Rede caiu no meio da sessão?** A conexão mestra cai junto, e o sync em background passa a falhar (fica só no log, não trava). Rode `tnrx-connect connect` de novo — vai pedir senha/2FA de novo, é esperado.
+- **Editou e disparou um job na sequência muito rápido?** O polling pode não ter processado ainda; rode `tnrx-connect sync` bloqueante antes de um `tnrx slurm`/`uvslurm` pontual, em vez de confiar só no sync em background.
+- Pré-requisito: cliente OpenSSH com suporte a `ControlMaster` (padrão em qualquer instalação razoavelmente recente) — é o que permite autenticar uma vez só por sessão.
+
+---
+
 ## 2. Gestão de Dependências (Headnode)
 
 O comando `tnrx uv` executa o binário `uv` de dentro do container, mas utiliza a interface de rede do **headnode**. Isso permite instalar pacotes com acesso à internet enquanto garante compatibilidade com o SO do container.

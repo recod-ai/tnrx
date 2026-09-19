@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# tnrx-connect: companion do `tnrx` que roda no SEU LAPTOP (não no servidor).
+#
+# Abre uma sessão SSH interativa no servidor e mantém o diretório do projeto
+# sincronizado (push local -> remoto) enquanto essa sessão estiver aberta.
+# Não instala nada no servidor: usa só `ssh`/`rsync`, que já existem em
+# qualquer Linux padrão.
+
+# --- Configurações Fixas ---
+CONFIG_FILE=".tnrx_connect"
+CACHE_DIR="$HOME/.cache/tnrx-connect"
+
+DEFAULT_SYNC_DELETE="true"
+DEFAULT_POLL_INTERVAL="3"
+
+DEBUG=0
+
+# Preenchidos por load_config()
+HOST=""
+REMOTE_PATH=""
+SYNC_DELETE=""
+POLL_INTERVAL=""
+CTRL_PATH=""
+
+# Preenchidos por do_connect()/cleanup()
+WATCHER_STARTED=false
+MASTER_OWNED=false
+LOG_FILE=""
+PID_FILE=""
+
+# --- Helpers ---
+
+run_cmd() {
+    if [ "$DEBUG" -eq 1 ]; then
+        local part
+        printf '🔎 [DEBUG] Comando real: '
+        for part in "$@"; do
+            printf '%q ' "$part"
+        done
+        printf '\n'
+    fi
+    "$@"
+}
+
+project_id() {
+    # Hash curto do caminho absoluto do projeto, para nomear log/pidfile sem
+    # colidir entre projetos de mesmo nome em pastas diferentes.
+    pwd -P | cksum | awk '{print $1}'
+}
+
+load_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "❌ Erro: $CONFIG_FILE não encontrado nesta pasta." >&2
+        echo "   Rode 'tnrx-connect init' para criar um, ou copie .tnrx_connect.example do repo do tnrx." >&2
+        exit 1
+    fi
+
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+
+    SYNC_DELETE="${SYNC_DELETE:-$DEFAULT_SYNC_DELETE}"
+    POLL_INTERVAL="${POLL_INTERVAL:-$DEFAULT_POLL_INTERVAL}"
+
+    mkdir -p "$CACHE_DIR"
+    # Path do socket de multiplexação SSH (ControlMaster), por HOST: permite
+    # autenticar uma vez (senha/2FA) e reaproveitar a conexão em todas as
+    # chamadas seguintes, sem prompt de novo. Ver ensure_master()/resolve_ssh_cmd().
+    CTRL_PATH="$CACHE_DIR/ssh-$(printf '%s' "$HOST" | cksum | awk '{print $1}').sock"
+}
+
+validate_config() {
+    if [ -z "$HOST" ]; then
+        echo "❌ Erro: HOST não definido em $CONFIG_FILE." >&2
+        exit 1
+    fi
+    case "$REMOTE_PATH" in
+        /*) ;;
+        *)
+            echo "❌ Erro: REMOTE_PATH precisa ser um caminho absoluto (começando com /)." >&2
+            echo "   Valor atual: '$REMOTE_PATH'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+ensure_master() {
+    # Autentica em $HOST uma única vez (pode pedir senha/2FA aqui) e deixa
+    # uma conexão mestra aberta, multiplexada via CTRL_PATH. Toda chamada
+    # ssh/rsync seguinte que usar o mesmo ControlPath reaproveita essa
+    # conexão já autenticada, sem prompt de novo — inclusive as chamadas do
+    # loop de sync em background, que não têm ninguém pra responder um prompt.
+    if ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+        echo "🔐 Reaproveitando conexão já autenticada em $HOST (de outra sessão do tnrx-connect)."
+        MASTER_OWNED=false
+        return 0
+    fi
+
+    echo "🔐 Autenticando em $HOST (pode pedir senha/2FA agora — só dessa vez, nesta sessão)..."
+    if ! ssh -o ControlMaster=auto -o ControlPath="$CTRL_PATH" -o ControlPersist=8h -fN "$HOST"; then
+        echo "❌ Erro: não foi possível autenticar em $HOST." >&2
+        exit 1
+    fi
+    MASTER_OWNED=true
+}
+
+resolve_ssh_cmd() {
+    # Ecoa o comando ssh a usar pelo rsync (-e). Se a conexão mestra estiver
+    # viva, reaproveita (sem novo prompt). Senão: em contexto de background
+    # (force_batch=true) usa BatchMode=yes pra falhar rápido em vez de travar
+    # esperando senha/2FA que ninguém vai digitar; em primeiro plano, deixa o
+    # ssh prompt normalmente (uso pontual de `sync`/`pull` sem sessão aberta).
+    local force_batch="${1:-false}"
+    if ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+        echo "ssh -o ControlPath=$CTRL_PATH -o BatchMode=yes"
+    elif [ "$force_batch" == "true" ]; then
+        echo "ssh -o BatchMode=yes"
+    else
+        echo "ssh"
+    fi
+}
+
+sync_once() {
+    # Reusa o .gitignore do projeto como lista de exclusão do rsync (mesma
+    # semântica do git: dir-merge recursivo), evitando manter uma segunda
+    # lista de exclusões separada. Artefatos gerados no servidor que também
+    # estão no .gitignore (.venv/, *.sif, logs/...) nunca são tocados, nem
+    # enviados nem apagados pelo --delete.
+    local force_batch="${1:-false}"
+    local delete_flag=()
+    [ "$SYNC_DELETE" == "true" ] && delete_flag=(--delete)
+
+    run_cmd rsync -avz "${delete_flag[@]}" \
+        --filter=':- .gitignore' \
+        --exclude='.git/' \
+        -e "$(resolve_ssh_cmd "$force_batch")" \
+        "$PWD"/ "$HOST:$REMOTE_PATH"/
+}
+
+watch_loop() {
+    # Polling simples: o rsync já faz diff incremental (mtime+size) por conta
+    # própria, então rodar a cada poucos segundos é barato. Evita depender de
+    # fswatch/inotifywait (não garantidos no laptop de todo mundo). Sempre em
+    # modo batch: se a conexão mestra cair, falha rápido no log em vez de
+    # travar pedindo senha/2FA num processo sem terminal.
+    while true; do
+        sleep "$POLL_INTERVAL"
+        sync_once true
+    done
+}
+
+cleanup() {
+    if [ "$WATCHER_STARTED" == "true" ]; then
+        sync_once true >> "$LOG_FILE" 2>&1
+        local pid
+        pid=$(cat "$PID_FILE" 2>/dev/null)
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        fi
+        rm -f "$PID_FILE"
+        echo "🔌 Sincronização encerrada."
+    fi
+
+    if [ "$MASTER_OWNED" == "true" ]; then
+        ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" 2>/dev/null
+        echo "🔒 Conexão autenticada com $HOST encerrada."
+    fi
+}
+
+# --- Comandos Principais ---
+
+do_connect() {
+    load_config
+    validate_config
+    ensure_master
+
+    run_cmd ssh -o ControlPath="$CTRL_PATH" -o BatchMode=yes "$HOST" "mkdir -p '$REMOTE_PATH'"
+
+    echo "🔄 Sincronização inicial..."
+    sync_once
+
+    mkdir -p "$CACHE_DIR"
+    local id
+    id=$(project_id)
+    LOG_FILE="$CACHE_DIR/${id}.log"
+    PID_FILE="$CACHE_DIR/${id}.pid"
+
+    local existing_pid=""
+    [ -f "$PID_FILE" ] && existing_pid=$(cat "$PID_FILE" 2>/dev/null)
+
+    if [ -n "$existing_pid" ] && kill -0 "$existing_pid" 2>/dev/null; then
+        echo "📡 Sync já ativo de outra sessão neste projeto (PID $existing_pid) — reaproveitando."
+        WATCHER_STARTED=false
+    else
+        watch_loop >> "$LOG_FILE" 2>&1 &
+        echo $! > "$PID_FILE"
+        WATCHER_STARTED=true
+        echo "📡 Sync ativo em background (PID $!, a cada ${POLL_INTERVAL}s). Logs: $LOG_FILE"
+    fi
+
+    trap cleanup EXIT INT TERM
+
+    echo "🖥️  Conectando em $HOST..."
+    run_cmd ssh -t -o ControlPath="$CTRL_PATH" "$HOST" "cd '$REMOTE_PATH' && exec \$SHELL -l"
+}
+
+do_sync() {
+    load_config
+    validate_config
+    sync_once
+}
+
+do_pull() {
+    load_config
+    validate_config
+    echo "⬇️  Puxando de $HOST:$REMOTE_PATH para $PWD (não apaga nada local)..."
+    run_cmd rsync -avz \
+        --filter=':- .gitignore' \
+        --exclude='.git/' \
+        -e "$(resolve_ssh_cmd)" \
+        "$HOST:$REMOTE_PATH"/ "$PWD"/
+}
+
+do_init() {
+    if [ -f "$CONFIG_FILE" ]; then
+        read -p "⚠️  $CONFIG_FILE já existe. Sobrescrever? (y/N) " resp
+        [[ "$resp" != "y" ]] && { echo "Cancelado."; return; }
+    fi
+
+    read -p "HOST (alias SSH resolvível a partir deste laptop, ex. abaporu): " host
+    read -p "REMOTE_PATH (caminho absoluto do projeto no servidor): " remote_path
+
+    cat > "$CONFIG_FILE" <<EOF
+# .tnrx_connect — configuração local de sincronização (NÃO versionar)
+HOST=$host
+REMOTE_PATH=$remote_path
+EOF
+    echo "✅ $CONFIG_FILE criado."
+}
+
+do_uninstall() {
+    local link="$HOME/.local/bin/tnrx-connect"
+    if [ -L "$link" ]; then
+        rm "$link"
+        echo "✅ Removido: $link"
+    else
+        echo "ℹ️  Nenhum symlink de tnrx-connect encontrado em $link."
+    fi
+}
+
+# --- Lógica de Entrada ---
+
+while [[ "$1" == "--debug" || "$1" == "-x" ]]; do
+    DEBUG=1
+    shift
+done
+
+case "$1" in
+    connect|"") shift; do_connect ;;
+    sync)       shift; do_sync ;;
+    pull)       shift; do_pull ;;
+    init)       shift; do_init ;;
+    uninstall)  shift; do_uninstall ;;
+    *)
+        echo "Uso: tnrx-connect [--debug|-x] {connect|sync|pull|init|uninstall}"
+        echo "  tnrx-connect              -> Sincroniza e abre um terminal SSH no servidor (default: connect)"
+        echo "  tnrx-connect sync         -> Sincroniza uma vez (push local -> remoto), sem abrir SSH"
+        echo "  tnrx-connect pull         -> Puxa do servidor pro local uma vez, sem --delete"
+        echo "  tnrx-connect init         -> Cria o .tnrx_connect deste projeto (HOST/REMOTE_PATH)"
+        echo "  tnrx-connect uninstall    -> Remove o symlink local"
+        ;;
+esac

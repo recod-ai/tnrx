@@ -1,0 +1,19 @@
+# .tnrx_connect — configuração local do tnrx-connect (roda no seu laptop).
+#
+# Copie este arquivo para ".tnrx_connect" na raiz do seu projeto e ajuste os
+# valores. ".tnrx_connect" (sem ".example") está no .gitignore de propósito:
+# REMOTE_PATH depende do seu $HOME no servidor, então não deve ser versionado.
+
+# HOST: alvo SSH resolvido a partir do SEU LAPTOP (não é o mesmo campo que o
+# HOSTNAME de tnrx_hosts.conf, que é a saída de `hostname` DENTRO do servidor).
+# Idealmente um alias do seu ~/.ssh/config. Sugestão: use o mesmo nome do
+# HOSTNAME em tnrx_hosts.conf só por consistência mental.
+HOST=abaporu
+
+# REMOTE_PATH: caminho ABSOLUTO do projeto no servidor — o mesmo diretório de
+# onde você roda `tnrx slurm`/`tnrx uvslurm` hoje.
+REMOTE_PATH=/home/SEU_USUARIO/projetos/SEU_PROJETO
+
+# Opcionais (descomente para sobrescrever o default):
+# SYNC_DELETE=true    # espelha deleções locais no remoto (default: true)
+# POLL_INTERVAL=3     # segundos entre sincronizações em "tnrx-connect connect" (default: 3)

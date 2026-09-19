@@ -31,6 +31,15 @@ repos:
         always_run: true
         pass_filenames: false
 
+      # Bateria de testes do tnrx-connect (test_tnrx_connect.sh). Não depende
+      # de singularity/servidor (só bash puro), então roda em qualquer host.
+      - id: tnrx-connect-test-suite
+        name: Run tnrx-connect test suite
+        entry: bash test_tnrx_connect.sh
+        language: system
+        always_run: true
+        pass_filenames: false
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
