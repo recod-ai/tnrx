@@ -113,14 +113,17 @@ Ou gere interativamente com `tnrx-connect init` — ele pergunta o `HOST` e ofer
 | `tnrx-connect init` | Cria o `.tnrx_connect` deste projeto interativamente — pergunta o `HOST` e deixa você **navegar pelas pastas do servidor** (via SSH) pra escolher o `REMOTE_PATH`, em vez de colar o caminho de cabeça |
 | `tnrx-connect uninstall` | Remove o symlink local |
 
-No dia a dia: rode `tnrx-connect` no seu laptop, edite os arquivos localmente com o Claude Code, e use o terminal do servidor que ele abriu pra disparar `tnrx slurm`/`tnrx uvslurm`/`tnrx uvslurm jupyter lab` normalmente — exatamente como documentado no resto deste README. A sincronização continua rodando em background e some sozinha quando você sai da sessão (`exit`, `Ctrl-D` ou queda de conexão).
+No dia a dia: rode `tnrx-connect` no seu laptop, edite os arquivos localmente com o Claude Code, e use o terminal do servidor que ele abriu pra disparar `tnrx slurm`/`tnrx uvslurm`/`tnrx uvslurm jupyter lab` normalmente — exatamente como documentado no resto deste README.
 
 ### Como a sincronização funciona
+
+**Enquanto o terminal do `tnrx-connect` estiver aberto, a sincronização roda sozinha, continuamente, em background — você não precisa rodar nada manualmente.** Por baixo dos panos é um loop simples (`while true; do sync; sleep`), disparando um `rsync` a cada `POLL_INTERVAL` segundos (padrão: 3s, configurável em `.tnrx_connect`). Não é instantâneo feito um watcher de arquivos, mas o `rsync` já faz diff incremental por conta própria, então cada rodada é barata. Assim que você sai da sessão (`exit`, `Ctrl-D` ou queda de conexão), esse loop é encerrado automaticamente — não fica processo escondido rodando depois que você fechou o terminal.
+
+Outros detalhes de comportamento:
 
 - Só sincroniza **do laptop pro servidor** por padrão (o laptop é a fonte da verdade do código). `pull` é manual e não apaga nada.
 - Usa o **próprio `.gitignore` do seu projeto** como lista de exclusão do `rsync` — `.venv/`, `*.sif`, `slurm-*.out` etc. nunca são enviados nem apagados no servidor, exatamente como já são ignorados pelo git.
 - Resultados de treino/logs devem ir para o storage compartilhado já bind-montado (`/data`/`/hadatasets`, o mesmo `HUB_ROOT` do `tnrx hf`), não para dentro do diretório do projeto — assim nunca precisam "voltar" pro laptop.
-- É um polling simples (a cada alguns segundos, configurável via `POLL_INTERVAL` em `.tnrx_connect`), não um watcher instantâneo — o `rsync` já faz diff incremental por conta própria, então isso é barato.
 
 ### Login com senha + 2FA (ex.: Abaporu)
 
