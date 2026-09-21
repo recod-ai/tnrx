@@ -996,7 +996,8 @@ do_connect() {
 
     echo "✅ Montado. Cache persistente: $DATA_DIR/$ID/ (log: $MOUNT_LOG)"
     echo "📁 Em OUTRA aba local (esta vira o terminal do servidor): cd '$LOCAL_DIR' && claude"
-    echo "   Numa aba que já estava aberta nesta pasta, rode 'cd .' (ou reabra) pra enxergar o mount."
+    echo "⚠️  Qualquer terminal que já estava DENTRO desta pasta antes de montar (inclusive este, depois de sair)"
+    echo "   continua vendo a pasta vazia de antes: rode 'cd .' (ou reabra o terminal) pra enxergar o mount."
     echo "📸 Snapshots a cada ${EFF_SNAPSHOT_INTERVAL}s — veja: tnrx-connect history | tnrx-connect restore <id>"
 
     echo "🖥️  Conectando em $HOST..."

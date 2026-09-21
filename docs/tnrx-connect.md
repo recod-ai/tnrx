@@ -45,7 +45,7 @@ Pasta remota [/home/marcos/proj] (Enter = manter, b = navegar):
 * **Toda execução pergunta de novo**, já com os valores da última vez: Enter aceita. Em `b` você navega pelas pastas do servidor (subir/descer) em vez de digitar o caminho.
 * O **host** pode ser `usuario@servidor.edu` ou um alias do seu `~/.ssh/config` (inclusive com `ProxyJump`).
 * Depois disso o comando autentica (senha/2FA uma única vez), monta o projeto em cima da pasta atual e **este terminal vira o terminal SSH do servidor** (já dentro da pasta do projeto).
-* Em **outra aba local**: `cd ~/trabalho/meu-projeto && claude`. Numa aba que já estava aberta nessa pasta antes de montar, rode `cd .` (ou reabra) pra enxergar o conteúdo montado.
+* Em **outra aba local**: `cd ~/trabalho/meu-projeto && claude`. Todo terminal que já estava **dentro** dessa pasta antes de montar (inclusive aquele em que você rodou o `tnrx-connect`, depois de sair) continua vendo a pasta vazia de antes, porque o diretório de trabalho dele aponta para a pasta local sem o mount: rode `cd .` (ou reabra o terminal) pra enxergar o conteúdo montado.
 * Ao sair do terminal SSH (`exit`/`Ctrl-D`), o comando tira um último snapshot, desmonta, espera o `rclone` terminar de enviar o que estava pendente e encerra a conexão.
 
 ### Onde ficam as coisas
