@@ -248,6 +248,7 @@ do_uvslurm() {
     fi
 
     local EXTRA_FLAGS=""
+    local wrapper=()
     # Se o comando contiver "jupyter", fazemos a configuração especial
     if [[ "$*" == *"jupyter"* ]]; then
         echo "🔧 [Jupyter Detectado] Configurando Kernel e Rede..."
@@ -261,6 +262,19 @@ do_uvslurm() {
 
         # 2. Adiciona as flags de IP e Origem para evitar o erro 403 Forbidden
         EXTRA_FLAGS="--ip=0.0.0.0 --no-browser"
+
+        # 3. A imagem NGC traz um jupyter_notebook_config.py com
+        # custom_display_url='http://hostname:8888' (literal). O nome do nó e a
+        # porta livre só existem dentro do job, então o wrapper os resolve lá e
+        # passa a URL certa ao Jupyter (a última flag da linha vence a config).
+        # port_retries=0: a porta escolhida é a impressa, sem deslocar sozinha.
+        local jupyter_wrapper='port=8888
+            while (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; do port=$((port + 1)); done
+            node=$(hostname 2>/dev/null || echo "$HOSTNAME")
+            echo "🌐 [tnrx] Nó: $node | porta: $port"
+            exec "$@" --port="$port" --ServerApp.port_retries=0 \
+                --ServerApp.custom_display_url="http://$node:$port"'
+        wrapper=(bash -c "$jupyter_wrapper" bash)
     fi
 
     echo "🚀 [SLURM+UV] $PARTITION | GPU:$GPUS | Executando: uv run $* $EXTRA_FLAGS"
@@ -271,7 +285,7 @@ do_uvslurm() {
          --mem="$MEM" \
          --time="$TIME" \
          "$HOST_RUNTIME" exec --bind "$bind_path" --nv "$image" \
-         "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
+         "${wrapper[@]}" "$UV_BIN" run --frozen "$@" $EXTRA_FLAGS
     unset_env_vars
 }
 

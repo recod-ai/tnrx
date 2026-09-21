@@ -498,6 +498,46 @@ test_runtime_env_injection() {
     fi
 }
 
+test_jupyter_display_url() {
+    log_test "Jupyter: URL exibida usa o nome do nó e a porta real"
+    setup_test_env
+
+    # hostname/singularity/srun/uv falsos: o teste não depende de servidor, GPU nem Jupyter.
+    # O uv falso apenas imprime os argumentos que o Jupyter receberia.
+    mkdir -p bin home/.local/bin
+    printf '#!/bin/sh\necho abaporu\n' > bin/hostname
+    printf '#!/bin/bash\nshift; while [ "$1" = "--bind" ]; do shift 2; done; [ "$1" = "--nv" ] && shift; shift; exec "$@"\n' > bin/singularity
+    printf '#!/bin/bash\nwhile [[ "$1" == --* ]]; do shift; done; exec "$@"\n' > bin/srun
+    printf '#!/bin/bash\n[ "$2" = python ] && exit 0\necho "UV-ARGS: $*"\n' > home/.local/bin/uv
+    chmod +x bin/* home/.local/bin/uv
+    touch fake.sif
+    local fake_path="$PWD/bin:$PATH"
+
+    local out
+    out=$(HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+    assert_contains "$out" "Nó: abaporu" "imprime o nome do nó"
+    assert_contains "$out" "--ServerApp.custom_display_url=http://abaporu:8888" "URL com o nó no lugar de 'hostname'"
+    assert_contains "$out" "--port=8888" "porta explícita, igual à da URL"
+    assert_contains "$out" "--ServerApp.port_retries=0" "a porta impressa não desloca sozinha"
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', 8888)); s.listen(); time.sleep(15)" &
+        local listener=$!
+        sleep 1
+        out=$(HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+        kill "$listener" 2>/dev/null; wait "$listener" 2>/dev/null
+        assert_contains "$out" "--ServerApp.custom_display_url=http://abaporu:8889" "porta 8888 ocupada: usa a 8889 na URL"
+    fi
+
+    out=$(HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm python script.py 2>&1)
+    assert_not_contains "$out" "custom_display_url" "comandos sem Jupyter não recebem as flags"
+
+    cleanup_test_env
+}
+
 # --- Test Runner ---
 
 run_all_tests() {
@@ -532,6 +572,9 @@ run_all_tests() {
     test_load_env_vars_wired_into_commands
     test_env_var_parsing_logic
     test_runtime_env_injection
+
+    # Jupyter
+    test_jupyter_display_url
 
     # Print summary
     print_summary

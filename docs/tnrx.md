@@ -186,6 +186,8 @@ tnrx uvslurm jupyter lab
 
 **Nota**: O script detecta o comando jupyter e injeta automaticamente as flags --ip=0.0.0.0, --no-browser e as permissões de acesso, além de criar um kernel para o ambiente em `.venv`, cujo nome será `Python (TNRX-nome_da_pasta)`
 
+O `tnrx` também escolhe a primeira porta livre a partir de 8888 no nó do job e passa ao Jupyter a URL certa (`http://<nó>:<porta>`). Isso substitui o `http://hostname:8888` que a imagem NGC imprime por padrão (texto fixo no `jupyter_notebook_config.py` dela). Ele imprime `🌐 [tnrx] Nó: dl-05 | porta: 8888` antes do Jupyter subir: use esse nome e essa porta na URL. Um `--port` passado na linha de comando é ignorado, porque a flag do `tnrx` vem depois.
+
 ### Acessando via VS Code (Remote-SSH)
 
 1. Para conectar seu notebook ao servidor rodando na GPU:
