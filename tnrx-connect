@@ -2,10 +2,15 @@
 
 # tnrx-connect: companion do `tnrx` que roda no SEU LAPTOP (não no servidor).
 #
-# Abre uma sessão SSH interativa no servidor e mantém o diretório do projeto
-# sincronizado (push local -> remoto) enquanto essa sessão estiver aberta.
-# Não instala nada no servidor: usa só `ssh`/`rsync`, que já existem em
-# qualquer Linux padrão.
+# Modo principal (mount): monta a pasta do projeto do servidor, via rclone/SFTP,
+# na pasta onde o comando foi rodado, e abre um terminal SSH no servidor. Só
+# existe uma cópia dos arquivos (no servidor); o laptop enxerga por um mount
+# com cache em disco. Um git "sombra" tira snapshots pra permitir rollback.
+#
+# Modo alternativo (rsync): `tnrx-connect rsync|sync|pull|init` — sincroniza uma
+# cópia local com o servidor via rsync (.tnrx_connect na pasta do projeto).
+#
+# Nenhum dos modos instala nada no servidor: usam só ssh + SFTP/rsync.
 
 # --- Configurações Fixas ---
 CONFIG_FILE=".tnrx_connect"
@@ -14,24 +19,59 @@ CACHE_DIR="$HOME/.cache/tnrx-connect"
 DEFAULT_SYNC_DELETE="true"
 DEFAULT_POLL_INTERVAL="3"
 
+# Modo mount
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/tnrx-connect"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tnrx-connect"
+MOUNTS_FILE="${TNRX_MOUNTS_FILE:-/proc/mounts}"
+
+DEFAULT_CACHE_MAX_SIZE="20G"
+DEFAULT_DIR_CACHE_TIME="30s"
+DEFAULT_SNAPSHOT_INTERVAL="60"
+DEFAULT_SNAPSHOT_MAX_FILE_MB="5"
+
+MOUNT_WAIT_SECS="${TNRX_MOUNT_WAIT_SECS:-30}"
+UNMOUNT_RETRIES="${TNRX_UNMOUNT_RETRIES:-5}"
+UNMOUNT_SLEEP="${TNRX_UNMOUNT_SLEEP:-1}"
+RCLONE_EXIT_WAIT_SECS="${TNRX_RCLONE_EXIT_WAIT_SECS:-120}"
+
 DEBUG=0
 
-# Preenchidos por load_config()
+# Preenchidos por load_config() (modo rsync) ou pelos prompts (modo mount)
 HOST=""
 REMOTE_PATH=""
 SYNC_DELETE=""
 POLL_INTERVAL=""
 CTRL_PATH=""
 
-# Preenchidos por do_connect()/cleanup()
+# Preenchidos por do_connect_rsync()/cleanup_rsync()
 WATCHER_STARTED=false
 MASTER_OWNED=false
 LOG_FILE=""
 PID_FILE=""
 
+# Estado do modo mount
+LOCAL_DIR=""
+ID=""
+CONF_FILE=""
+DEF_HOST=""
+DEF_REMOTE=""
+CONF_CACHE_MAX_SIZE=""
+CONF_DIR_CACHE_TIME=""
+CONF_SNAPSHOT_INTERVAL=""
+CONF_SNAPSHOT_MAX_FILE_MB=""
+LOCK_DIR=""
+LOCK_OWNED=false
+OLD_MOUNT_PID=""
+MOUNT_PID=""
+SNAP_PID=""
+MOUNT_STARTED=false
+KEEP_LOCK=false
+SHADOW_DIR=""
+MOUNT_LOG=""
+
 # --- Helpers ---
 
-run_cmd() {
+debug_print() {
     if [ "$DEBUG" -eq 1 ]; then
         local part
         printf '🔎 [DEBUG] Comando real: '
@@ -40,6 +80,10 @@ run_cmd() {
         done
         printf '\n'
     fi
+}
+
+run_cmd() {
+    debug_print "$@"
     "$@"
 }
 
@@ -154,13 +198,13 @@ ensure_master() {
     # conexão já autenticada, sem prompt de novo — inclusive as chamadas do
     # loop de sync em background, que não têm ninguém pra responder um prompt.
     if ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
-        echo "🔐 Reaproveitando conexão já autenticada em $HOST (de outra sessão do tnrx-connect)."
-        MASTER_OWNED=false
+        echo "🔐 Reaproveitando conexão já autenticada em $HOST (conexão mestra que ainda estava aberta)."
         return 0
     fi
 
     echo "🔐 Autenticando em $HOST (pode pedir senha/2FA agora — só dessa vez, nesta sessão)..."
-    if ! ssh -o ControlMaster=auto -o ControlPath="$CTRL_PATH" -o ControlPersist=8h -fN "$HOST"; then
+    if ! ssh -o ControlMaster=auto -o ControlPath="$CTRL_PATH" -o ControlPersist=8h \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=4 -fN "$HOST"; then
         echo "❌ Erro: não foi possível autenticar em $HOST." >&2
         exit 1
     fi
@@ -212,7 +256,7 @@ watch_loop() {
     done
 }
 
-cleanup() {
+cleanup_rsync() {
     if [ "$WATCHER_STARTED" == "true" ]; then
         sync_once true >> "$LOG_FILE" 2>&1
         local pid
@@ -233,7 +277,7 @@ cleanup() {
 
 # --- Comandos Principais ---
 
-do_connect() {
+do_connect_rsync() {
     load_config
     validate_config
     ensure_master
@@ -262,7 +306,7 @@ do_connect() {
         echo "📡 Sync ativo em background (PID $!, a cada ${POLL_INTERVAL}s). Logs: $LOG_FILE"
     fi
 
-    trap cleanup EXIT INT TERM
+    trap cleanup_rsync EXIT INT TERM
 
     echo "🖥️  Conectando em $HOST..."
     run_cmd ssh -t -o ControlPath="$CTRL_PATH" "$HOST" "cd '$REMOTE_PATH' && exec \$SHELL -l"
@@ -328,6 +372,810 @@ do_uninstall() {
     fi
 }
 
+# ============================================================================
+# Modo mount (rclone)
+# ============================================================================
+
+LOCK_START=""
+STALE_LOCK_FOUND=false
+EFF_CACHE_MAX_SIZE=""
+EFF_DIR_CACHE_TIME=""
+EFF_SNAPSHOT_INTERVAL=""
+EFF_SNAPSHOT_MAX_FILE_MB=""
+RCLONE_ARGS=()
+
+hash_of() { printf '%s' "$1" | cksum | awk '{print $1}'; }
+
+sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._@-' '_'; }
+
+now_epoch() { date +%s; }
+
+fmt_epoch() { date -d "@$1" '+%F %T' 2>/dev/null || date -r "$1" '+%F %T' 2>/dev/null || echo "$1"; }
+
+pid_alive() {
+    local pid="$1" st
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    st=$(ps -p "$pid" -o stat= 2>/dev/null | tr -d ' ')
+    [ "${st:0:1}" != "Z" ]
+}
+
+pid_is_tnrx() {
+    pid_alive "$1" && ps -p "$1" -o command= 2>/dev/null | grep -q 'tnrx-connect'
+}
+
+# --- Config por host_pasta (~/.config/tnrx-connect/<host>_<pasta>.conf) ---
+
+CONF_KEYS="HOST REMOTE_PATH LOCAL_DIR LAST_USED CACHE_MAX_SIZE DIR_CACHE_TIME SNAPSHOT_INTERVAL SNAPSHOT_MAX_FILE_MB"
+
+conf_get() {
+    ( unset $CONF_KEYS; source "$1" >/dev/null 2>&1; printf '%s' "${!2}" )
+}
+
+find_confs_for_dir() {
+    # Ecoa os .conf cuja LOCAL_DIR é a pasta dada, o mais recente primeiro.
+    local dir="$1" f d t
+    for f in "$CONF_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        d=$(conf_get "$f" LOCAL_DIR)
+        [ "$d" == "$dir" ] || continue
+        t=$(conf_get "$f" LAST_USED)
+        printf '%s %s\n' "${t:-0}" "$f"
+    done | sort -rn | cut -d' ' -f2-
+}
+
+load_optional_from_conf() {
+    CONF_CACHE_MAX_SIZE=$(conf_get "$1" CACHE_MAX_SIZE)
+    CONF_DIR_CACHE_TIME=$(conf_get "$1" DIR_CACHE_TIME)
+    CONF_SNAPSHOT_INTERVAL=$(conf_get "$1" SNAPSHOT_INTERVAL)
+    CONF_SNAPSHOT_MAX_FILE_MB=$(conf_get "$1" SNAPSHOT_MAX_FILE_MB)
+}
+
+set_effective() {
+    EFF_CACHE_MAX_SIZE="${CONF_CACHE_MAX_SIZE:-$DEFAULT_CACHE_MAX_SIZE}"
+    EFF_DIR_CACHE_TIME="${CONF_DIR_CACHE_TIME:-$DEFAULT_DIR_CACHE_TIME}"
+    EFF_SNAPSHOT_INTERVAL="${CONF_SNAPSHOT_INTERVAL:-$DEFAULT_SNAPSHOT_INTERVAL}"
+    EFF_SNAPSHOT_MAX_FILE_MB="${CONF_SNAPSHOT_MAX_FILE_MB:-$DEFAULT_SNAPSHOT_MAX_FILE_MB}"
+}
+
+resolve_conf_file() {
+    # Nome: <host>_<pasta>.conf. Se já existir um .conf com esse nome apontando
+    # pra OUTRA pasta local (mesmo nome de pasta em caminhos diferentes),
+    # acrescenta um hash curto do caminho pra não colidir.
+    local host_s base cand existing
+    host_s=$(sanitize "$HOST")
+    base=$(sanitize "$(basename "$LOCAL_DIR")")
+    cand="$CONF_DIR/${host_s}_${base}.conf"
+    if [ -f "$cand" ]; then
+        existing=$(conf_get "$cand" LOCAL_DIR)
+        if [ -n "$existing" ] && [ "$existing" != "$LOCAL_DIR" ]; then
+            cand="$CONF_DIR/${host_s}_${base}-$(hash_of "$LOCAL_DIR").conf"
+        fi
+    fi
+    CONF_FILE="$cand"
+    ID=$(basename "$cand" .conf)
+}
+
+emit_opt() {
+    [ -n "$2" ] && printf '%s=%q\n' "$1" "$2"
+    return 0
+}
+
+save_conf() {
+    mkdir -p "$CONF_DIR"
+    {
+        echo "# tnrx-connect (modo mount) — regravado a cada execução."
+        echo "# Opcionais (adicione a linha pra mudar): CACHE_MAX_SIZE, DIR_CACHE_TIME, SNAPSHOT_INTERVAL, SNAPSHOT_MAX_FILE_MB"
+        printf 'HOST=%q\n' "$HOST"
+        printf 'REMOTE_PATH=%q\n' "$REMOTE_PATH"
+        printf 'LOCAL_DIR=%q\n' "$LOCAL_DIR"
+        printf 'LAST_USED=%s\n' "$(now_epoch)"
+        emit_opt CACHE_MAX_SIZE "$CONF_CACHE_MAX_SIZE"
+        emit_opt DIR_CACHE_TIME "$CONF_DIR_CACHE_TIME"
+        emit_opt SNAPSHOT_INTERVAL "$CONF_SNAPSHOT_INTERVAL"
+        emit_opt SNAPSHOT_MAX_FILE_MB "$CONF_SNAPSHOT_MAX_FILE_MB"
+    } > "$CONF_FILE.tmp" && mv "$CONF_FILE.tmp" "$CONF_FILE"
+}
+
+# --- Prompts (sempre perguntam; Enter aceita o valor anterior) ---
+
+ask() {
+    local prompt="$1" def="$2" ans=""
+    if [ -n "$def" ]; then
+        read -r -p "$prompt [$def]: " ans
+    else
+        read -r -p "$prompt: " ans
+    fi
+    printf '%s' "${ans:-$def}"
+}
+
+select_defaults() {
+    DEF_HOST=""
+    DEF_REMOTE=""
+    local -a confs=()
+    local f
+    while IFS= read -r f; do
+        [ -n "$f" ] && confs+=("$f")
+    done < <(find_confs_for_dir "$LOCAL_DIR")
+    [ "${#confs[@]}" -eq 0 ] && return 0
+
+    local chosen="${confs[0]}"
+    if [ "${#confs[@]}" -gt 1 ]; then
+        echo "Esta pasta já foi usada com mais de uma configuração (mais recente primeiro):" >&2
+        local i=1
+        for f in "${confs[@]}"; do
+            echo "  [$i] $(conf_get "$f" HOST):$(conf_get "$f" REMOTE_PATH)" >&2
+            ((i++))
+        done
+        local n
+        n=$(ask "Usar qual" "1")
+        case "$n" in
+            ''|*[!0-9]*) ;;
+            *) if [ "$n" -ge 1 ] && [ "$n" -le "${#confs[@]}" ]; then chosen="${confs[$((n - 1))]}"; fi ;;
+        esac
+    fi
+    DEF_HOST=$(conf_get "$chosen" HOST)
+    DEF_REMOTE=$(conf_get "$chosen" REMOTE_PATH)
+    load_optional_from_conf "$chosen"
+}
+
+prompt_remote_path() {
+    local def="" ans
+    [ "$HOST" == "$DEF_HOST" ] && def="$DEF_REMOTE"
+    if [ -n "$def" ]; then
+        read -r -p "Pasta remota [$def] (Enter = manter, b = navegar): " ans
+    else
+        read -r -p "Pasta remota (caminho absoluto, ou b = navegar): " ans
+    fi
+    case "$ans" in
+        b|B)
+            ensure_master
+            local picked
+            picked=$(browse_remote_dir) || { echo "Cancelado." >&2; return 1; }
+            [ -n "$picked" ] || { echo "Cancelado." >&2; return 1; }
+            REMOTE_PATH="$picked"
+            ;;
+        *) REMOTE_PATH="${ans:-$def}" ;;
+    esac
+    [ "$REMOTE_PATH" != "/" ] && REMOTE_PATH="${REMOTE_PATH%/}"
+    case "$REMOTE_PATH" in
+        /*) return 0 ;;
+        *)
+            echo "❌ A pasta remota precisa ser um caminho absoluto (começando com /). Use 'b' pra navegar." >&2
+            return 1
+            ;;
+    esac
+}
+
+# --- Estado de montagem ---
+
+is_mounted() {
+    local dir="$1"
+    if [ -r "$MOUNTS_FILE" ]; then
+        D="${dir// /\\040}" awk '$2 == ENVIRON["D"] { found = 1 } END { exit !found }' "$MOUNTS_FILE"
+        return
+    fi
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$dir" 2>/dev/null
+        return
+    fi
+    local a b
+    a=$(stat -c %d "$dir" 2>/dev/null || stat -f %d "$dir" 2>/dev/null)
+    b=$(stat -c %d "$dir/.." 2>/dev/null || stat -f %d "$dir/.." 2>/dev/null)
+    [ -n "$a" ] && [ "$a" != "$b" ]
+}
+
+is_rclone_mount() {
+    [ -r "$MOUNTS_FILE" ] || return 0
+    D="${1// /\\040}" awk '$2 == ENVIRON["D"] && $3 ~ /rclone/ { found = 1 } END { exit !found }' "$MOUNTS_FILE"
+}
+
+# --- Lock por pasta local ---
+
+lock_dir_for() { printf '%s/locks/%s.d' "$DATA_DIR" "$(hash_of "$1")"; }
+
+lock_get() { sed -n "s/^$2=//p" "$1/info" 2>/dev/null | head -1; }
+
+write_lock_info() {
+    printf 'PID=%s\nHOST=%s\nREMOTE_PATH=%s\nLOCAL_DIR=%s\nID=%s\nSTART=%s\nMOUNT_PID=%s\n' \
+        "$$" "$HOST" "$REMOTE_PATH" "$LOCAL_DIR" "$ID" "$LOCK_START" "$MOUNT_PID" > "$LOCK_DIR/info"
+}
+
+refuse_locked() {
+    local ld="$1"
+    echo "❌ Já existe uma sessão do tnrx-connect ativa nesta pasta:" >&2
+    echo "   pasta: $LOCAL_DIR" >&2
+    echo "   host:  $(lock_get "$ld" HOST):$(lock_get "$ld" REMOTE_PATH)" >&2
+    echo "   PID:   $(lock_get "$ld" PID) (desde $(fmt_epoch "$(lock_get "$ld" START)"))" >&2
+    echo "   Encerre-a (saia do terminal SSH dela) antes de abrir outra nesta pasta." >&2
+}
+
+check_lock_free() {
+    local ld
+    ld=$(lock_dir_for "$LOCAL_DIR")
+    if [ -d "$ld" ] && pid_is_tnrx "$(lock_get "$ld" PID)"; then
+        refuse_locked "$ld"
+        return 1
+    fi
+    return 0
+}
+
+acquire_lock() {
+    mkdir -p "$DATA_DIR/locks"
+    local ld
+    ld=$(lock_dir_for "$LOCAL_DIR")
+    if [ -d "$ld" ]; then
+        if pid_is_tnrx "$(lock_get "$ld" PID)"; then
+            refuse_locked "$ld"
+            return 1
+        fi
+        STALE_LOCK_FOUND=true
+        OLD_MOUNT_PID=$(lock_get "$ld" MOUNT_PID)
+        rm -rf "$ld"
+    fi
+    if ! mkdir "$ld" 2>/dev/null; then
+        refuse_locked "$ld"
+        return 1
+    fi
+    LOCK_DIR="$ld"
+    LOCK_OWNED=true
+    LOCK_START=$(now_epoch)
+    MOUNT_PID="$OLD_MOUNT_PID"
+    write_lock_info
+}
+
+warn_remote_in_use() {
+    local info ld
+    for info in "$DATA_DIR"/locks/*.d/info; do
+        [ -f "$info" ] || continue
+        ld=$(dirname "$info")
+        [ "$(lock_get "$ld" LOCAL_DIR)" == "$LOCAL_DIR" ] && continue
+        pid_is_tnrx "$(lock_get "$ld" PID)" || continue
+        if [ "$(lock_get "$ld" HOST)" == "$HOST" ] && [ "$(lock_get "$ld" REMOTE_PATH)" == "$REMOTE_PATH" ]; then
+            echo "⚠️  $HOST:$REMOTE_PATH já está montado em $(lock_get "$ld" LOCAL_DIR) por outra sessão." >&2
+            echo "   Dois mounts da mesma pasta remota têm caches separados e podem mostrar versões diferentes." >&2
+        fi
+    done
+}
+
+other_sessions_on_host() {
+    local info ld
+    for info in "$DATA_DIR"/locks/*.d/info; do
+        [ -f "$info" ] || continue
+        ld=$(dirname "$info")
+        pid_is_tnrx "$(lock_get "$ld" PID)" || continue
+        [ "$(lock_get "$ld" HOST)" == "$HOST" ] && return 0
+    done
+    return 1
+}
+
+# --- Montar / desmontar ---
+
+check_mount_deps() {
+    if ! command -v rclone >/dev/null 2>&1; then
+        echo "❌ rclone não encontrado no PATH. Instale-o no laptop (rclone.org) e tente de novo." >&2
+        return 1
+    fi
+    case "$(uname -s)" in
+        Linux)
+            if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
+                echo "❌ FUSE não encontrado (fusermount3). Instale o pacote fuse3 do seu sistema." >&2
+                return 1
+            fi
+            ;;
+        Darwin)
+            if [ ! -e /Library/Filesystems/macfuse.fs ] && [ ! -e /Library/Filesystems/osxfuse.fs ]; then
+                echo "⚠️  macFUSE não detectado; o mount pode falhar no macOS." >&2
+            fi
+            ;;
+    esac
+    return 0
+}
+
+do_unmount_once() {
+    local dir="$1" lazy="$2" cmd
+    for cmd in fusermount3 fusermount; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            if [ "$lazy" == "lazy" ]; then "$cmd" -uz "$dir" 2>/dev/null; else "$cmd" -u "$dir" 2>/dev/null; fi
+            return
+        fi
+    done
+    if [ "$lazy" == "lazy" ]; then
+        umount -l "$dir" 2>/dev/null || diskutil unmount force "$dir" >/dev/null 2>&1
+    else
+        umount "$dir" 2>/dev/null || diskutil unmount "$dir" >/dev/null 2>&1
+    fi
+}
+
+unmount_dir() {
+    local dir="$1" lazy="$2" i
+    for ((i = 1; i <= UNMOUNT_RETRIES; i++)); do
+        do_unmount_once "$dir" "$lazy"
+        is_mounted "$dir" || return 0
+        sleep "$UNMOUNT_SLEEP"
+    done
+    echo "⚠️  Não consegui desmontar $dir (em uso?). Quem está usando a pasta:" >&2
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -mv "$dir" >&2 2>&1
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof +f -- "$dir" 2>/dev/null | head -10 >&2
+    fi
+    return 1
+}
+
+wait_rclone_exit() {
+    # Não mata o rclone: ele precisa terminar de enviar as escritas pendentes.
+    local pid="$1" i announced=false
+    for ((i = 0; i < RCLONE_EXIT_WAIT_SECS; i++)); do
+        pid_alive "$pid" || return 0
+        if [ "$announced" == "false" ]; then
+            echo "⏳ Aguardando o rclone (PID $pid) terminar de enviar escritas pendentes..."
+            announced=true
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+recover_previous() {
+    # A sessão anterior nesta pasta terminou sem limpar (lock velho).
+    if is_mounted "$LOCAL_DIR"; then
+        echo "⚠️  A pasta ainda estava montada por uma sessão anterior; desmontando..."
+        if ! unmount_dir "$LOCAL_DIR"; then
+            KEEP_LOCK=true
+            echo "❌ Feche o que usa a pasta e rode: tnrx-connect unmount" >&2
+            return 1
+        fi
+    fi
+    if [ -n "$OLD_MOUNT_PID" ] && pid_alive "$OLD_MOUNT_PID"; then
+        if ! wait_rclone_exit "$OLD_MOUNT_PID"; then
+            KEEP_LOCK=true
+            echo "❌ O rclone anterior (PID $OLD_MOUNT_PID) ainda está enviando escritas pendentes. Tente de novo em instantes." >&2
+            return 1
+        fi
+    fi
+    OLD_MOUNT_PID=""
+    MOUNT_PID=""
+    return 0
+}
+
+start_mount() {
+    local vfs_dir ssh_cmd i max
+    vfs_dir="$DATA_DIR/$ID/vfs-$(hash_of "$REMOTE_PATH")"
+    mkdir -p "$vfs_dir"
+    MOUNT_LOG="$DATA_DIR/$ID/mount.log"
+    ssh_cmd="ssh -o ControlPath=$CTRL_PATH -o BatchMode=yes $HOST"
+
+    RCLONE_ARGS=(mount ":sftp:$REMOTE_PATH" "$LOCAL_DIR"
+        --vfs-cache-mode full --cache-dir "$vfs_dir"
+        --vfs-cache-max-size "$EFF_CACHE_MAX_SIZE" --vfs-cache-max-age 8760h
+        --dir-cache-time "$EFF_DIR_CACHE_TIME" --vfs-write-back 5s
+        --sftp-connections 4 --sftp-disable-hashcheck
+        --exclude '.venv/**'
+        --log-file "$MOUNT_LOG" --log-level INFO)
+
+    if [ "$DEBUG" -eq 1 ]; then
+        printf '🔎 [DEBUG] RCLONE_SFTP_SSH=%q\n' "$ssh_cmd"
+        debug_print rclone "${RCLONE_ARGS[@]}"
+    fi
+
+    RCLONE_SFTP_SSH="$ssh_cmd" rclone "${RCLONE_ARGS[@]}" </dev/null >/dev/null 2>&1 &
+    MOUNT_PID=$!
+    MOUNT_STARTED=true
+    write_lock_info
+
+    max=$((MOUNT_WAIT_SECS * 5))
+    for ((i = 0; i < max; i++)); do
+        is_mounted "$LOCAL_DIR" && return 0
+        if ! pid_alive "$MOUNT_PID"; then
+            echo "❌ O rclone terminou antes de montar. Fim do log ($MOUNT_LOG):" >&2
+            tail -5 "$MOUNT_LOG" 2>/dev/null >&2
+            MOUNT_STARTED=false
+            MOUNT_PID=""
+            return 1
+        fi
+        sleep 0.2
+    done
+    echo "❌ A montagem não ficou pronta em ${MOUNT_WAIT_SECS}s. Fim do log ($MOUNT_LOG):" >&2
+    tail -5 "$MOUNT_LOG" 2>/dev/null >&2
+    kill "$MOUNT_PID" 2>/dev/null
+    MOUNT_STARTED=false
+    MOUNT_PID=""
+    return 1
+}
+
+# --- Git sombra (snapshots pra rollback; git-dir fora do projeto) ---
+
+shadow_git() {
+    local t=()
+    command -v timeout >/dev/null 2>&1 && t=(timeout "${TNRX_SNAPSHOT_TIMEOUT:-120}")
+    "${t[@]}" git --git-dir="$SHADOW_DIR" --work-tree="$LOCAL_DIR" \
+        -c user.name=tnrx-connect -c user.email=tnrx-connect@localhost \
+        -c core.hooksPath=/dev/null -c commit.gpgsign=false -c core.quotepath=off \
+        -c core.autocrlf=false "$@"
+}
+
+init_shadow() {
+    [ -d "$SHADOW_DIR" ] && return 0
+    mkdir -p "$(dirname "$SHADOW_DIR")"
+    git -c init.defaultBranch=main init -q --bare "$SHADOW_DIR"
+}
+
+update_shadow_excludes() {
+    # Exclui do snapshot: regras do .git/info/exclude do projeto (que o git
+    # sombra não enxerga) + arquivos maiores que SNAPSHOT_MAX_FILE_MB.
+    local ex="$SHADOW_DIR/info/exclude" p rel
+    mkdir -p "$SHADOW_DIR/info"
+    {
+        [ -f "$LOCAL_DIR/.git/info/exclude" ] && cat "$LOCAL_DIR/.git/info/exclude"
+        find "$LOCAL_DIR" -path "$LOCAL_DIR/.git" -prune -o -type f -size +"${EFF_SNAPSHOT_MAX_FILE_MB}M" -print 2>/dev/null |
+            while IFS= read -r p; do
+                rel="${p#"$LOCAL_DIR"/}"
+                printf '/%s\n' "$(printf '%s' "$rel" | sed 's/[][*?\\#!]/\\&/g')"
+            done
+        true
+    } > "$ex.tmp" && mv "$ex.tmp" "$ex"
+}
+
+snapshot_once() {
+    # Nunca tira snapshot se a pasta não está montada: o work-tree vazio seria
+    # gravado como "todos os arquivos apagados".
+    local msg="${1:-snapshot $(date '+%F %T')}" staged total deleted
+    is_mounted "$LOCAL_DIR" || return 1
+    init_shadow
+    update_shadow_excludes
+    shadow_git add -A >/dev/null 2>&1 || return 1
+    staged=$(shadow_git diff --cached --name-only 2>/dev/null | wc -l | tr -d ' ')
+    [ "${staged:-0}" -eq 0 ] && return 0
+
+    # Proteção extra: se mais da metade dos arquivos sumiu de uma vez, é mais
+    # provável um mount vazio/instável do que uma limpeza real.
+    total=$(shadow_git ls-tree -r --name-only HEAD 2>/dev/null | wc -l | tr -d ' ')
+    deleted=$(shadow_git diff --cached --diff-filter=D --name-only 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${total:-0}" -ge 10 ] && [ $((deleted * 2)) -gt "${total:-0}" ]; then
+        shadow_git reset -q >/dev/null 2>&1
+        echo "[$(date '+%F %T')] snapshot ignorado: $deleted de $total arquivos sumiram de uma vez (mount instável?)"
+        return 2
+    fi
+    shadow_git commit -q -m "$msg" >/dev/null 2>&1
+}
+
+snapshot_loop() {
+    # Encerra sozinho quando a sessão que o criou deixa de existir (ex.: kill -9,
+    # que não roda o cleanup); senão ficaria órfão tirando snapshots pra sempre.
+    local parent="$1"
+    while kill -0 "$parent" 2>/dev/null; do
+        sleep "$EFF_SNAPSHOT_INTERVAL"
+        kill -0 "$parent" 2>/dev/null || break
+        snapshot_once >> "$MOUNT_LOG" 2>&1
+    done
+}
+
+snapshot_retry() {
+    local msg="$1" n
+    for n in 1 2 3; do
+        snapshot_once "$msg"
+        [ $? -le 2 ] && return 0
+        sleep 1
+    done
+    return 1
+}
+
+# --- Ciclo de vida da sessão ---
+
+cleanup_mount() {
+    trap - EXIT INT TERM HUP
+    cd / 2>/dev/null
+    local unmounted_ok=true
+
+    if [ -n "$SNAP_PID" ]; then
+        kill "$SNAP_PID" 2>/dev/null
+        wait "$SNAP_PID" 2>/dev/null
+        SNAP_PID=""
+    fi
+
+    if [ "$MOUNT_STARTED" == "true" ]; then
+        if is_mounted "$LOCAL_DIR"; then
+            snapshot_retry "snapshot final $(date '+%F %T')" >/dev/null 2>&1
+            echo "🔌 Desmontando $LOCAL_DIR..."
+            if ! unmount_dir "$LOCAL_DIR"; then
+                unmounted_ok=false
+                KEEP_LOCK=true
+                echo "   A montagem continua ativa. Feche o que usa a pasta e rode: tnrx-connect unmount $LOCAL_DIR" >&2
+            fi
+        fi
+        if [ "$unmounted_ok" == "true" ] && [ -n "$MOUNT_PID" ]; then
+            if ! wait_rclone_exit "$MOUNT_PID"; then
+                unmounted_ok=false
+                KEEP_LOCK=true
+                echo "   O rclone (PID $MOUNT_PID) segue enviando escritas pendentes; elas ficam no cache e não se perdem." >&2
+            fi
+        fi
+    fi
+
+    if [ "$LOCK_OWNED" == "true" ]; then
+        if [ "$KEEP_LOCK" == "true" ]; then
+            write_lock_info
+        else
+            rm -rf "$LOCK_DIR"
+            LOCK_OWNED=false
+        fi
+    fi
+
+    # A conexão SSH mestra é compartilhada entre sessões do mesmo host: só fecha
+    # quando não sobrou outra sessão viva usando ela (e o mount não depende mais dela).
+    if [ "$unmounted_ok" == "true" ] && [ -n "$HOST" ] && [ -n "$CTRL_PATH" ] && ! other_sessions_on_host; then
+        if ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+            echo "🔒 Conexão autenticada com $HOST encerrada."
+        fi
+    fi
+}
+
+on_signal() {
+    cleanup_mount
+    exit 130
+}
+
+check_local_dir_ready() {
+    # O mount cobre a pasta local: ela precisa estar vazia (o que o SERVIDOR
+    # tem não importa; é o conteúdo LOCAL que ficaria escondido).
+    local entries count
+    if is_mounted "$LOCAL_DIR"; then
+        echo "❌ $LOCAL_DIR já é um ponto de montagem que não é de uma sessão do tnrx-connect." >&2
+        return 1
+    fi
+    entries=$(ls -A "$LOCAL_DIR" 2>/dev/null)
+    if [ -n "$entries" ]; then
+        count=$(printf '%s\n' "$entries" | wc -l | tr -d ' ')
+        echo "❌ $LOCAL_DIR não está vazia ($count itens locais):" >&2
+        printf '%s\n' "$entries" | head -5 | sed 's/^/     /' >&2
+        [ "$count" -gt 5 ] && echo "     ..." >&2
+        echo "   O mount é montado POR CIMA desta pasta e esconderia esse conteúdo local." >&2
+        echo "   O que está no servidor pode ter quantos arquivos quiser; o que precisa estar vazio é a pasta LOCAL." >&2
+        echo "   Rode o comando numa pasta vazia (ex.: mkdir ~/trabalho/proj && cd ~/trabalho/proj) ou mova esse conteúdo pra outro lugar." >&2
+        return 1
+    fi
+}
+
+do_connect() {
+    check_mount_deps || exit 1
+    LOCAL_DIR=$(pwd -P)
+    case "$LOCAL_DIR" in
+        /|"$HOME")
+            echo "❌ Rode em uma pasta de projeto dedicada (não em / nem na sua home): ela vira o ponto de montagem." >&2
+            exit 1
+            ;;
+    esac
+    mkdir -p "$CONF_DIR" "$DATA_DIR"
+    check_lock_free || exit 1
+    # Com lock velho (sessão que caiu) a pasta pode ainda ter o mount antigo:
+    # recover_previous cuida disso mais adiante; a checagem final vale nos dois casos.
+    if [ ! -d "$(lock_dir_for "$LOCAL_DIR")" ]; then
+        check_local_dir_ready || exit 1
+    fi
+
+    select_defaults
+    HOST=$(ask "Host (user@servidor ou alias do ~/.ssh/config)" "$DEF_HOST")
+    if [ -z "$HOST" ]; then
+        echo "❌ O host é obrigatório." >&2
+        exit 1
+    fi
+    compute_ctrl_path
+    case "$CTRL_PATH" in
+        *" "*)
+            echo "❌ O caminho do socket SSH tem espaço ($CTRL_PATH); o rclone não aceita isso. Defina HOME sem espaços." >&2
+            exit 1
+            ;;
+    esac
+    prompt_remote_path || exit 1
+    resolve_conf_file
+    set_effective
+    SHADOW_DIR="$DATA_DIR/$ID/shadow.git"
+    MOUNT_LOG="$DATA_DIR/$ID/mount.log"
+    mkdir -p "$DATA_DIR/$ID"
+
+    cd / || exit 1
+    acquire_lock || exit 1
+    trap cleanup_mount EXIT
+    trap on_signal INT TERM HUP
+    save_conf
+    warn_remote_in_use
+
+    ensure_master
+
+    if [ "$STALE_LOCK_FOUND" == "true" ]; then
+        recover_previous || exit 1
+    fi
+    check_local_dir_ready || exit 1
+
+    echo "📦 Montando $HOST:$REMOTE_PATH em $LOCAL_DIR ..."
+    start_mount || exit 1
+
+    snapshot_loop "$$" >> "$MOUNT_LOG" 2>&1 &
+    SNAP_PID=$!
+
+    echo "✅ Montado. Cache persistente: $DATA_DIR/$ID/ (log: $MOUNT_LOG)"
+    echo "📁 Em OUTRA aba local (esta vira o terminal do servidor): cd '$LOCAL_DIR' && claude"
+    echo "   Numa aba que já estava aberta nesta pasta, rode 'cd .' (ou reabra) pra enxergar o mount."
+    echo "📸 Snapshots a cada ${EFF_SNAPSHOT_INTERVAL}s — veja: tnrx-connect history | tnrx-connect restore <id>"
+
+    echo "🖥️  Conectando em $HOST..."
+    run_cmd ssh -t -o ControlPath="$CTRL_PATH" "$HOST" "cd '$REMOTE_PATH' && exec \$SHELL -l"
+}
+
+# --- Subcomandos que operam sobre a pasta (atual ou informada) ---
+
+load_session_for_dir() {
+    local f
+    LOCAL_DIR=$(cd "${1:-.}" 2>/dev/null && pwd -P) || {
+        echo "❌ Pasta inválida: ${1:-.}" >&2
+        return 1
+    }
+    f=$(find_confs_for_dir "$LOCAL_DIR" | head -1)
+    if [ -z "$f" ]; then
+        echo "❌ Nenhuma configuração do tnrx-connect (modo mount) registrada para $LOCAL_DIR." >&2
+        return 1
+    fi
+    CONF_FILE="$f"
+    ID=$(basename "$f" .conf)
+    HOST=$(conf_get "$f" HOST)
+    REMOTE_PATH=$(conf_get "$f" REMOTE_PATH)
+    load_optional_from_conf "$f"
+    set_effective
+    SHADOW_DIR="$DATA_DIR/$ID/shadow.git"
+    MOUNT_LOG="$DATA_DIR/$ID/mount.log"
+    LOCK_DIR=$(lock_dir_for "$LOCAL_DIR")
+}
+
+do_snapshot() {
+    load_session_for_dir "" || exit 1
+    if snapshot_once "${1:-snapshot manual $(date '+%F %T')}"; then
+        echo "📸 Snapshot registrado (ou sem mudanças desde o último)."
+    else
+        echo "❌ Não foi possível tirar o snapshot (a pasta está montada?)." >&2
+        exit 1
+    fi
+}
+
+do_history() {
+    load_session_for_dir "" || exit 1
+    if [ ! -d "$SHADOW_DIR" ]; then
+        echo "Nenhum snapshot ainda."
+        return 0
+    fi
+    local out
+    out=$(shadow_git log --pretty=format:'%h  %ad  %s' --date=format:'%Y-%m-%d %H:%M:%S' -n 30 -- "$@" 2>/dev/null)
+    if [ -z "$out" ]; then
+        echo "Nenhum snapshot ainda."
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+do_restore() {
+    local commit="$1" n
+    if [ -z "$commit" ]; then
+        echo "Uso: tnrx-connect restore <snapshot> [arquivo-ou-pasta ...]" >&2
+        exit 1
+    fi
+    shift
+    load_session_for_dir "" || exit 1
+    if [ ! -d "$SHADOW_DIR" ]; then
+        echo "❌ Nenhum snapshot ainda." >&2
+        exit 1
+    fi
+    if ! is_mounted "$LOCAL_DIR"; then
+        echo "❌ A pasta não está montada; restaurar escreve nela. Inicie uma sessão com 'tnrx-connect'." >&2
+        exit 1
+    fi
+    if ! shadow_git rev-parse --verify --quiet "$commit^{commit}" >/dev/null 2>&1; then
+        echo "❌ Snapshot inexistente: $commit (veja 'tnrx-connect history')." >&2
+        exit 1
+    fi
+    snapshot_once "snapshot antes de restaurar $commit" >/dev/null 2>&1
+    local -a paths=("$@")
+    [ "${#paths[@]}" -eq 0 ] && paths=(":(top)")
+    for n in 1 2 3; do
+        if shadow_git checkout "$commit" -- "${paths[@]}"; then
+            echo "♻️  Restaurado de $commit. (Arquivos criados depois desse snapshot não são apagados.)"
+            return 0
+        fi
+        sleep 1
+    done
+    echo "❌ Não consegui restaurar (o snapshot automático pode estar rodando; tente de novo)." >&2
+    exit 1
+}
+
+do_status() {
+    load_session_for_dir "$1" || exit 1
+    local pid mounted="não" cache_dir count last
+    echo "Pasta:     $LOCAL_DIR"
+    echo "Config:    $CONF_FILE"
+    echo "Servidor:  $HOST:$REMOTE_PATH"
+    pid=$(lock_get "$LOCK_DIR" PID)
+    if pid_is_tnrx "$pid"; then
+        echo "Sessão:    ativa (PID $pid, desde $(fmt_epoch "$(lock_get "$LOCK_DIR" START)"))"
+    else
+        echo "Sessão:    inativa"
+    fi
+    is_mounted "$LOCAL_DIR" && mounted="sim"
+    echo "Montada:   $mounted"
+    cache_dir="$DATA_DIR/$ID/vfs-$(hash_of "$REMOTE_PATH")"
+    if [ -d "$cache_dir" ]; then
+        echo "Cache:     $cache_dir ($(du -sh "$cache_dir" 2>/dev/null | cut -f1), limite $EFF_CACHE_MAX_SIZE)"
+    else
+        echo "Cache:     ainda não criado"
+    fi
+    if [ -d "$SHADOW_DIR" ]; then
+        count=$(shadow_git rev-list --count HEAD 2>/dev/null || echo 0)
+        last=$(shadow_git log -1 --pretty=format:'%ad' --date=format:'%Y-%m-%d %H:%M:%S' 2>/dev/null)
+        echo "Snapshots: ${count:-0}${last:+ (último: $last)}"
+    else
+        echo "Snapshots: nenhum"
+    fi
+}
+
+do_refresh() {
+    load_session_for_dir "" || exit 1
+    local pid mpid
+    pid=$(lock_get "$LOCK_DIR" PID)
+    mpid=$(lock_get "$LOCK_DIR" MOUNT_PID)
+    if ! pid_is_tnrx "$pid" || ! pid_alive "$mpid"; then
+        echo "❌ Não há sessão ativa nesta pasta." >&2
+        exit 1
+    fi
+    kill -HUP "$mpid"
+    echo "🔄 Cache de diretórios limpo (rclone PID $mpid): o que mudou no servidor aparece no próximo acesso."
+}
+
+do_unmount() {
+    local a dir_arg="" lazy="" ld pid mpid
+    for a in "$@"; do
+        case "$a" in
+            -f|--force) lazy="lazy" ;;
+            *) dir_arg="$a" ;;
+        esac
+    done
+    LOCAL_DIR=$(cd "${dir_arg:-.}" 2>/dev/null && pwd -P) || {
+        echo "❌ Pasta inválida: ${dir_arg:-.}" >&2
+        exit 1
+    }
+    cd / || exit 1
+    ld=$(lock_dir_for "$LOCAL_DIR")
+    LOCK_DIR="$ld"
+    pid=$(lock_get "$ld" PID)
+    if pid_is_tnrx "$pid"; then
+        echo "❌ Há uma sessão ativa nesta pasta (PID $pid). Saia do terminal SSH dela pra desmontar normalmente." >&2
+        exit 1
+    fi
+    if ! is_mounted "$LOCAL_DIR"; then
+        echo "ℹ️  $LOCAL_DIR não está montada."
+        [ -d "$ld" ] && rm -rf "$ld"
+        return 0
+    fi
+    if [ ! -d "$ld" ] && ! is_rclone_mount "$LOCAL_DIR"; then
+        echo "❌ $LOCAL_DIR está montada, mas não parece um mount do rclone/tnrx-connect; não vou mexer." >&2
+        exit 1
+    fi
+    mpid=$(lock_get "$ld" MOUNT_PID)
+    HOST=$(lock_get "$ld" HOST)
+    if ! unmount_dir "$LOCAL_DIR" "$lazy"; then
+        echo "❌ Ainda em uso. Saia da pasta (cd ~) e feche o que a usa; ou use --force (desmontagem preguiçosa)." >&2
+        exit 1
+    fi
+    echo "✅ $LOCAL_DIR desmontada."
+    if [ -n "$mpid" ] && pid_alive "$mpid"; then
+        wait_rclone_exit "$mpid" || echo "⚠️  O rclone (PID $mpid) ainda está enviando escritas pendentes; elas ficam no cache." >&2
+    fi
+    rm -rf "$ld"
+    if [ -n "$HOST" ]; then
+        compute_ctrl_path
+        if ! other_sessions_on_host; then
+            ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1 && echo "🔒 Conexão autenticada com $HOST encerrada."
+        fi
+    fi
+}
+
 # --- Lógica de Entrada ---
 
 while [[ "$1" == "--debug" || "$1" == "-x" ]]; do
@@ -337,16 +1185,35 @@ done
 
 case "$1" in
     connect|"") shift; do_connect ;;
+    status)     shift; do_status "$@" ;;
+    refresh)    shift; do_refresh ;;
+    unmount)    shift; do_unmount "$@" ;;
+    snapshot)   shift; do_snapshot "$@" ;;
+    history)    shift; do_history "$@" ;;
+    restore)    shift; do_restore "$@" ;;
+    rsync)      shift; do_connect_rsync ;;
     sync)       shift; do_sync ;;
     pull)       shift; do_pull ;;
     init)       shift; do_init ;;
     uninstall)  shift; do_uninstall ;;
     *)
-        echo "Uso: tnrx-connect [--debug|-x] {connect|sync|pull|init|uninstall}"
-        echo "  tnrx-connect              -> Sincroniza e abre um terminal SSH no servidor (default: connect)"
-        echo "  tnrx-connect sync         -> Sincroniza uma vez (push local -> remoto), sem abrir SSH"
-        echo "  tnrx-connect pull         -> Puxa do servidor pro local uma vez, sem --delete"
-        echo "  tnrx-connect init         -> Cria o .tnrx_connect deste projeto (HOST + navegação de pastas pro REMOTE_PATH)"
-        echo "  tnrx-connect uninstall    -> Remove o symlink local"
+        echo "Uso: tnrx-connect [--debug|-x] <comando>"
+        echo ""
+        echo "Modo mount (rclone) — rode dentro de uma pasta VAZIA:"
+        echo "  tnrx-connect                 -> Pergunta host/pasta remota, monta a pasta remota aqui e abre o SSH"
+        echo "  tnrx-connect status [pasta]  -> Estado da sessão, do mount, do cache e dos snapshots"
+        echo "  tnrx-connect refresh         -> Limpa o cache de diretórios (vê o que mudou no servidor agora)"
+        echo "  tnrx-connect history [path]  -> Lista os snapshots (git sombra)"
+        echo "  tnrx-connect restore <id> [path...] -> Restaura arquivos de um snapshot"
+        echo "  tnrx-connect snapshot        -> Tira um snapshot agora"
+        echo "  tnrx-connect unmount [-f] [pasta] -> Desmonta um mount órfão (sessão que caiu)"
+        echo ""
+        echo "Modo rsync (cópia local sincronizada, .tnrx_connect na pasta):"
+        echo "  tnrx-connect rsync           -> Sincroniza em background e abre o SSH"
+        echo "  tnrx-connect sync            -> Sincroniza uma vez (push local -> remoto)"
+        echo "  tnrx-connect pull            -> Puxa do servidor pro local uma vez, sem --delete"
+        echo "  tnrx-connect init            -> Cria o .tnrx_connect deste projeto"
+        echo ""
+        echo "  tnrx-connect uninstall       -> Remove o symlink local"
         ;;
 esac

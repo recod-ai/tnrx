@@ -1,4 +1,8 @@
-# .tnrx_connect — configuração local do tnrx-connect (roda no seu laptop).
+# .tnrx_connect — configuração do MODO RSYNC do tnrx-connect (roda no seu laptop).
+#
+# Só é usado por `tnrx-connect rsync|sync|pull`. O modo principal (mount, o
+# comando `tnrx-connect` sem argumentos) não usa este arquivo: ele pergunta
+# host/pasta a cada execução e guarda a config em ~/.config/tnrx-connect/.
 #
 # Copie este arquivo para ".tnrx_connect" na raiz do seu projeto e ajuste os
 # valores. ".tnrx_connect" (sem ".example") está no .gitignore de propósito:
@@ -16,4 +20,4 @@ REMOTE_PATH=/home/SEU_USUARIO/projetos/SEU_PROJETO
 
 # Opcionais (descomente para sobrescrever o default):
 # SYNC_DELETE=true    # espelha deleções locais no remoto (default: true)
-# POLL_INTERVAL=3     # segundos entre sincronizações em "tnrx-connect connect" (default: 3)
+# POLL_INTERVAL=3     # segundos entre sincronizações em "tnrx-connect rsync" (default: 3)
