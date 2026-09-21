@@ -502,6 +502,7 @@ test_jupyter_display_url() {
     log_test "Jupyter: URL exibida usa o nome do nó e a porta real"
     setup_test_env
 
+    # Porta alta (TNRX_JUPYTER_PORT) pra não depender das portas em uso na máquina.
     # hostname/singularity/srun/uv falsos: o teste não depende de servidor, GPU nem Jupyter.
     # O uv falso apenas imprime os argumentos que o Jupyter receberia.
     mkdir -p bin home/.local/bin
@@ -514,25 +515,34 @@ test_jupyter_display_url() {
     local fake_path="$PWD/bin:$PATH"
 
     local out
-    out=$(HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+    out=$(TNRX_JUPYTER_PORT=47888 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
     assert_contains "$out" "Nó: abaporu" "imprime o nome do nó"
-    assert_contains "$out" "--ServerApp.custom_display_url=http://abaporu:8888" "URL com o nó no lugar de 'hostname'"
-    assert_contains "$out" "--port=8888" "porta explícita, igual à da URL"
+    assert_contains "$out" "--ServerApp.custom_display_url=http://abaporu:47888" "URL com o nó no lugar de 'hostname'"
+    assert_contains "$out" "--port=47888" "porta explícita, igual à da URL"
     assert_contains "$out" "--ServerApp.port_retries=0" "a porta impressa não desloca sozinha"
+    assert_contains "$out" "TNRX_JUPYTER_READY node=abaporu port=47888 token=" "linha de marcador pro tnrx-connect"
+    local marker_token flag_token
+    marker_token=$(printf '%s\n' "$out" | sed -n 's/.*TNRX_JUPYTER_READY .* token=\([0-9a-f]*\).*/\1/p' | head -1)
+    flag_token=$(printf '%s\n' "$out" | sed -n 's/.*--IdentityProvider.token=\([0-9a-f]*\).*/\1/p' | head -1)
+    if [[ ${#marker_token} -eq 48 && "$marker_token" == "$flag_token" ]]; then
+        pass_test "o token do marcador é o mesmo passado ao Jupyter (48 hex)"
+    else
+        fail_test "token do marcador difere do da flag" "marcador='$marker_token' flag='$flag_token'"
+    fi
 
     if command -v python3 >/dev/null 2>&1; then
         python3 -c "
 import socket, time
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('0.0.0.0', 8888)); s.listen(); time.sleep(15)" &
+s.bind(('0.0.0.0', 47888)); s.listen(); time.sleep(15)" &
         local listener=$!
         sleep 1
-        out=$(HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+        out=$(TNRX_JUPYTER_PORT=47888 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
         kill "$listener" 2>/dev/null; wait "$listener" 2>/dev/null
-        assert_contains "$out" "--ServerApp.custom_display_url=http://abaporu:8889" "porta 8888 ocupada: usa a 8889 na URL"
+        assert_contains "$out" "--ServerApp.custom_display_url=http://abaporu:47889" "porta 47888 ocupada: usa a 47889 na URL"
     fi
 
-    out=$(HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm python script.py 2>&1)
+    out=$(TNRX_JUPYTER_PORT=47888 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm python script.py 2>&1)
     assert_not_contains "$out" "custom_display_url" "comandos sem Jupyter não recebem as flags"
 
     cleanup_test_env

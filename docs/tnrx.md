@@ -186,7 +186,7 @@ tnrx uvslurm jupyter lab
 
 **Nota**: O script detecta o comando jupyter e injeta automaticamente as flags --ip=0.0.0.0, --no-browser e as permissões de acesso, além de criar um kernel para o ambiente em `.venv`, cujo nome será `Python (TNRX-nome_da_pasta)`
 
-O `tnrx` também escolhe a primeira porta livre a partir de 8888 no nó do job e passa ao Jupyter a URL certa (`http://<nó>:<porta>`). Isso substitui o `http://hostname:8888` que a imagem NGC imprime por padrão (texto fixo no `jupyter_notebook_config.py` dela). Ele imprime `🌐 [tnrx] Nó: dl-05 | porta: 8888` antes do Jupyter subir: use esse nome e essa porta na URL. Um `--port` passado na linha de comando é ignorado, porque a flag do `tnrx` vem depois.
+O `tnrx` também escolhe a primeira porta livre a partir de 8888 no nó do job e passa ao Jupyter a URL certa (`http://<nó>:<porta>`). Isso substitui o `http://hostname:8888` que a imagem NGC imprime por padrão (texto fixo no `jupyter_notebook_config.py` dela). Ele imprime `🌐 [tnrx] Nó: dl-05 | porta: 8888` antes do Jupyter subir: use esse nome e essa porta na URL. Do seu laptop, essa URL só abre com uma ponte SSH: veja [`tnrx-connect jupyter`](tnrx-connect.md#jupyter-no-nó-de-computação) (o `jupyter start` roda o `tnrx` por você e abre a ponte). O `tnrx` gera o token do Jupyter e imprime a linha `TNRX_JUPYTER_READY node=... port=... token=...`, que o `tnrx-connect` lê. Um `--port` passado na linha de comando é ignorado, porque a flag do `tnrx` vem depois; para começar por outra porta, use `TNRX_JUPYTER_PORT=9000 tnrx uvslurm jupyter lab`.
 
 ### Acessando via VS Code (Remote-SSH)
 

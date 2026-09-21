@@ -1177,6 +1177,226 @@ do_unmount() {
     fi
 }
 
+# --- Jupyter: ponte local -> nó de computação pela conexão SSH mestra ---
+
+FWD_SPEC=""
+
+port_in_use() { (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
+
+host_label() {
+    # Rótulo DNS (a-z0-9-) do host, sem "user@": recod-headnode, abaporu...
+    local h="${1##*@}"
+    h=$(printf '%s' "$h" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')
+    printf '%s' "${h:-host}"
+}
+
+parse_jupyter_target() {
+    # Aceita a URL que o Jupyter imprimiu (http://nó:porta/lab?token=...),
+    # "nó:porta", "nó porta" ou só "nó" (porta 8888). Preenche J_NODE/J_PORT/J_PATH.
+    local in="$1"
+    local re_url='^https?://([^/:?#]+)(:([0-9]+))?(/.*)?$'
+    local re_np='^([^[:space:]:/]+)[[:space:]:]+([0-9]+)$'
+    local re_node='^[^[:space:]:/]+$'
+    J_NODE=""; J_PORT=""; J_PATH=""
+    if [[ "$in" =~ $re_url ]]; then
+        J_NODE="${BASH_REMATCH[1]}"; J_PORT="${BASH_REMATCH[3]}"; J_PATH="${BASH_REMATCH[4]}"
+    elif [[ "$in" =~ $re_np ]]; then
+        J_NODE="${BASH_REMATCH[1]}"; J_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$in" =~ $re_node ]]; then
+        J_NODE="$in"
+    else
+        return 1
+    fi
+    case "$J_NODE" in
+        127.0.0.1|localhost|0.0.0.0|"[::1]")
+            echo "ℹ️  A URL usa '$J_NODE' (o Jupyter imprime duas); preciso do nome do NÓ (linha 'Nó: ...' do tnrx)." >&2
+            J_NODE=$(ask "Nó" "")
+            ;;
+    esac
+    J_PORT="${J_PORT:-8888}"
+    J_PATH="${J_PATH:-/lab}"
+    [[ "$J_NODE" =~ ^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?$ ]] || { echo "❌ Nome de nó inválido: '$J_NODE'." >&2; return 1; }
+    [[ "$J_PORT" =~ ^[0-9]+$ ]] && [ "$J_PORT" -ge 1 ] && [ "$J_PORT" -le 65535 ] || { echo "❌ Porta inválida: '$J_PORT'." >&2; return 1; }
+}
+
+JUP_LOG=""
+JUP_STATE=""
+JUP_WATCH_PID=""
+
+cleanup_jupyter() {
+    trap - EXIT INT TERM HUP
+    [ -n "$JUP_WATCH_PID" ] && kill "$JUP_WATCH_PID" 2>/dev/null
+    # Sessão 'start': encerra o ssh -tt (o terminal remoto fecha e o srun termina o job).
+    command -v pkill >/dev/null 2>&1 && pkill -TERM -P $$ -f 'ssh -tt' 2>/dev/null
+    [ -z "$FWD_SPEC" ] && [ -s "$JUP_STATE" ] && FWD_SPEC=$(cat "$JUP_STATE")
+    if [ -n "$FWD_SPEC" ]; then
+        ssh -O cancel -L "$FWD_SPEC" -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1
+        FWD_SPEC=""
+    fi
+    [ -n "$JUP_LOG$JUP_STATE" ] && rm -f "$JUP_LOG" "$JUP_STATE"
+    if [ "$MASTER_OWNED" == "true" ] && ! other_sessions_on_host; then
+        ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1 && echo "🔒 Conexão autenticada com $HOST encerrada."
+    fi
+}
+
+jupyter_defaults() {
+    # Sugestões de host/pasta remota: a sessão desta pasta, senão o .conf mais recente.
+    DEF_HOST=""; DEF_REMOTE=""
+    local f
+    f=$(find_confs_for_dir "$LOCAL_DIR" | head -1)
+    [ -z "$f" ] && f=$(ls -t "$CONF_DIR"/*.conf 2>/dev/null | head -1)
+    if [ -n "$f" ]; then
+        DEF_HOST=$(conf_get "$f" HOST)
+        DEF_REMOTE=$(conf_get "$f" REMOTE_PATH)
+    fi
+}
+
+open_bridge() {
+    # Usa J_NODE/J_PORT/HOST/CTRL_PATH. Tenta a mesma porta local; se ocupada, a próxima livre.
+    local lp="$J_PORT" tries=0
+    FWD_SPEC=""
+    while [ "$tries" -lt 50 ]; do
+        if ! port_in_use "$lp" && ssh -O forward -L "localhost:$lp:$J_NODE:$J_PORT" -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+            FWD_SPEC="localhost:$lp:$J_NODE:$J_PORT"
+            LOCAL_PORT="$lp"
+            return 0
+        fi
+        lp=$((lp + 1)); tries=$((tries + 1))
+    done
+    echo "❌ Não consegui abrir uma porta local (tentei $J_PORT a $((J_PORT + 49))). A conexão com $HOST está ativa?" >&2
+    return 1
+}
+
+print_bridge() {
+    # $1 = caminho com token (ex.: /lab?token=...)
+    local label
+    label="$J_NODE.$(host_label "$HOST").localhost"
+    echo "🔗 Ponte aberta: localhost:$LOCAL_PORT  ->  $J_NODE:$J_PORT  (via $HOST)"
+    [ "$LOCAL_PORT" != "$J_PORT" ] && echo "   (a porta local $J_PORT já estava em uso; usando $LOCAL_PORT)"
+    echo "🌐 Abra no navegador:  http://$label:$LOCAL_PORT$1"
+    echo "   Programas que não resolvem *.localhost (ex.: VS Code): http://127.0.0.1:$LOCAL_PORT$1"
+}
+
+do_jupyter() {
+    if [ "$1" == "start" ]; then
+        shift
+        do_jupyter_start "$@"
+        return
+    fi
+    mkdir -p "$CONF_DIR" "$DATA_DIR"
+    LOCAL_DIR=$(pwd -P)
+    jupyter_defaults
+
+    HOST=$(ask "Host (user@servidor ou alias do ~/.ssh/config)" "$DEF_HOST")
+    if [ -z "$HOST" ]; then
+        echo "❌ O host é obrigatório." >&2
+        exit 1
+    fi
+    local target="$*"
+    if [ -z "$target" ]; then
+        echo "Cole a URL que o Jupyter imprimiu (http://nó:porta/lab?token=...) ou digite nó:porta." >&2
+        target=$(ask "URL ou nó:porta" "")
+    fi
+    parse_jupyter_target "$target" || {
+        echo "❌ Não entendi '$target'. Use a URL do Jupyter, 'nó:porta' ou 'nó'." >&2
+        exit 1
+    }
+    compute_ctrl_path
+
+    ensure_master
+    trap cleanup_jupyter EXIT
+    trap 'exit 130' INT TERM HUP
+
+    open_bridge || exit 1
+    print_bridge "$J_PATH"
+    echo "⏳ A ponte fica ativa enquanto este comando rodar. Ctrl-C fecha."
+    echo "   Se der 'Connection refused': confira nó e porta e se o Jupyter ainda está rodando."
+
+    while ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; do
+        sleep "${TNRX_JUPYTER_POLL_SECS:-3}" &
+        wait $!
+    done
+    FWD_SPEC=""
+    echo "⚠️  A conexão SSH com $HOST foi encerrada; a ponte caiu." >&2
+}
+
+jupyter_watch_ready() {
+    # Roda em background: espera a linha TNRX_JUPYTER_READY na saída do job, abre a
+    # ponte e mostra o link. Grava a ponte aberta em $JUP_STATE (o pai cancela ao sair).
+    local line waited=0 hint="${TNRX_JUPYTER_HINT_SECS:-120}" step="${TNRX_JUPYTER_POLL_SECS:-0.5}" hinted=false
+    local re='TNRX_JUPYTER_READY node=[A-Za-z0-9._-]+ port=[0-9]+ token=[A-Za-z0-9]+'
+    while true; do
+        line=$(tr -d '\r' < "$JUP_LOG" 2>/dev/null | grep -Eo "$re" | head -1)
+        if [ -n "$line" ]; then
+            J_NODE=$(printf '%s' "$line" | sed 's/.*node=\([^ ]*\).*/\1/')
+            J_PORT=$(printf '%s' "$line" | sed 's/.*port=\([^ ]*\).*/\1/')
+            local token
+            token=$(printf '%s' "$line" | sed 's/.*token=//')
+            open_bridge || return 1
+            printf '%s' "$FWD_SPEC" > "$JUP_STATE"
+            echo ""
+            print_bridge "/lab?token=$token"
+            echo "   (O Jupyter pode levar alguns segundos pra subir. Ctrl-C aqui pede pra encerrá-lo; duas vezes, sem confirmação.)"
+            return 0
+        fi
+        if [ "$hinted" == false ] && awk "BEGIN{exit !($waited >= $hint)}"; then
+            hinted=true
+            echo "" >&2
+            echo "⏳ Ainda sem a linha TNRX_JUPYTER_READY: o job pode estar na fila do Slurm, ou o tnrx do servidor está desatualizado (git pull no servidor)." >&2
+        fi
+        sleep "$step"
+        waited=$(awk "BEGIN{print $waited + $step}")
+    done
+}
+
+do_jupyter_start() {
+    mkdir -p "$CONF_DIR" "$DATA_DIR"
+    LOCAL_DIR=$(pwd -P)
+    jupyter_defaults
+
+    HOST=$(ask "Host (user@servidor ou alias do ~/.ssh/config)" "$DEF_HOST")
+    if [ -z "$HOST" ]; then
+        echo "❌ O host é obrigatório." >&2
+        exit 1
+    fi
+    REMOTE_PATH=$(ask "Pasta do projeto no servidor (onde rodar o tnrx)" "$DEF_REMOTE")
+    case "$REMOTE_PATH" in
+        /*) ;;
+        *) echo "❌ A pasta remota precisa ser um caminho absoluto (começando com /)." >&2; exit 1 ;;
+    esac
+    compute_ctrl_path
+
+    ensure_master
+    JUP_LOG=$(mktemp "${TMPDIR:-/tmp}/tnrx-jupyter.XXXXXX")
+    JUP_STATE="$JUP_LOG.fwd"
+    trap cleanup_jupyter EXIT
+    trap 'exit 130' INT TERM HUP
+
+    local inner outer
+    inner="cd $(printf '%q' "$REMOTE_PATH") && exec tnrx uvslurm jupyter lab"
+    outer="bash -lc $(printf '%q' "$inner")"
+
+    echo "🚀 Iniciando o Jupyter em $HOST:$REMOTE_PATH (tnrx uvslurm jupyter lab)..."
+    echo "   A saída do servidor aparece abaixo; a ponte abre sozinha quando o Jupyter informar nó e porta."
+
+    jupyter_watch_ready &
+    JUP_WATCH_PID=$!
+
+    ssh -tt -o ControlPath="$CTRL_PATH" "$HOST" "$outer" <&0 2>&1 | tee "$JUP_LOG" &
+    wait $!
+
+    kill "$JUP_WATCH_PID" 2>/dev/null
+    JUP_WATCH_PID=""
+    echo ""
+    if [ -s "$JUP_STATE" ]; then
+        echo "🛑 O Jupyter terminou; a ponte foi fechada."
+    else
+        echo "❌ O job terminou sem informar nó e porta (nenhuma linha TNRX_JUPYTER_READY)." >&2
+        echo "   Veja a saída acima: 'tnrx: command not found' (PATH/instalação no servidor), erro do Slurm/.sif, ou tnrx desatualizado." >&2
+        exit 1
+    fi
+}
+
 # --- Lógica de Entrada ---
 
 while [[ "$1" == "--debug" || "$1" == "-x" ]]; do
@@ -1188,6 +1408,7 @@ case "$1" in
     connect|"") shift; do_connect ;;
     status)     shift; do_status "$@" ;;
     refresh)    shift; do_refresh ;;
+    jupyter)    shift; do_jupyter "$@" ;;
     unmount)    shift; do_unmount "$@" ;;
     snapshot)   shift; do_snapshot "$@" ;;
     history)    shift; do_history "$@" ;;
@@ -1208,6 +1429,8 @@ case "$1" in
         echo "  tnrx-connect restore <id> [path...] -> Restaura arquivos de um snapshot"
         echo "  tnrx-connect snapshot        -> Tira um snapshot agora"
         echo "  tnrx-connect unmount [-f] [pasta] -> Desmonta um mount órfão (sessão que caiu)"
+        echo "  tnrx-connect jupyter start   -> Inicia o Jupyter no servidor (tnrx uvslurm jupyter lab) e abre a ponte sozinho"
+        echo "  tnrx-connect jupyter [URL|nó:porta] -> Abre a ponte pra um Jupyter que já está rodando"
         echo ""
         echo "Modo rsync (cópia local sincronizada, .tnrx_connect na pasta):"
         echo "  tnrx-connect rsync           -> Sincroniza em background e abre o SSH"

@@ -108,6 +108,43 @@ tnrx-connect restore <id>               # restaura a árvore toda
 | `tnrx-connect restore <id> [caminho ...]` | Restaura arquivos de um snapshot |
 | `tnrx-connect snapshot` | Tira um snapshot agora |
 | `tnrx-connect unmount [-f] [pasta]` | Desmonta um mount que ficou órfão (sessão que caiu). `-f` = desmontagem preguiçosa |
+| `tnrx-connect jupyter start` | Inicia o Jupyter no servidor (`tnrx uvslurm jupyter lab`) e abre a ponte sozinho (veja [Jupyter](#jupyter-no-nó-de-computação)) |
+| `tnrx-connect jupyter [URL\|nó:porta]` | Abre a ponte para um Jupyter que já está rodando |
+
+### Jupyter no nó de computação
+
+O mount só traz **arquivos**. O Jupyter continua rodando num nó de computação (ex.: `dl-02`), e o endereço `http://dl-02:8889` só é alcançável de dentro da rede do cluster. O `tnrx-connect jupyter` abre uma **ponte** (túnel SSH) do seu laptop até esse nó, pela mesma conexão já autenticada (sem novo 2FA). Há duas formas:
+
+#### `tnrx-connect jupyter start`: inicia tudo sozinho
+
+```bash
+tnrx-connect jupyter start
+```
+
+Ele pergunta o host e a pasta do projeto no servidor (sugere os da última sessão), roda `tnrx uvslurm jupyter lab` nessa pasta pela conexão já autenticada, lê da saída o nó, a porta e o token, e abre a ponte:
+
+```
+🔗 Ponte aberta: localhost:8889  ->  dl-02:8889  (via recod-headnode)
+🌐 Abra no navegador:  http://dl-02.recod-headnode.localhost:8889/lab?token=...
+   Programas que não resolvem *.localhost (ex.: VS Code): http://127.0.0.1:8889/lab?token=...
+```
+
+* A saída do servidor (fila do Slurm, logs do Jupyter) aparece no mesmo terminal. **`Ctrl-C` vai para o Jupyter**, como num terminal SSH normal (ele pede confirmação; duas vezes encerra sem perguntar). Quando ele termina, a ponte é fechada e o comando sai.
+* Se o terminal for fechado ou o comando morto, o `tnrx-connect` derruba a sessão SSH; o `sshd` avisa o `srun`, que encerra o job (e libera a GPU). Confira depois com `squeue -u $USER`.
+* **Pré-requisitos no servidor:** o `tnrx` **atualizado** (`git pull` no servidor: o `tnrx` novo gera o token e imprime a linha `TNRX_JUPYTER_READY node=... port=... token=...`) e o comando `tnrx` no `PATH` de um shell de login (`bash -lc`). Se não achar a linha, o comando avisa depois de 2 minutos e, se o job terminar sem ela, mostra a saída e sai com erro.
+* O job é um `srun`: ele vive **junto com a sessão SSH**. Se a conexão cair, o job cai também (e a GPU é liberada).
+
+#### `tnrx-connect jupyter [URL|nó:porta]`: para um Jupyter que já está rodando
+
+Se você já iniciou o Jupyter por outro caminho, use este. Ele pergunta o host e pede a URL: **cole** a linha `http://dl-02:8889/lab?token=...` que o Jupyter imprimiu. Também aceita `dl-02:8889`, `dl-02 8889` ou só `dl-02` (porta 8888). Se você colar a URL `127.0.0.1`, ele pergunta o nome do nó. Não inicia nada no servidor.
+
+#### Regras comuns às duas formas
+
+* **A ponte fica ativa enquanto o comando rodar.** Se a conexão SSH cair, o comando avisa e termina.
+* **Porta local:** ele tenta usar o **mesmo número** da porta do servidor (o `tnrx` já escolhe uma porta livre lá). Se essa porta já estiver em uso no laptop (por outra ponte ou outro programa), usa a próxima livre e avisa. Assim duas pontes com a mesma porta remota não conflitam.
+* **O nome `nó.host.localhost` é só um rótulo.** Navegadores resolvem qualquer `*.localhost` para o seu próprio computador, então ele não muda para onde a ponte vai. Vale porque servidores Jupyter diferentes em `localhost` compartilham cookies (o `_xsrf`) e se atrapalham; com nomes diferentes, não. Se o navegador não abrir esse nome, use o link `127.0.0.1`.
+* Se a conexão mestra do host ainda não existir, o comando autentica (senha/2FA) e a fecha ao sair. Se ela veio de uma sessão do `tnrx-connect` aberta, reaproveita e não a fecha.
+* Se o navegador mostrar `Connection refused`: nó ou porta errados, ou o Jupyter já terminou.
 
 ### Configuração opcional
 

@@ -268,11 +268,15 @@ do_uvslurm() {
         # porta livre só existem dentro do job, então o wrapper os resolve lá e
         # passa a URL certa ao Jupyter (a última flag da linha vence a config).
         # port_retries=0: a porta escolhida é a impressa, sem deslocar sozinha.
-        local jupyter_wrapper='port=8888
+        # A linha TNRX_JUPYTER_READY (nó, porta, token) é lida pelo `tnrx-connect jupyter start`.
+        local jupyter_wrapper='port=${TNRX_JUPYTER_PORT:-8888}
             while (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; do port=$((port + 1)); done
             node=$(hostname 2>/dev/null || echo "$HOSTNAME")
-            echo "🌐 [tnrx] Nó: $node | porta: $port"
+            token=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n")
+            echo "🌐 [tnrx] Nó: $node | porta: $port  (do laptop: tnrx-connect jupyter start)"
+            echo "TNRX_JUPYTER_READY node=$node port=$port token=$token"
             exec "$@" --port="$port" --ServerApp.port_retries=0 \
+                --IdentityProvider.token="$token" \
                 --ServerApp.custom_display_url="http://$node:$port"'
         wrapper=(bash -c "$jupyter_wrapper" bash)
     fi
