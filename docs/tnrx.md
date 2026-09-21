@@ -61,10 +61,11 @@ Bind path, binário do runtime (`singularity`/`apptainer`) e o diretório compar
 ```
 # HOSTNAME | BIND_PATH | RUNTIME | HUB_ROOT
 abaporu|/data/:/data/|singularity|/data/huggingface_hub
+ssh|/hadatasets/:/hadatasets/|singularity|/hadatasets/huggingface_hub
 headnode|/hadatasets/:/hadatasets/|singularity|/hadatasets/huggingface_hub
 ```
 
-O `tnrx` identifica o servidor atual via `hostname` e busca a linha correspondente nesse arquivo antes de qualquer comando que dependa do container. Hoje todos os servidores do grupo usam `singularity` (o Abaporu não tem `apptainer` instalado), mas o campo `RUNTIME` existe justamente para não travar o projeto nesse binário caso outro servidor use `apptainer` no futuro — basta adicionar uma linha nova, sem tocar no script.
+O `tnrx` identifica o servidor atual via `hostname` (o nome que a máquina reporta, que nem sempre é o nome que você usa no ssh: o Headnode, por exemplo, responde `ssh`) e busca a linha correspondente nesse arquivo antes de qualquer comando que dependa do container. Hoje todos os servidores do grupo usam `singularity` (o Abaporu não tem `apptainer` instalado), mas o campo `RUNTIME` existe justamente para não travar o projeto nesse binário caso outro servidor use `apptainer` no futuro — basta adicionar uma linha nova, sem tocar no script.
 
 Se o hostname atual não estiver listado, o `tnrx` recusa a execução e mostra quais hosts estão configurados.
 
