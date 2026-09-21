@@ -155,6 +155,15 @@ Executa seu código através do `uv run --frozen`. O flag `--frozen` garante que
 tnrx uvslurm python deep_check.py
 ```
 
+`deep_check.py` verifica o **PyTorch** (precisa de `torch` no `.venv`). Para projetos com **JAX** use `deep_check_jax.py`, que confere a GPU, um matmul e uma convolução (que exercita o cuDNN):
+
+```bash
+tnrx uv add "jax[cuda12]"
+tnrx uvslurm python deep_check_jax.py
+```
+
+Os dois scripts são exemplos deste repositório: copie o que precisar para a pasta do seu projeto.
+
 ---
 
 ## 6. Jupyter Lab e VS Code
