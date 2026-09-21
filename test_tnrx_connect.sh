@@ -348,6 +348,8 @@ case "${FAKE_TNRX_MODE:-ok}" in
   slow)      sleep 1.5; echo "$marker"; hold ;;
   ansi)      printf '\033[32m%s\033[0m\r\n' "$marker"; hold ;;
   silent)    echo "http://hostname:8888/lab?token=x"; hold ;;
+  oldtnrx)   echo "http://dl-05:48889/lab?token=aaa111bbb"; echo "    http://127.0.0.1:48889/lab?token=aaa111bbb"; hold ;;
+  masked)    echo "http://dl-05:48889/lab?token=..."; hold ;;
   noready)   echo "erro: sem GPU disponível"; exit 1 ;;
   exitafter) echo "$marker"; sleep 0.5; exit 0 ;;
 esac
@@ -898,6 +900,34 @@ test_jupyter_start_old_tnrx_without_marker() {
     cleanup_mount_env
 }
 
+test_jupyter_start_fallback_to_jupyter_url() {
+    log_test "jupyter start: tnrx sem marcador mas com a URL do Jupyter (versão intermediária)"
+    setup_mount_env
+    local remote="$MT/p"; mkdir -p "$remote"
+
+    FAKE_TNRX_MODE=oldtnrx start_jupyter_start "$remote"
+    wait_out "Ponte aberta" && pass_test "ponte aberta pela URL do Jupyter" || fail_test "não abriu" "$(cat "$MT/jout")"
+    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "forward localhost:48889:dl-05:48889" "usa o nó da URL (não o 127.0.0.1)"
+    assert_contains "$(cat "$MT/jout")" "http://dl-05.srv.localhost:48889/lab?token=aaa111bbb" "link com o token da URL"
+    assert_contains "$(cat "$MT/jout")" "desatualizado" "avisa que o tnrx do servidor está desatualizado"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    cleanup_mount_env
+}
+
+test_jupyter_start_masked_token_no_bridge() {
+    log_test "jupyter start: token mascarado no log e sem marcador não abre ponte"
+    setup_mount_env
+    local remote="$MT/p"; mkdir -p "$remote"
+
+    FAKE_TNRX_MODE=masked TNRX_JUPYTER_HINT_SECS=0.3 start_jupyter_start "$remote"
+    wait_out "Ainda sem a linha" && pass_test "cai na dica" || fail_test "sem dica" "$(cat "$MT/jout")"
+    [[ ! -s "$FAKE_STATE/ssh.fwd" ]] && pass_test "não abre ponte com token '...'" || fail_test "abriu ponte com token mascarado"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    cleanup_mount_env
+}
+
 test_jupyter_start_bad_remote_path() {
     log_test "jupyter start: pasta remota relativa é recusada antes de rodar qualquer coisa"
     setup_mount_env
@@ -984,6 +1014,8 @@ run_all_tests() {
     test_jupyter_start_job_ends_by_itself
     test_jupyter_start_slow_queue_and_hint
     test_jupyter_start_old_tnrx_without_marker
+    test_jupyter_start_fallback_to_jupyter_url
+    test_jupyter_start_masked_token_no_bridge
     test_jupyter_start_bad_remote_path
     test_jupyter_start_local_port_busy
     rm -rf "$FAKES_DIR"

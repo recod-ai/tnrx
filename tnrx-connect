@@ -1325,16 +1325,31 @@ jupyter_watch_ready() {
     # ponte e mostra o link. Grava a ponte aberta em $JUP_STATE (o pai cancela ao sair).
     local line waited=0 hint="${TNRX_JUPYTER_HINT_SECS:-120}" step="${TNRX_JUPYTER_POLL_SECS:-0.5}" hinted=false
     local re='TNRX_JUPYTER_READY node=[A-Za-z0-9._-]+ port=[0-9]+ token=[A-Za-z0-9]+'
+    # Plano B (tnrx do servidor sem o marcador): a URL que o próprio Jupyter imprime,
+    # se tiver nó de verdade e token visível (versões novas mascaram o token).
+    local re_url='http://[A-Za-z0-9._-]+:[0-9]+/lab\?token=[0-9a-f]+'
+    local text token fallback=false
     while true; do
-        line=$(tr -d '\r' < "$JUP_LOG" 2>/dev/null | grep -Eo "$re" | head -1)
+        text=$(tr -d '\r' < "$JUP_LOG" 2>/dev/null)
+        line=$(printf '%s\n' "$text" | grep -Eo "$re" | head -1)
         if [ -n "$line" ]; then
             J_NODE=$(printf '%s' "$line" | sed 's/.*node=\([^ ]*\).*/\1/')
             J_PORT=$(printf '%s' "$line" | sed 's/.*port=\([^ ]*\).*/\1/')
-            local token
             token=$(printf '%s' "$line" | sed 's/.*token=//')
+        else
+            line=$(printf '%s\n' "$text" | grep -Eo "$re_url" | grep -Ev '://(127\.0\.0\.1|localhost|0\.0\.0\.0|hostname):' | head -1)
+            if [ -n "$line" ]; then
+                fallback=true
+                J_NODE=$(printf '%s' "$line" | sed 's|http://\([^:]*\):.*|\1|')
+                J_PORT=$(printf '%s' "$line" | sed 's|http://[^:]*:\([0-9]*\)/.*|\1|')
+                token=$(printf '%s' "$line" | sed 's/.*token=//')
+            fi
+        fi
+        if [ -n "$line" ]; then
             open_bridge || return 1
             printf '%s' "$FWD_SPEC" > "$JUP_STATE"
             echo ""
+            [ "$fallback" == true ] && echo "ℹ️  O tnrx do servidor não imprimiu TNRX_JUPYTER_READY (desatualizado: faça git pull lá); usei a URL que o Jupyter imprimiu."
             print_bridge "/lab?token=$token"
             echo "   (O Jupyter pode levar alguns segundos pra subir. Ctrl-C aqui pede pra encerrá-lo; duas vezes, sem confirmação.)"
             return 0
@@ -1393,6 +1408,7 @@ do_jupyter_start() {
     else
         echo "❌ O job terminou sem informar nó e porta (nenhuma linha TNRX_JUPYTER_READY)." >&2
         echo "   Veja a saída acima: 'tnrx: command not found' (PATH/instalação no servidor), erro do Slurm/.sif, ou tnrx desatualizado." >&2
+        echo "   Se o Jupyter chegou a subir, o tnrx do servidor está desatualizado (git pull lá) e o Jupyter mascarou o token no log." >&2
         exit 1
     fi
 }

@@ -129,9 +129,9 @@ Ele pergunta o host e a pasta do projeto no servidor (sugere os da última sess�
    Programas que não resolvem *.localhost (ex.: VS Code): http://127.0.0.1:8889/lab?token=...
 ```
 
-* A saída do servidor (fila do Slurm, logs do Jupyter) aparece no mesmo terminal. **`Ctrl-C` vai para o Jupyter**, como num terminal SSH normal (ele pede confirmação; duas vezes encerra sem perguntar). Quando ele termina, a ponte é fechada e o comando sai.
+* A saída do servidor (fila do Slurm, logs do Jupyter) aparece no mesmo terminal. **O `Ctrl-C` vai para o `srun` do servidor**, como num terminal SSH normal: ele responde `srun: interrupt (one more within 1 sec to abort)`. Pressione **duas vezes em menos de 1 segundo** para cancelar o job (o prompt de confirmação do Jupyter não aparece, porque o `srun` intercepta antes). Quando o job termina, a ponte é fechada e o comando sai.
 * Se o terminal for fechado ou o comando morto, o `tnrx-connect` derruba a sessão SSH; o `sshd` avisa o `srun`, que encerra o job (e libera a GPU). Confira depois com `squeue -u $USER`.
-* **Pré-requisitos no servidor:** o `tnrx` **atualizado** (`git pull` no servidor: o `tnrx` novo gera o token e imprime a linha `TNRX_JUPYTER_READY node=... port=... token=...`) e o comando `tnrx` no `PATH` de um shell de login (`bash -lc`). Se não achar a linha, o comando avisa depois de 2 minutos e, se o job terminar sem ela, mostra a saída e sai com erro.
+* **Pré-requisitos no servidor:** o `tnrx` **atualizado** (`git pull` no servidor: o `tnrx` novo gera o token e imprime a linha `TNRX_JUPYTER_READY node=... port=... token=...`) e o comando `tnrx` no `PATH` de um shell de login (`bash -lc`). Com um `tnrx` que ainda não imprime a linha, ele usa como plano B a URL que o próprio Jupyter imprime (`http://<nó>:<porta>/lab?token=...`), se o nó for real e o token estiver visível (versões novas do Jupyter o mascaram no log, e aí não dá). Sem nenhum dos dois, o comando avisa depois de 2 minutos e, se o job terminar, mostra a saída e sai com erro.
 * O job é um `srun`: ele vive **junto com a sessão SSH**. Se a conexão cair, o job cai também (e a GPU é liberada).
 
 #### `tnrx-connect jupyter [URL|nó:porta]`: para um Jupyter que já está rodando
