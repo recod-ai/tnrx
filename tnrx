@@ -73,6 +73,11 @@ load_host_config() {
             HOST_RUNTIME="${runtime:-singularity}"
             HOST_HUB_ROOT="$hub_root"
             RUNTIME_ENV_PREFIX="$(echo "$HOST_RUNTIME" | tr '[:lower:]' '[:upper:]')ENV_"
+            if ! command -v "$HOST_RUNTIME" >/dev/null 2>&1; then
+                echo "❌ Erro: '$HOST_RUNTIME' não foi encontrado nesta máquina (hostname '$hostname')." >&2
+                echo "   O tnrx precisa rodar num nó que tenha o $HOST_RUNTIME (e o Slurm). Você está no servidor certo?" >&2
+                exit 1
+            fi
             return 0
         fi
     done < "$HOSTS_FILE"
@@ -159,6 +164,7 @@ do_install() {
 
         singularity)
             # Alteração 1: Uso de parâmetros com fallback para defaults
+            load_host_config
             local sif_name="${2:-$DEFAULT_SIF_NAME}"
             local docker_url="${3:-$DEFAULT_DOCKER_SOURCE}"
 
@@ -170,7 +176,7 @@ do_install() {
 
             echo "📥 Baixando imagem: $docker_url"
             echo "💾 Destino: $sif_name"
-            singularity pull "$sif_name" "$docker_url"
+            run_cmd "$HOST_RUNTIME" pull "$sif_name" "$docker_url"
             echo "✅ Instalação concluída."
             ;;
 
@@ -187,7 +193,8 @@ do_uv() {
         add|remove|sync|init|lock|tree|export)
             check_hostname
             load_env_vars
-            local image=$(find_sif) || exit 1
+            local image
+            image=$(find_sif) || exit 1
             local bind_path=$(get_bind_path) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
             run_cmd "$HOST_RUNTIME" exec --bind "$bind_path" "$image" "$UV_BIN" "$@"
@@ -207,7 +214,8 @@ do_slurm() {
     check_hostname
     load_env_vars
     load_config
-    local image=$(find_sif) || exit 1
+    local image
+    image=$(find_sif) || exit 1
     local bind_path=$(get_bind_path) || exit 1
 
     # Se não houver argumentos ou se o primeiro for 'bash', abre modo interativo
@@ -230,7 +238,8 @@ do_uvslurm() {
     check_hostname
     load_env_vars
     load_config
-    local image=$(find_sif) || exit 1
+    local image
+    image=$(find_sif) || exit 1
     local bind_path=$(get_bind_path) || exit 1
 
     if [ $# -eq 0 ]; then
@@ -301,7 +310,8 @@ do_huggingface() {
     fi
     echo "✅ Token validado com sucesso."
 
-    local image=$(find_sif) || exit 1
+    local image
+    image=$(find_sif) || exit 1
 
     # Nota: Removi o 'uv sync' para tornar o download mais direto,
     # partindo do princípio que o usuário já preparou o ambiente.

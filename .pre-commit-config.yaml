@@ -16,7 +16,7 @@ repos:
       # então dispensa o --bind por servidor.
       - id: uv-format-toml
         name: Format pyproject.toml
-        entry: bash -c 'singularity exec pytorch_devel.sif "$HOME/.local/bin/uv" pip compile pyproject.toml -o /dev/null'
+        entry: bash -c 'rt=$(command -v apptainer || command -v singularity); "$rt" exec pytorch_devel.sif "$HOME/.local/bin/uv" pip compile pyproject.toml -o /dev/null'
         language: system
         files: ^pyproject.toml$
 

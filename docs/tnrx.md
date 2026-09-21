@@ -61,11 +61,11 @@ Bind path, binário do runtime (`singularity`/`apptainer`) e o diretório compar
 ```
 # HOSTNAME | BIND_PATH | RUNTIME | HUB_ROOT
 abaporu|/data/:/data/|singularity|/data/huggingface_hub
-ssh|/hadatasets/:/hadatasets/|singularity|/hadatasets/huggingface_hub
-headnode|/hadatasets/:/hadatasets/|singularity|/hadatasets/huggingface_hub
+ssh|/hadatasets/:/hadatasets/|apptainer|/hadatasets/huggingface_hub
+headnode|/hadatasets/:/hadatasets/|apptainer|/hadatasets/huggingface_hub
 ```
 
-O `tnrx` identifica o servidor atual via `hostname` (o nome que a máquina reporta, que nem sempre é o nome que você usa no ssh: o Headnode, por exemplo, responde `ssh`) e busca a linha correspondente nesse arquivo antes de qualquer comando que dependa do container. Hoje todos os servidores do grupo usam `singularity` (o Abaporu não tem `apptainer` instalado), mas o campo `RUNTIME` existe justamente para não travar o projeto nesse binário caso outro servidor use `apptainer` no futuro — basta adicionar uma linha nova, sem tocar no script.
+O `tnrx` identifica o servidor atual via `hostname` (o nome que a máquina reporta, que nem sempre é o nome que você usa no ssh: o Headnode, por exemplo, responde `ssh`) e busca a linha correspondente nesse arquivo antes de qualquer comando que dependa do container. O campo `RUNTIME` diz qual binário usar em cada servidor: o Abaporu só tem `singularity`, e o Headnode usa `apptainer`. Um servidor novo com outro runtime é só uma linha nova, sem tocar no script. Se o binário do `RUNTIME` não existir na máquina, o `tnrx` recusa com uma mensagem explicando isso.
 
 Se o hostname atual não estiver listado, o `tnrx` recusa a execução e mostra quais hosts estão configurados.
 
@@ -305,7 +305,7 @@ Sempre que tentar realizar um git commit (seja via terminal ou interface do VS C
 
 * `uv-format-toml` (opcional): compila o `pyproject.toml` com `uv pip compile` só pra validar que ele resolve, sem tocar em `/data`/`/hadatasets`.
 
-* `tnrx-test-suite` / `tnrx-connect-test-suite`: rodam `test_tnrx.sh`/`test_tnrx_connect.sh` a cada commit — cobrem parsing de config, mensagens de erro e a montagem dos comandos `singularity`/`rsync` (via `--debug`), sem depender de GPU/rede real. A do `tnrx-connect` também exercita o modo mount de ponta a ponta com `ssh`/`rclone`/`fusermount3` falsos (lock, recuperação de sessão, snapshots) e leva cerca de 25s.
+* `tnrx-test-suite` / `tnrx-connect-test-suite`: rodam `test_tnrx.sh`/`test_tnrx_connect.sh` a cada commit — cobrem parsing de config, mensagens de erro e a montagem dos comandos do runtime (`singularity`/`apptainer`) e do `rsync` (via `--debug`), sem depender de GPU/rede real. A do `tnrx-connect` também exercita o modo mount de ponta a ponta com `ssh`/`rclone`/`fusermount3` falsos (lock, recuperação de sessão, snapshots) e leva cerca de 25s.
 
 * `Black`: Formata automaticamente o teu código Python para seguir as normas PEP8.
 
