@@ -520,16 +520,6 @@ test_jupyter_display_url() {
     assert_contains "$out" "--ServerApp.custom_display_url=http://abaporu:47888" "URL com o nó no lugar de 'hostname'"
     assert_contains "$out" "--port=47888" "porta explícita, igual à da URL"
     assert_contains "$out" "--ServerApp.port_retries=0" "a porta impressa não desloca sozinha"
-    assert_contains "$out" "TNRX_JUPYTER_READY node=abaporu port=47888 token=" "linha de marcador pro tnrx-connect"
-    local marker_token flag_token
-    marker_token=$(printf '%s\n' "$out" | sed -n 's/.*TNRX_JUPYTER_READY .* token=\([0-9a-f]*\).*/\1/p' | head -1)
-    flag_token=$(printf '%s\n' "$out" | sed -n 's/.*--IdentityProvider.token=\([0-9a-f]*\).*/\1/p' | head -1)
-    if [[ ${#marker_token} -eq 48 && "$marker_token" == "$flag_token" ]]; then
-        pass_test "o token do marcador é o mesmo passado ao Jupyter (48 hex)"
-    else
-        fail_test "token do marcador difere do da flag" "marcador='$marker_token' flag='$flag_token'"
-    fi
-
     if command -v python3 >/dev/null 2>&1; then
         python3 -c "
 import socket, time
@@ -544,6 +534,70 @@ s.bind(('0.0.0.0', 47888)); s.listen(); time.sleep(15)" &
 
     out=$(TNRX_JUPYTER_PORT=47888 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm python script.py 2>&1)
     assert_not_contains "$out" "custom_display_url" "comandos sem Jupyter não recebem as flags"
+
+    cleanup_test_env
+}
+
+test_jupyter_registry() {
+    log_test "Jupyter: registra o servidor em .tnrx/jupyter só depois que a porta responde"
+    setup_test_env
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        pass_test "python3 ausente: teste do registro ignorado"
+        cleanup_test_env
+        return
+    fi
+
+    # uv falso: imprime os argumentos e, com FAKE_JUPYTER_LISTEN=1, escuta na --port por 3s
+    # (faz o papel do Jupyter subindo).
+    mkdir -p bin home/.local/bin
+    printf '#!/bin/sh\necho abaporu\n' > bin/hostname
+    printf '#!/bin/bash\nshift; while [ "$1" = "--bind" ]; do shift 2; done; [ "$1" = "--nv" ] && shift; shift; exec "$@"\n' > bin/singularity
+    printf '#!/bin/bash\nwhile [[ "$1" == --* ]]; do shift; done; exec "$@"\n' > bin/srun
+    cat > home/.local/bin/uv <<'FAKEUV'
+#!/bin/bash
+[ "$2" = python ] && exit 0
+echo "UV-ARGS: $*"
+for a in "$@"; do case "$a" in --port=*) p="${a#--port=}";; esac; done
+[ -n "$FAKE_JUPYTER_LISTEN" ] && python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',$p)); s.listen(); time.sleep(3)"
+exit 0
+FAKEUV
+    chmod +x bin/* home/.local/bin/uv
+    touch fake.sif
+    local fake_path="$PWD/bin:$PATH"
+    local env_file out
+
+    out=$(FAKE_JUPYTER_LISTEN=1 SLURM_JOB_ID=4242 TNRX_JUPYTER_REGISTER_SECS=6 TNRX_JUPYTER_PORT=47900 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+    env_file=".tnrx/jupyter/4242.env"
+    if [[ -f "$env_file" ]]; then
+        pass_test "registro criado depois que a porta respondeu (.tnrx/jupyter/<job>.env)"
+    else
+        fail_test "registro não criado" "$(ls -R .tnrx 2>&1)"
+    fi
+    local content flag_token file_token
+    content=$(cat "$env_file" 2>/dev/null)
+    assert_contains "$content" "NODE=abaporu" "registra o nó"
+    assert_contains "$content" "PORT=47900" "registra a porta"
+    assert_contains "$content" "JOBID=4242" "registra o job"
+    assert_contains "$content" "PROJECT=$PWD" "registra a pasta do projeto"
+    file_token=$(sed -n 's/^TOKEN=//p' "$env_file")
+    flag_token=$(printf '%s\n' "$out" | sed -n 's/.*--IdentityProvider.token=\([0-9a-f]*\).*/\1/p' | head -1)
+    if [[ ${#file_token} -eq 48 && "$file_token" == "$flag_token" ]]; then
+        pass_test "o token do registro é o mesmo passado ao Jupyter (48 hex)"
+    else
+        fail_test "token do registro difere do da flag" "registro='$file_token' flag='$flag_token'"
+    fi
+    if [[ "$(stat -c %a "$env_file" 2>/dev/null)" == "600" ]]; then pass_test "arquivo com permissão 600"; else fail_test "permissão do registro" "$(stat -c %a "$env_file" 2>&1)"; fi
+    if [[ "$(cat .tnrx/.gitignore 2>/dev/null)" == "*" ]]; then pass_test ".tnrx/.gitignore ignora tudo (token não vai pro git)"; else fail_test ".tnrx/.gitignore ausente"; fi
+    if command -v git >/dev/null 2>&1; then
+        git init -q . 2>/dev/null
+        if [[ -z "$(git status --porcelain --untracked-files=all 2>/dev/null | grep '\.tnrx')" ]]; then pass_test "git não enxerga o .tnrx"; else fail_test "git enxerga o .tnrx" "$(git status --porcelain --untracked-files=all)"; fi
+    fi
+
+    rm -rf .tnrx
+    out=$(SLURM_JOB_ID=4243 TNRX_JUPYTER_REGISTER_SECS=2 TNRX_JUPYTER_PORT=47901 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+    sleep 3
+    if [[ ! -e .tnrx/jupyter/4243.env ]]; then pass_test "sem Jupyter respondendo, nada é registrado"; else fail_test "registrou sem o Jupyter subir"; fi
 
     cleanup_test_env
 }
@@ -585,6 +639,7 @@ run_all_tests() {
 
     # Jupyter
     test_jupyter_display_url
+    test_jupyter_registry
 
     # Print summary
     print_summary

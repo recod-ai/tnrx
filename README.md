@@ -48,7 +48,7 @@ mkdir -p ~/trabalho/meu-projeto && cd ~/trabalho/meu-projeto
 tnrx-connect
 ```
 
-> O modo mount do `tnrx-connect` foi validado só com testes automatizados que usam `ssh`, `rclone` e `fusermount3` falsos. Ele ainda não foi testado com o `rclone` real nem no Abaporu; veja o aviso de status em [docs/tnrx-connect.md](docs/tnrx-connect.md#modo-mount-recomendado) antes de depender dele.
+> O modo mount do `tnrx-connect` já montou o Headnode com o `rclone` real e funciona. Ainda não foram validados num servidor real: o 2FA do Abaporu, escritas pendentes após queda de rede, o desempenho de `git status`/buscas na pasta montada e o macOS; a lista de conferência está em [docs/validacao-manual.md](docs/validacao-manual.md). O manual com o passo a passo das tarefas do dia a dia está em [docs/tnrx-connect.md](docs/tnrx-connect.md#tarefas-do-dia-a-dia).
 
 ## O que tem no repositório
 

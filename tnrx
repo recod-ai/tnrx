@@ -268,13 +268,31 @@ do_uvslurm() {
         # porta livre só existem dentro do job, então o wrapper os resolve lá e
         # passa a URL certa ao Jupyter (a última flag da linha vence a config).
         # port_retries=0: a porta escolhida é a impressa, sem deslocar sozinha.
-        # A linha TNRX_JUPYTER_READY (nó, porta, token) é lida pelo `tnrx-connect jupyter start`.
+        # Um processo em segundo plano espera a porta responder e só então registra o
+        # servidor em .tnrx/jupyter/<job>.env (600), que o `tnrx-connect jupyter` lê.
+        # Sem stdout/stderr pra não segurar o srun; o .gitignore próprio evita que o token
+        # vá pra um `git add .`.
         local jupyter_wrapper='port=${TNRX_JUPYTER_PORT:-8888}
             while (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; do port=$((port + 1)); done
             node=$(hostname 2>/dev/null || echo "$HOSTNAME")
             token=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n")
-            echo "🌐 [tnrx] Nó: $node | porta: $port  (do laptop: tnrx-connect jupyter start)"
-            echo "TNRX_JUPYTER_READY node=$node port=$port token=$token"
+            echo "🌐 [tnrx] Nó: $node | porta: $port  (do laptop: tnrx-connect jupyter)"
+            (
+                umask 077
+                i=0
+                while [ "$i" -lt "${TNRX_JUPYTER_REGISTER_SECS:-180}" ]; do
+                    if (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; then
+                        reg="$PWD/.tnrx/jupyter"
+                        mkdir -p "$reg"
+                        [ -e "$PWD/.tnrx/.gitignore" ] || printf "*\n" > "$PWD/.tnrx/.gitignore"
+                        printf "NODE=%s\nPORT=%s\nTOKEN=%s\nJOBID=%s\nSTARTED=%s\nPROJECT=%s\n" \
+                            "$node" "$port" "$token" "${SLURM_JOB_ID:-$$}" "$(date +%s)" "$PWD" \
+                            > "$reg/${SLURM_JOB_ID:-$$}.env"
+                        break
+                    fi
+                    i=$((i + 1)); sleep 1
+                done
+            ) >/dev/null 2>&1 &
             exec "$@" --port="$port" --ServerApp.port_retries=0 \
                 --IdentityProvider.token="$token" \
                 --ServerApp.custom_display_url="http://$node:$port"'

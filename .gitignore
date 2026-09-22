@@ -223,4 +223,6 @@ slurm-*.out
 .nfs*
 .vscode
 .tnrx_env
+# Registro dos Jupyters no ar (contém o token); o tnrx cria um .gitignore próprio dentro
+.tnrx/
 .tnrx_connect

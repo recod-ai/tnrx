@@ -303,11 +303,6 @@ done
 }
 [ "$mode" == cancel ] && { echo "cancel $lspec" >> "$FAKE_STATE/ssh.fwd"; exit 0; }
 for a in "${args[@]}"; do [ "$a" == "-fN" ] && { touch "$ctrl"; exit 0; }; done
-for a in "${args[@]}"; do [ "$a" == "-tt" ] && {
-  bash -c "${args[-1]}" & c=$!
-  trap 'kill -HUP $c 2>/dev/null; wait $c 2>/dev/null; exit 143' TERM HUP INT
-  wait $c; exit $?
-}; done
 for a in "${args[@]}"; do [ "$a" == "-t" ] && { sleep "${FAKE_SSH_SESSION_SECS:-0}"; exit 0; }; done
 export HOME="${FAKE_REMOTE_HOME:-$HOME}"; bash -c "${args[-1]}"
 EOF
@@ -337,24 +332,7 @@ grep -vF "rclone $esc " "$TNRX_MOUNTS_FILE" > "$TNRX_MOUNTS_FILE.n"; mv "$TNRX_M
 [ -f "$FAKE_STATE/rclone.pid" ] && kill "$(cat "$FAKE_STATE/rclone.pid")" 2>/dev/null
 exit 0
 EOF
-    cat > "$FAKES_DIR/tnrx" <<'EOF'
-#!/bin/bash
-# tnrx falso (servidor): registra argumentos e pasta; comportamento por FAKE_TNRX_MODE.
-echo "$*" > "$FAKE_STATE/tnrx.args"; pwd > "$FAKE_STATE/tnrx.cwd"
-marker="TNRX_JUPYTER_READY node=dl-02 port=48889 token=abc123def"
-hold() { trap 'echo hup > "$FAKE_STATE/tnrx.killed"; exit 0' TERM HUP INT; while true; do sleep 0.1; done; }
-case "${FAKE_TNRX_MODE:-ok}" in
-  ok)        echo "🚀 [SLURM+UV] fake"; echo "$marker"; hold ;;
-  slow)      sleep 1.5; echo "$marker"; hold ;;
-  ansi)      printf '\033[32m%s\033[0m\r\n' "$marker"; hold ;;
-  silent)    echo "http://hostname:8888/lab?token=x"; hold ;;
-  oldtnrx)   echo "http://dl-05:48889/lab?token=aaa111bbb"; echo "    http://127.0.0.1:48889/lab?token=aaa111bbb"; hold ;;
-  masked)    echo "http://dl-05:48889/lab?token=..."; hold ;;
-  noready)   echo "erro: sem GPU disponível"; exit 1 ;;
-  exitafter) echo "$marker"; sleep 0.5; exit 0 ;;
-esac
-EOF
-    chmod +x "$FAKES_DIR"/ssh "$FAKES_DIR"/rclone "$FAKES_DIR"/fusermount3 "$FAKES_DIR"/tnrx
+    chmod +x "$FAKES_DIR"/ssh "$FAKES_DIR"/rclone "$FAKES_DIR"/fusermount3
 }
 
 setup_mount_env() {
@@ -668,8 +646,9 @@ test_mount_refresh_sends_hup() {
 }
 
 run_jupyter_bg() {
-    # $1 = stdin (formato printf %b). Sobe `tnrx-connect jupyter` em background.
-    printf '%b' "$1" | TNRX_JUPYTER_POLL_SECS=0.2 "$TNRX_CONNECT" jupyter > "$MT/jout" 2>&1 &
+    # $1 = stdin (formato printf %b), demais = argumentos. Sobe `tnrx-connect jupyter` em background.
+    local input="$1"; shift
+    printf '%b' "$input" | TNRX_JUPYTER_POLL_SECS=0.1 "$TNRX_CONNECT" jupyter "$@" > "$MT/jout" 2>&1 &
     JPID=$!
     local i
     for i in $(seq 1 60); do
@@ -689,7 +668,7 @@ test_jupyter_tunnel_from_url() {
     log_test "jupyter: cola a URL do Jupyter e abre a ponte com o mesmo número de porta"
     setup_mount_env
 
-    run_jupyter_bg 'user@srv\nhttp://dl-02:48889/lab?token=abc\n' && pass_test "ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    run_jupyter_bg 'user@srv\n' 'http://dl-02:48889/lab?token=abc' && pass_test "ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
     local out fwd
     out=$(cat "$MT/jout")
     fwd=$(cat "$FAKE_STATE/ssh.fwd" 2>/dev/null)
@@ -711,7 +690,7 @@ test_jupyter_local_port_busy_shifts() {
     log_test "jupyter: porta local ocupada -> usa a próxima livre e avisa"
     setup_mount_env
 
-    FAKE_BUSY_PORTS="48889 48890" run_jupyter_bg 'user@srv\ndl-02:48889\n' || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    FAKE_BUSY_PORTS="48889 48890" run_jupyter_bg 'user@srv\n' 'dl-02:48889' || fail_test "ponte não abriu" "$(cat "$MT/jout")"
     local out fwd
     out=$(cat "$MT/jout"); fwd=$(cat "$FAKE_STATE/ssh.fwd" 2>/dev/null)
     assert_contains "$fwd" "forward localhost:48891:dl-02:48889" "local 48891 -> remoto 48889"
@@ -727,19 +706,19 @@ test_jupyter_input_formats() {
     setup_mount_env
     local fwd
 
-    run_jupyter_bg 'user@srv\ndl-02 48890\n' || fail_test "não abriu (nó porta)"
+    run_jupyter_bg 'user@srv\n' 'dl-02 48890' || fail_test "não abriu (nó porta)"
     stop_jupyter_bg
     fwd=$(cat "$FAKE_STATE/ssh.fwd" 2>/dev/null)
     assert_contains "$fwd" "forward localhost:48890:dl-02:48890" "'nó porta'"
 
     : > "$FAKE_STATE/ssh.fwd"
-    run_jupyter_bg 'user@srv\ndl-03\n' || fail_test "não abriu (só nó)"
+    run_jupyter_bg 'user@srv\n' 'dl-03' || fail_test "não abriu (só nó)"
     stop_jupyter_bg
     fwd=$(cat "$FAKE_STATE/ssh.fwd" 2>/dev/null)
     assert_contains "$fwd" ":dl-03:8888" "só o nó usa a porta remota 8888 (a local pode variar)"
 
     : > "$FAKE_STATE/ssh.fwd"
-    run_jupyter_bg 'user@srv\nhttp://127.0.0.1:48892/lab?token=t\ndl-04\n' || fail_test "não abriu (URL 127.0.0.1)" "$(cat "$MT/jout")"
+    run_jupyter_bg 'user@srv\ndl-04\n' 'http://127.0.0.1:48892/lab?token=t' || fail_test "não abriu (URL 127.0.0.1)" "$(cat "$MT/jout")"
     stop_jupyter_bg
     fwd=$(cat "$FAKE_STATE/ssh.fwd" 2>/dev/null)
     assert_contains "$fwd" "forward localhost:48892:dl-04:48892" "URL 127.0.0.1 pergunta o nó"
@@ -752,9 +731,9 @@ test_jupyter_rejects_bad_input() {
     setup_mount_env
     local out
 
-    out=$(printf 'user@srv\nhttp://a;rm:1/lab\n' | "$TNRX_CONNECT" jupyter 2>&1)
+    out=$(printf 'user@srv\n' | "$TNRX_CONNECT" jupyter 'http://a;rm:1/lab' 2>&1)
     assert_contains "$out" "Nome de nó inválido" "nó com caractere perigoso é rejeitado"
-    out=$(printf 'user@srv\ndl-02:99999\n' | "$TNRX_CONNECT" jupyter 2>&1)
+    out=$(printf 'user@srv\n' | "$TNRX_CONNECT" jupyter 'dl-02:99999' 2>&1)
     assert_contains "$out" "Porta inválida" "porta fora da faixa é rejeitada"
     [[ ! -s "$FAKE_STATE/ssh.fwd" ]] && pass_test "nenhuma ponte aberta" || fail_test "abriu ponte com entrada inválida"
 
@@ -768,7 +747,7 @@ test_jupyter_keeps_master_it_did_not_open() {
     mkdir -p "$HOME/.cache/tnrx-connect"
     local sock="$HOME/.cache/tnrx-connect/ssh-$(printf '%s' user@srv | cksum | awk '{print $1}').sock"
     touch "$sock"
-    run_jupyter_bg 'user@srv\ndl-02:48889\n' || fail_test "não abriu" "$(cat "$MT/jout")"
+    run_jupyter_bg 'user@srv\n' 'dl-02:48889' || fail_test "não abriu" "$(cat "$MT/jout")"
     assert_contains "$(cat "$MT/jout")" "Reaproveitando conexão" "reaproveita a conexão existente"
     stop_jupyter_bg
     [[ -f "$sock" ]] && pass_test "conexão mestra preservada" || fail_test "fechou a conexão de outra sessão"
@@ -780,7 +759,7 @@ test_jupyter_master_lost_ends_command() {
     log_test "jupyter: se a conexão mestra cair, o comando avisa e termina"
     setup_mount_env
 
-    run_jupyter_bg 'user@srv\ndl-02:48889\n' || fail_test "não abriu"
+    run_jupyter_bg 'user@srv\n' 'dl-02:48889' || fail_test "não abriu"
     rm -f "$HOME/.cache/tnrx-connect/ssh-$(printf '%s' user@srv | cksum | awk '{print $1}').sock"
     local i
     for i in $(seq 1 30); do kill -0 "$JPID" 2>/dev/null || break; sleep 0.2; done
@@ -801,157 +780,197 @@ wait_out() {
     return 1
 }
 
-start_jupyter_start() {
-    # $1 = pasta remota. stdin: host + pasta. Sobe em background.
-    printf 'user@srv\n%s\n' "$1" | TNRX_JUPYTER_POLL_SECS=0.1 "$TNRX_CONNECT" jupyter start > "$MT/jout" 2>&1 &
+# --- descoberta automática: tnrx-connect jupyter (sem argumentos) ---
+
+JT_LISTENERS=()
+
+jt_listen() {
+    # $1 = porta. Escuta em 0.0.0.0 por 20s (faz o papel do Jupyter no ar).
+    python3 -c "
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', $1)); s.listen(); time.sleep(20)" &
+    JT_LISTENERS+=("$!")
+    sleep 0.3
+}
+
+jt_cleanup() {
+    local p
+    for p in "${JT_LISTENERS[@]}"; do kill "$p" 2>/dev/null; wait "$p" 2>/dev/null; done
+    JT_LISTENERS=()
+}
+
+jt_registry() {
+    # $1 = pasta remota, $2 = job, $3 = nó, $4 = porta, $5 = token, $6 = início (epoch)
+    mkdir -p "$1/.tnrx/jupyter"
+    printf 'NODE=%s\nPORT=%s\nTOKEN=%s\nJOBID=%s\nSTARTED=%s\n' "$3" "$4" "$5" "$2" "$6" > "$1/.tnrx/jupyter/$2.env"
+}
+
+jt_conf() {
+    # cria o .conf de uma sessão para a pasta atual: $1 = pasta remota
+    mkdir -p "$HOME/.config/tnrx-connect"
+    printf 'HOST=user@srv\nREMOTE_PATH=%q\nLOCAL_DIR=%q\nLAST_USED=1\n' "$1" "$(pwd -P)" > "$HOME/.config/tnrx-connect/user@srv_proj.conf"
+}
+
+jt_run() {
+    # $1 = stdin (formato printf %b). Sobe `tnrx-connect jupyter` em background.
+    printf '%b' "$1" | TNRX_JUPYTER_POLL_SECS=0.1 TNRX_JUPYTER_LIVE_SECS=1 "$TNRX_CONNECT" jupyter > "$MT/jout" 2>&1 &
     JPID=$!
 }
 
-test_jupyter_start_full_flow() {
-    log_test "jupyter start: roda o tnrx no servidor, abre a ponte sozinho e encerra o job ao sair"
+test_jupyter_auto_single_server() {
+    log_test "jupyter (auto): um servidor no ar -> conecta direto, sem perguntar nada"
     setup_mount_env
-    local remote="$MT/proj remoto"; mkdir -p "$remote"
+    local remote="$MT/proj remoto"; jt_conf "$remote"
+    jt_listen 48950
+    jt_registry "$remote" 95272 127.0.0.1 48950 aabbccdd0011 "$(date +%s)"
 
-    start_jupyter_start "$remote"
-    wait_out "Ponte aberta" && pass_test "ponte aberta sem colar nada" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    jt_run ''
+    wait_out "Ponte aberta" && pass_test "ponte aberta sem prompts" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
     local out; out=$(cat "$MT/jout")
-    assert_contains "$out" "http://dl-02.srv.localhost:48889/lab?token=abc123def" "link com nó, porta e token do marcador"
-    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "forward localhost:48889:dl-02:48889" "encaminha pro nó/porta lidos da saída"
-    [[ "$(cat "$FAKE_STATE/tnrx.args")" == "uvslurm jupyter lab" ]] && pass_test "roda 'tnrx uvslurm jupyter lab'" || fail_test "comando remoto errado" "$(cat "$FAKE_STATE/tnrx.args")"
-    [[ "$(cat "$FAKE_STATE/tnrx.cwd")" == "$remote" ]] && pass_test "roda na pasta do projeto (caminho com espaço)" || fail_test "pasta remota errada" "$(cat "$FAKE_STATE/tnrx.cwd")"
-
+    assert_contains "$out" "Procurando servidores Jupyter no ar em user@srv:$remote" "usa host e pasta da sessão"
+    assert_not_contains "$out" "Host (" "não pergunta o host"
+    assert_contains "$out" "127.0.0.1:48950" "ponte para nó:porta do registro"
+    assert_contains "$out" "?token=aabbccdd0011" "link com o token do registro"
+    assert_contains "$out" "job 95272" "mostra o job"
+    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" ":127.0.0.1:48950" "encaminhamento pedido"
     kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
-    sleep 0.5
-    [[ -f "$FAKE_STATE/tnrx.killed" ]] && pass_test "ao encerrar, o job remoto recebe HUP" || fail_test "job remoto ficou vivo"
-    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "cancel localhost:48889:dl-02:48889" "cancela a ponte"
-    assert_not_contains "$(ps -eo args)" "$MT" "nenhum processo do teste sobrou"
+    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "cancel " "cancela a ponte ao sair"
+
+    jt_cleanup; cleanup_mount_env
+}
+
+test_jupyter_auto_none() {
+    log_test "jupyter (auto): nenhum servidor -> só avisa e sai"
+    setup_mount_env
+    local remote="$MT/proj"; mkdir -p "$remote"; jt_conf "$remote"
+
+    local out rc
+    out=$("$TNRX_CONNECT" jupyter < /dev/null 2>&1); rc=$?
+    assert_contains "$out" "Nenhum servidor Jupyter no ar neste projeto" "avisa que não há servidor"
+    assert_contains "$out" "tnrx uvslurm jupyter lab" "diz como iniciar um"
+    assert_not_contains "$out" "URL" "não pede para colar URL"
+    [[ "$rc" == "1" ]] && pass_test "sai com erro" || fail_test "exit=$rc"
+    [[ ! -s "$FAKE_STATE/ssh.fwd" ]] && pass_test "nenhuma ponte aberta" || fail_test "abriu ponte sem servidor"
+    [[ ! -f "$HOME/.cache/tnrx-connect/ssh-$(printf '%s' user@srv | cksum | awk '{print $1}').sock" ]] \
+        && pass_test "fecha a conexão que abriu" || fail_test "conexão mestra ficou aberta"
 
     cleanup_mount_env
 }
 
-test_jupyter_start_marker_with_ansi_and_crlf() {
-    log_test "jupyter start: marcador com códigos de cor e CRLF (saída de terminal) é lido"
+test_jupyter_auto_multiple_servers_menu() {
+    log_test "jupyter (auto): vários servidores -> menu, mais recente primeiro"
     setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
+    local remote="$MT/proj"; jt_conf "$remote"
+    local now; now=$(date +%s)
+    jt_listen 48951; jt_listen 48953
+    jt_registry "$remote" 11 127.0.0.1 48951 aa11 $((now - 7200))
+    jt_registry "$remote" 22 127.0.0.1 48953 bb22 $((now - 60))
 
-    FAKE_TNRX_MODE=ansi start_jupyter_start "$remote"
-    wait_out "Ponte aberta" && pass_test "ponte aberta" || fail_test "não leu o marcador com ANSI" "$(cat "$MT/jout")"
-    assert_contains "$(cat "$MT/jout")" "token=abc123def" "token extraído sem lixo"
-    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
-
-    cleanup_mount_env
-}
-
-test_jupyter_start_job_fails_without_marker() {
-    log_test "jupyter start: job que falha antes de subir o Jupyter"
-    setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
-
-    FAKE_TNRX_MODE=noready start_jupyter_start "$remote"
-    wait "$JPID"; local rc=$?
+    jt_run '2\n'
+    wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
     local out; out=$(cat "$MT/jout")
-    [[ "$rc" == "1" ]] && pass_test "termina com erro (exit 1)" || fail_test "exit=$rc"
-    assert_contains "$out" "erro: sem GPU disponível" "mostra a saída do servidor"
-    assert_contains "$out" "nenhuma linha TNRX_JUPYTER_READY" "explica que não veio nó/porta"
-    [[ ! -s "$FAKE_STATE/ssh.fwd" ]] && pass_test "nenhuma ponte aberta" || fail_test "abriu ponte sem marcador"
-
-    cleanup_mount_env
-}
-
-test_jupyter_start_job_ends_by_itself() {
-    log_test "jupyter start: Jupyter encerrado no servidor fecha a ponte e o comando"
-    setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
-
-    FAKE_TNRX_MODE=exitafter start_jupyter_start "$remote"
-    wait "$JPID"; local rc=$?
-    [[ "$rc" == "0" ]] && pass_test "termina sozinho com exit 0" || fail_test "exit=$rc" "$(cat "$MT/jout")"
-    assert_contains "$(cat "$MT/jout")" "O Jupyter terminou; a ponte foi fechada" "avisa"
-    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "cancel localhost:48889:dl-02:48889" "cancela a ponte"
-
-    cleanup_mount_env
-}
-
-test_jupyter_start_slow_queue_and_hint() {
-    log_test "jupyter start: fila demorada mostra a dica e ainda assim abre a ponte depois"
-    setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
-
-    FAKE_TNRX_MODE=slow TNRX_JUPYTER_HINT_SECS=0.3 start_jupyter_start "$remote"
-    wait_out "Ponte aberta" && pass_test "ponte abriu depois da espera" || fail_test "não abriu" "$(cat "$MT/jout")"
-    assert_contains "$(cat "$MT/jout")" "Ainda sem a linha TNRX_JUPYTER_READY" "mostra a dica de espera"
+    assert_contains "$out" "[1] 127.0.0.1:48953  (job 22" "o mais recente é o [1]"
+    assert_contains "$out" "[2] 127.0.0.1:48951  (job 11" "o mais antigo é o [2]"
+    assert_contains "$out" "?token=aa11" "a opção 2 conecta no mais antigo"
+    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" ":127.0.0.1:48951" "encaminha o escolhido"
     kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
 
-    cleanup_mount_env
+    jt_cleanup; cleanup_mount_env
 }
 
-test_jupyter_start_old_tnrx_without_marker() {
-    log_test "jupyter start: tnrx antigo (sem marcador) não abre ponte e avisa"
+test_jupyter_auto_ignores_and_prunes_dead() {
+    log_test "jupyter (auto): registros de servidores parados são ignorados; os velhos são apagados"
     setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
+    local remote="$MT/proj"; jt_conf "$remote"
+    local now; now=$(date +%s)
+    jt_listen 48955
+    jt_registry "$remote" 1 127.0.0.1 48955 aa11 "$now"
+    jt_registry "$remote" 2 127.0.0.1 48956 bb22 "$((now - 60))"
+    jt_registry "$remote" 3 127.0.0.1 48957 cc33 "$((now - 200000))"
 
-    FAKE_TNRX_MODE=silent TNRX_JUPYTER_HINT_SECS=0.3 start_jupyter_start "$remote"
-    wait_out "Ainda sem a linha" && pass_test "avisa que o tnrx pode estar desatualizado" || fail_test "sem aviso" "$(cat "$MT/jout")"
-    [[ ! -s "$FAKE_STATE/ssh.fwd" ]] && pass_test "nenhuma ponte aberta" || fail_test "abriu ponte sem marcador"
-    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
-    sleep 0.4
-    [[ -f "$FAKE_STATE/tnrx.killed" ]] && pass_test "job remoto encerrado ao sair" || fail_test "job remoto ficou vivo"
-
-    cleanup_mount_env
-}
-
-test_jupyter_start_fallback_to_jupyter_url() {
-    log_test "jupyter start: tnrx sem marcador mas com a URL do Jupyter (versão intermediária)"
-    setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
-
-    FAKE_TNRX_MODE=oldtnrx start_jupyter_start "$remote"
-    wait_out "Ponte aberta" && pass_test "ponte aberta pela URL do Jupyter" || fail_test "não abriu" "$(cat "$MT/jout")"
-    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "forward localhost:48889:dl-05:48889" "usa o nó da URL (não o 127.0.0.1)"
-    assert_contains "$(cat "$MT/jout")" "http://dl-05.srv.localhost:48889/lab?token=aaa111bbb" "link com o token da URL"
-    assert_contains "$(cat "$MT/jout")" "desatualizado" "avisa que o tnrx do servidor está desatualizado"
+    jt_run ''
+    wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    local out; out=$(cat "$MT/jout")
+    assert_contains "$out" "?token=aa11" "conecta no único que responde"
+    assert_not_contains "$out" "[1]" "sem menu: só um estava no ar"
+    [[ -f "$remote/.tnrx/jupyter/2.env" ]] && pass_test "parado há pouco tempo: mantido" || fail_test "apagou registro recente"
+    [[ ! -f "$remote/.tnrx/jupyter/3.env" ]] && pass_test "parado há mais de 1 dia: apagado" || fail_test "registro antigo ficou"
     kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
 
-    cleanup_mount_env
+    jt_cleanup; cleanup_mount_env
 }
 
-test_jupyter_start_masked_token_no_bridge() {
-    log_test "jupyter start: token mascarado no log e sem marcador não abre ponte"
+test_jupyter_auto_rejects_bad_registry_files() {
+    log_test "jupyter (auto): registro com conteúdo suspeito é ignorado (nunca executado)"
     setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
-
-    FAKE_TNRX_MODE=masked TNRX_JUPYTER_HINT_SECS=0.3 start_jupyter_start "$remote"
-    wait_out "Ainda sem a linha" && pass_test "cai na dica" || fail_test "sem dica" "$(cat "$MT/jout")"
-    [[ ! -s "$FAKE_STATE/ssh.fwd" ]] && pass_test "não abre ponte com token '...'" || fail_test "abriu ponte com token mascarado"
-    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
-
-    cleanup_mount_env
-}
-
-test_jupyter_start_bad_remote_path() {
-    log_test "jupyter start: pasta remota relativa é recusada antes de rodar qualquer coisa"
-    setup_mount_env
+    local remote="$MT/proj"; jt_conf "$remote"
+    jt_listen 48958
+    local now; now=$(date +%s)
+    jt_registry "$remote" 1 '127.0.0.1;touch_pwned' 48958 aa11 "$now"
+    jt_registry "$remote" 2 127.0.0.1 48958 'aa11;touch_pwned' "$now"
+    jt_registry "$remote" 3 127.0.0.1 'x48958' aa11 "$now"
 
     local out
-    out=$(printf 'user@srv\nrelativa/x\n' | "$TNRX_CONNECT" jupyter start 2>&1)
-    assert_contains "$out" "caminho absoluto" "erro de caminho absoluto"
-    [[ ! -e "$FAKE_STATE/tnrx.args" ]] && pass_test "não executou o tnrx" || fail_test "executou o tnrx"
+    out=$("$TNRX_CONNECT" jupyter < /dev/null 2>&1)
+    assert_contains "$out" "Nenhum servidor Jupyter no ar" "todos rejeitados"
+    [[ ! -e "$remote/touch_pwned" && ! -e "$PWD/touch_pwned" ]] && pass_test "nada foi executado" || fail_test "conteúdo do registro foi executado"
+
+    jt_cleanup; cleanup_mount_env
+}
+
+test_jupyter_auto_bridge_closes_when_server_ends() {
+    log_test "jupyter (auto): quando o Jupyter para no servidor, a ponte fecha e o comando termina"
+    setup_mount_env
+    local remote="$MT/proj"; jt_conf "$remote"
+    jt_listen 48960
+    jt_registry "$remote" 7 127.0.0.1 48960 aa11 "$(date +%s)"
+
+    jt_run ''
+    wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    jt_cleanup
+    local i
+    for i in $(seq 1 60); do kill -0 "$JPID" 2>/dev/null || break; sleep 0.2; done
+    if kill -0 "$JPID" 2>/dev/null; then fail_test "comando não terminou"; kill -TERM "$JPID"; else pass_test "terminou sozinho"; fi
+    wait "$JPID" 2>/dev/null
+    assert_contains "$(cat "$MT/jout")" "terminou; a ponte foi fechada" "avisa"
+    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "cancel " "cancela a ponte"
 
     cleanup_mount_env
 }
 
-test_jupyter_start_local_port_busy() {
-    log_test "jupyter start: porta local ocupada -> usa a próxima"
+test_jupyter_auto_from_subfolder() {
+    log_test "jupyter (auto): rodado numa subpasta da pasta montada usa a sessão dela"
     setup_mount_env
-    local remote="$MT/p"; mkdir -p "$remote"
+    local remote="$MT/proj"; jt_conf "$remote"
+    mkdir -p sub/deep; cd sub/deep || exit 1
+    jt_listen 48962
+    jt_registry "$remote" 8 127.0.0.1 48962 aa11 "$(date +%s)"
 
-    FAKE_BUSY_PORTS="48889" start_jupyter_start "$remote"
-    wait_out "Ponte aberta" || fail_test "não abriu" "$(cat "$MT/jout")"
-    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "forward localhost:48890:dl-02:48889" "local 48890 -> remoto 48889"
-    assert_contains "$(cat "$MT/jout")" "já estava em uso; usando 48890" "avisa"
+    jt_run ''
+    wait_out "Ponte aberta" && pass_test "achou a sessão da pasta acima" || fail_test "não achou" "$(cat "$MT/jout")"
+    assert_not_contains "$(cat "$MT/jout")" "Host (" "sem perguntas"
     kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
 
-    cleanup_mount_env
+    jt_cleanup; cleanup_mount_env
+}
+
+test_jupyter_auto_asks_when_no_session() {
+    log_test "jupyter (auto): fora de uma pasta montada pergunta host e pasta"
+    setup_mount_env
+    local remote="$MT/proj remoto"; mkdir -p "$remote"
+    jt_listen 48964
+    jt_registry "$remote" 9 127.0.0.1 48964 aa11 "$(date +%s)"
+
+    jt_run "user@srv\n$remote\n"
+    wait_out "Ponte aberta" && pass_test "ponte aberta com host/pasta informados" || fail_test "não abriu" "$(cat "$MT/jout")"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    local out
+    out=$(printf 'user@srv\nrelativa\n' | "$TNRX_CONNECT" jupyter 2>&1)
+    assert_contains "$out" "caminho absoluto" "pasta relativa é recusada"
+
+    jt_cleanup; cleanup_mount_env
 }
 
 test_usage_lists_both_modes() {
@@ -1008,16 +1027,14 @@ run_all_tests() {
     test_jupyter_rejects_bad_input
     test_jupyter_keeps_master_it_did_not_open
     test_jupyter_master_lost_ends_command
-    test_jupyter_start_full_flow
-    test_jupyter_start_marker_with_ansi_and_crlf
-    test_jupyter_start_job_fails_without_marker
-    test_jupyter_start_job_ends_by_itself
-    test_jupyter_start_slow_queue_and_hint
-    test_jupyter_start_old_tnrx_without_marker
-    test_jupyter_start_fallback_to_jupyter_url
-    test_jupyter_start_masked_token_no_bridge
-    test_jupyter_start_bad_remote_path
-    test_jupyter_start_local_port_busy
+    test_jupyter_auto_single_server
+    test_jupyter_auto_none
+    test_jupyter_auto_multiple_servers_menu
+    test_jupyter_auto_ignores_and_prunes_dead
+    test_jupyter_auto_rejects_bad_registry_files
+    test_jupyter_auto_bridge_closes_when_server_ends
+    test_jupyter_auto_from_subfolder
+    test_jupyter_auto_asks_when_no_session
     rm -rf "$FAKES_DIR"
 
     echo -e "\n${BLUE}📊 Total: $((TESTS_PASSED + TESTS_FAILED))  Passed: ${GREEN}$TESTS_PASSED${NC}  Failed: ${RED}$TESTS_FAILED${NC}"
