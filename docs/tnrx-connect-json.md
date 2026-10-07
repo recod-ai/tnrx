@@ -16,7 +16,7 @@ A ferramenta não reimplementa nada: ela chama o `tnrx-connect` com `--json` e l
 
 | Tipo | Comandos | Saída |
 | --- | --- | --- |
-| **Resposta única** | `status`, `cluster`, `cluster cancel`, `jupyter list`, `jupyter stop` | Um objeto em uma linha: `{"v":1,"ok":true,...}` ou `{"v":1,"ok":false,"error":{"code":...,"message":...}}` |
+| **Resposta única** | `status`, `cluster`, `cluster cancel`, `jupyter list`, `jupyter stop`, `config`, `rename`, `forget` | Um objeto em uma linha: `{"v":1,"ok":true,...}` ou `{"v":1,"ok":false,"error":{"code":...,"message":...}}` |
 | **Eventos** | `jupyter start`, `jupyter connect` | Um objeto por linha (JSON Lines), cada um com `"event"`. Erro vira `{"v":1,"event":"error","code":...,"message":...}` |
 
 ### Códigos de saída e de erro
@@ -25,7 +25,7 @@ A ferramenta não reimplementa nada: ela chama o `tnrx-connect` com `--json` e l
 | --- | --- |
 | `0` | Sucesso |
 | `1` | Falha (veja `error.code`) |
-| `2` | Uso inválido (`usage`): opção faltando, job inválido |
+| `2` | Uso inválido (`usage`, `invalid_value`): opção faltando, job inválido, valor recusado |
 | `3` | Sem conexão (`not_connected`) |
 | `130` | Interrompido por sinal (o `jupyter start` cancela o job; o `jupyter connect` fecha a ponte) |
 
@@ -40,18 +40,26 @@ A ferramenta não reimplementa nada: ela chama o `tnrx-connect` com `--json` e l
 | `bridge_failed` | Nenhuma porta local livre para a ponte |
 | `no_server` | `jupyter connect` sem Jupyter no ar no projeto (ou sem o `--job` pedido) |
 | `query_failed`, `no_slurm` | Só dentro de um host do `cluster`: o servidor não respondeu, ou não tem `sinfo` |
+| `not_mounted` | `config` numa pasta que não está montada agora |
+| `invalid_value` | `config set` com chave desconhecida ou valor fora do formato; nada é gravado |
+| `write_failed` | `config` não conseguiu gravar o `tnrx.conf` na pasta montada |
+| `unknown_mount` | `rename`/`forget` com `--id` ou pasta que não é uma montagem conhecida |
+| `mounted` | `forget` numa pasta montada (ou com a montagem caída e a pasta ainda montada) |
+| `pending_writes` | `forget` com arquivos no cache que ainda não chegaram ao servidor; `--force` apaga mesmo assim |
 
 ### Opções comuns
 
 * `--host H`: o host (como no `.conf`: alias do `~/.ssh/config` ou `user@servidor`). Sem ele, os comandos que precisam de um host usam o da pasta montada onde foram rodados.
 * `--project P`: a pasta **remota** do projeto (caminho absoluto no servidor), como em `remote_path`.
 * `--job J`: o id do job no Slurm.
+* `--dir D`: a pasta **local** (montada) do projeto, para o `config`. Sem ela, a pasta atual.
+* `--id ID`: o `id` de uma montagem (como no `status`), para o `rename` e o `forget`. Sem ele, a montagem da pasta atual (ou de `--dir`).
 
 ## Comandos
 
 ### `tnrx-connect status --json`
 
-Todas as pastas que este laptop conhece (os `.conf`), com o estado. Não usa a rede, exceto um `ssh -O check` por host (local, instantâneo) e a leitura do `tnrx_slurm.conf` pela pasta montada (com limite de 3 s).
+Todas as pastas que este laptop conhece (os `.conf`), com o estado. Não usa a rede, exceto um `ssh -O check` por host (local, instantâneo) e a leitura do `tnrx.conf` pela pasta montada (com limite de 3 s).
 
 ```json
 {"v":1,"ok":true,
@@ -60,9 +68,10 @@ Todas as pastas que este laptop conhece (os `.conf`), com o estado. Não usa a r
    "local_dir":"/home/marcos/Research/x/code","host":"recod-headnode","remote_path":"/home/marcos/x",
    "state":"mounted","connected":true,"rclone_pid":3610194,"since":1759590000,"last_used":1759590000,
    "jupyter_port":18342,"log":"/home/marcos/.local/share/tnrx-connect/recod-headnode_code/mount.log",
-   "slurm":{"file":"/home/marcos/Research/x/code/tnrx_slurm.conf","exists":true,
+   "slurm":{"file":"/home/marcos/Research/x/code/tnrx.conf","exists":true,
             "values":{"PARTITION":{"value":"l40s","from_file":true},
-                      "GPUS":{"value":"1","from_file":false}, "CPUS":{...}, "MEM":{...}, "TIME":{...}}}}
+                      "GPUS":{"value":"1","from_file":false}, "CPUS":{...}, "MEM":{...}, "TIME":{...},
+                      "IMAGE":{"value":"docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04","from_file":false}}}}
  ],
  "hosts":[{"host":"recod-headnode","connected":true}]}
 ```
@@ -75,9 +84,34 @@ Todas as pastas que este laptop conhece (os `.conf`), com o estado. Não usa a r
 
   A mesma pasta local pode ter um `.conf` por host: só o da montagem atual aparece como `mounted`.
 * `connected`: a conexão mestra com o host está viva. `mounted` com `connected: false` = a rede caiu; a ferramenta oferece "Reconectar" (terminal com `tnrx-connect mount` na pasta).
-* `slurm`: só para `mounted` + `connected` (senão `null`). Os valores são os **efetivos**: os do `tnrx_slurm.conf` (`from_file: true`) ou o padrão do `tnrx` (`from_file: false`). `file` é o caminho local, para abrir no editor.
+* `name`: o nome dado com `rename`, ou o nome da pasta local.
+* `slurm`: a configuração do projeto (`tnrx.conf`); o campo se chama assim desde antes do `IMAGE`. Só para `mounted` + `connected` (senão `null`). Os valores são os **efetivos**: os do arquivo (`from_file: true`) ou o padrão do `tnrx` (`from_file: false`). Para o `IMAGE`, o padrão é o que o `tnrx` usaria: um `.sif` na pasta, o `tnrx.def`, ou a imagem padrão. `file` é o caminho local, para abrir no editor: `tnrx.conf`, ou `tnrx_slurm.conf` num projeto que ainda usa o nome antigo.
 * `jupyter_port`: a porta local fixa do Jupyter desse projeto, ou `null` se ainda não foi escolhida.
 * `hosts`: cada host dos `.conf`, com a conexão.
+
+### `tnrx-connect config [--dir D] [set KEY=VALOR ... | unset KEY ...] --json`
+
+Lê ou muda o `tnrx.conf` da pasta montada (pela própria montagem). Sem `set`/`unset`, só lê. As chaves são `PARTITION`, `GPUS`, `CPUS`, `MEM`, `TIME` e `IMAGE`; os valores são conferidos antes (qualquer um inválido: `invalid_value`, nada é gravado). Ao gravar, um `tnrx_slurm.conf` antigo vira `tnrx.conf`. As outras linhas do arquivo, inclusive comentários, ficam.
+
+```json
+{"v":1,"ok":true,"dir":"/home/marcos/Research/x/code","slurm":{ ...como no status... }}
+```
+
+### `tnrx-connect rename [--id ID] <nome> --json`
+
+Dá um nome à montagem (até 60 caracteres). Nome vazio volta ao nome da pasta. `name` é o nome que vale agora.
+
+```json
+{"v":1,"ok":true,"id":"recod-headnode_code","name":"code do artigo"}
+```
+
+### `tnrx-connect forget [--id ID] [--force] --json`
+
+Apaga a montagem deste laptop: o `.conf`, o cache, os snapshots e o log. Não toca nos arquivos do servidor nem na pasta local. Recusa uma pasta montada (`mounted`) e um cache com escritas que não chegaram ao servidor (`pending_writes`; a ferramenta pode oferecer montar de novo, para enviá-las, ou repetir com `--force`).
+
+```json
+{"v":1,"ok":true,"id":"recod-headnode_code"}
+```
 
 ### `tnrx-connect cluster [--host H] --json`
 
@@ -100,7 +134,7 @@ Todas as pastas que este laptop conhece (os `.conf`), com o estado. Não usa a r
 * `nodes`: a soma das linhas do `sinfo` da partição (`%F`: alocados/livres/outros/total). Nós `MIXED` (parte das GPUs em uso) contam em `other`, então `idle` subestima o que está disponível: para "dá para rodar agora?", use `gpus.free`.
 * `gpus`: de `scontrol show node -o` (`CfgTRES`/`AllocTRES` `gres/gpu`). `unavailable` = GPUs não alocadas em nós `DOWN`/`DRAIN`/`MAINT`/...; `free = total - used - unavailable`. `null` se o cluster não informa GPUs.
 * `jobs[].work_dir`: a pasta em que o job foi submetido. Compare com `remote_path` para saber de que projeto ele é. `reason` é o nó (rodando) ou o motivo (na fila, ex.: `(Resources)`).
-* `default`: a partição padrão do Slurm (a do `*` no `sinfo`), não a do `tnrx_slurm.conf`.
+* `default`: a partição padrão do Slurm (a do `*` no `sinfo`), não a do `tnrx.conf`.
 
 ### `tnrx-connect cluster cancel <job> --host H --json` / `tnrx-connect jupyter stop <job> --host H --json`
 
@@ -123,6 +157,7 @@ Os Jupyters no ar, por host e por projeto. Sem `--host`, todos os hosts dos `.co
      "bridge_open":false,"local_port":18342,"url":"http://127.0.0.1:18342/lab?token=..."}]}]}]}
 ```
 
+* `name`: o nome da montagem dessa pasta remota (o do `rename`), ou o nome da pasta remota.
 * Um servidor só aparece se a porta responde **e** (quando o servidor tem `squeue`) o job ainda está na fila. Para o mesmo `nó:porta`, só o registro mais recente.
 * `local_port`/`url`: com `bridge_open: true`, a ponte já está aberta (por qualquer `tnrx-connect jupyter` deste laptop) e a URL funciona agora. Com `false`, é a URL que o `jupyter connect` vai abrir: a porta fixa do projeto.
 * `token_fixed`: o Jupyter usa a senha fixa do projeto. Com `true` e porta fixa, a `url` é a mesma sempre. Com `false` (iniciado antes da senha fixa, ou `tnrx` desatualizado no servidor), ela vale só para aquele Jupyter.

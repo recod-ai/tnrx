@@ -61,6 +61,7 @@ function mountsTree(status) {
         return {
             id: `mount:${m.id}`,
             label: m.name,
+            // Contexto: mount-<estado>; o menu usa isso para Renomear (sempre) e Apagar (só desmontada).
             description: `${m.host}:${m.remote_path}`,
             tooltip,
             icon: st.icon,
@@ -71,16 +72,47 @@ function mountsTree(status) {
     });
 }
 
-// --- Bloco 2: Configuração Slurm (tnrx_slurm.conf de cada pasta montada) ---
+// --- Bloco 2: Configuração do projeto (tnrx.conf de cada pasta montada) ---
 
-const SLURM_ORDER = ['PARTITION', 'GPUS', 'CPUS', 'MEM', 'TIME'];
+const SLURM_ORDER = ['PARTITION', 'GPUS', 'CPUS', 'MEM', 'TIME', 'IMAGE'];
+
+const KEY_HELP = {
+    PARTITION: 'Partição do Slurm',
+    GPUS: 'GPUs por job',
+    CPUS: 'CPUs por job',
+    MEM: 'Memória por job',
+    TIME: 'Tempo máximo do job',
+    IMAGE: 'Imagem do container',
+};
+
+function validateConfigValue(key, value) {
+    // O mesmo que o `tnrx-connect config` confere (ele é quem decide; isto só avisa antes).
+    const v = String(value ?? '');
+    const rules = {
+        PARTITION: [/^[A-Za-z0-9_.-]+$/, "Use só letras, números, '.', '_' e '-'."],
+        GPUS: [/^[0-9]+$/, 'Use um número inteiro.'],
+        CPUS: [/^[0-9]+$/, 'Use um número inteiro.'],
+        MEM: [/^[0-9]+[KMGTkmgt]?$/, 'Use um número com unidade, ex.: 16G ou 500M.'],
+        TIME: [/^([0-9]+-)?[0-9]+(:[0-9]{2}){0,2}$/, 'Use o formato do Slurm, ex.: 02:00:00 ou 1-00:00:00.'],
+        IMAGE: [/^\S+$/, 'Use uma origem (docker://...), um .def ou o caminho de um .sif, sem espaços.'],
+    };
+    const r = rules[key];
+    if (!r) return `Chave desconhecida: ${key}`;
+    return r[0].test(v) ? null : r[1];
+}
+
+function confName(m) {
+    // Nome do arquivo de configuração (tnrx.conf, ou o tnrx_slurm.conf antigo).
+    return m.slurm && m.slurm.file ? m.slurm.file.split('/').pop() : 'tnrx.conf';
+}
 
 function slurmTree(status) {
     if (!status || !status.mounts) return [];
     return sortMounts(status.mounts.filter((m) => m.state === 'mounted')).map((m) => {
+        const file = confName(m);
         let children;
         if (!m.slurm) {
-            children = [info(`slurm:${m.id}:off`, 'Sem conexão: reconecte para ler o tnrx_slurm.conf', 'warning')];
+            children = [info(`slurm:${m.id}:off`, 'Sem conexão: reconecte para ler o tnrx.conf', 'warning')];
         } else {
             children = SLURM_ORDER.filter((k) => m.slurm.values[k]).map((k) => {
                 const v = m.slurm.values[k];
@@ -88,17 +120,21 @@ function slurmTree(status) {
                     id: `slurm:${m.id}:${k}`,
                     label: k,
                     description: v.from_file ? v.value : `${v.value} (padrão)`,
-                    tooltip: v.from_file ? `${k}=${v.value} (tnrx_slurm.conf)` : `${k}=${v.value}: padrão do tnrx (não está no tnrx_slurm.conf)`,
+                    tooltip: `${KEY_HELP[k]}: ${v.value}\n${v.from_file ? `Definido no ${file}.` : `Padrão do tnrx (não está no ${file}).`}\nClique para mudar.`,
                     icon: v.from_file ? 'symbol-field' : 'symbol-constant',
-                    contextValue: 'slurm-key',
+                    // O contexto decide se a linha oferece "voltar ao padrão".
+                    contextValue: v.from_file ? 'slurm-key-file' : 'slurm-key-default',
                     mount: m,
+                    key: k,
+                    value: v,
                 };
             });
         }
         return {
             id: `slurm:${m.id}`,
             label: m.name,
-            description: m.slurm && !m.slurm.exists ? `${m.host} · sem tnrx_slurm.conf (padrões)` : m.host,
+            description: m.slurm && !m.slurm.exists ? `${m.host} · sem tnrx.conf (padrões)`
+                : file !== 'tnrx.conf' && m.slurm ? `${m.host} · ${file} (nome antigo)` : m.host,
             tooltip: m.slurm ? m.slurm.file : m.local_dir,
             icon: 'settings-gear',
             contextValue: 'slurm-mount',
@@ -248,4 +284,4 @@ function jupyterTree(list, now) {
     return out.sort((a, b) => (b.children[0].server ? 1 : 0) - (a.children[0].server ? 1 : 0) || a.label.localeCompare(b.label));
 }
 
-module.exports = { fmtAge, fmtDate, mountsTree, slurmTree, clusterTree, jupyterTree, projectOfJob, mountStatus };
+module.exports = { fmtAge, fmtDate, mountsTree, slurmTree, clusterTree, jupyterTree, projectOfJob, mountStatus, SLURM_ORDER, KEY_HELP, validateConfigValue };

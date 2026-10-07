@@ -3,7 +3,7 @@
 # Definition file padrão do tnrx (formato do Apptainer/Singularity).
 # Para customizar a imagem de um projeto, copie este arquivo para a pasta do
 # projeto, edite e rode `tnrx install singularity`: ele gera a imagem (build
-# com --fakeroot) no banco ~/.tnrx/sifs e liga o projeto a ela.
+# com --fakeroot) no banco ~/.tnrx/sifs e grava IMAGE=tnrx.def no tnrx.conf.
 #
 # A imagem só traz o sistema (CUDA, cuDNN, ferramentas de linha de comando).
 # O Python e as bibliotecas ficam com o uv no .venv do projeto: o uv baixa a

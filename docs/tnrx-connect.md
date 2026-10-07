@@ -102,7 +102,17 @@ tnrx uv add numpy pandas
 tnrx uvslurm python train.py
 ```
 
-Os recursos do job (partição, GPUs, memória, tempo) vêm do `tnrx_slurm.conf` do projeto, que você edita no laptop como qualquer arquivo ([detalhes](tnrx.md#configurar-os-recursos-tnrx_slurmconf)). Para ver as GPUs livres e os seus jobs sem sair do laptop:
+Os recursos do job (partição, GPUs, memória, tempo) e a imagem do container vêm do `tnrx.conf` do projeto ([detalhes](tnrx.md#configuração-do-projeto-tnrxconf)). Ele é um arquivo do projeto: dá para editar no laptop como qualquer outro, ou pelo terminal:
+
+```bash
+tnrx-connect config                       # mostra os valores, marcando os que são padrão
+tnrx-connect config set GPUS=2 TIME=04:00:00
+tnrx-connect config unset TIME            # volta ao padrão
+```
+
+O `config` confere os valores antes de gravar (`GPUS` precisa ser um número, `TIME` no formato do Slurm...). A [extensão do VS Code](../vscode/README.md) faz o mesmo com um clique em cada valor, e oferece as partições do cluster com as GPUs livres.
+
+Para ver as GPUs livres e os seus jobs sem sair do laptop:
 
 ```bash
 tnrx-connect cluster               # partições, GPUs livres e os seus jobs
@@ -144,6 +154,25 @@ cd ~ && tnrx-connect umount ~/trabalho/meu-projeto
 ```
 
 Ele tira um último snapshot, desmonta, espera terminar o envio do que estava pendente e fecha a conexão. Se algo ainda usa a pasta (o editor, o Claude Code, um terminal dentro dela), ele recusa e a pasta continua montada: feche o que a usa e rode de novo, ou use `-f` para desmontar mesmo assim.
+
+### Renomear ou apagar uma montagem
+
+Cada montagem aparece com o nome da pasta local. Para diferenciar duas pastas `code` de projetos diferentes, dê um nome a cada uma:
+
+```bash
+cd ~/trabalho/artigo/code && tnrx-connect rename "code do artigo"
+tnrx-connect rename ""          # volta ao nome da pasta
+```
+
+O nome aparece no `status`, no menu do `jupyter` e na extensão do VS Code (inclusive ao lado dos seus jobs, no bloco Cluster).
+
+Para apagar uma montagem que você não usa mais, desmonte e rode:
+
+```bash
+cd ~/trabalho/meu-projeto && tnrx-connect forget
+```
+
+Ele apaga deste laptop a configuração, o cache e os snapshots da pasta. **Os arquivos no servidor e a pasta local não são tocados.** Ele recusa uma pasta montada e, se o cache tiver arquivos salvos que ainda não chegaram ao servidor, pede para montar de novo e deixá-los subir; `--force` apaga mesmo assim, perdendo essas mudanças. Se a mesma pasta local foi usada com dois servidores, escolha qual com `--id <id>` (o `id` aparece no `tnrx-connect status --json`).
 
 ## Jupyter
 
@@ -230,18 +259,21 @@ Enquanto a pasta está montada, o `tnrx-connect` tira um snapshot a cada minuto,
 | `tnrx-connect jupyter list` | Lista os Jupyters no ar, sem conectar |
 | `tnrx-connect cluster [--host H]` | Partições, GPUs livres e os seus jobs nos servidores com pasta montada |
 | `tnrx-connect cluster cancel <job>` | Cancela um job |
+| `tnrx-connect config [set KEY=VALOR ... \| unset KEY ...]` | Mostra ou muda o `tnrx.conf` do projeto montado |
+| `tnrx-connect rename <nome>` | Dá um nome à montagem (vazio: volta ao nome da pasta) |
+| `tnrx-connect forget [--force] [--id ID]` | Apaga a montagem deste laptop (configuração, cache, snapshots). Precisa estar desmontada |
 | `tnrx-connect --debug <comando>` | Mostra os comandos reais (`ssh`, `rclone`) antes de rodá-los |
 | `tnrx-connect update` | Atualiza o `tnrx-connect` (e a extensão do VS Code) a partir do GitHub |
 | `tnrx-connect version` | Versão instalada |
 | `tnrx-connect uninstall` | Remove os comandos e a pasta da instalação |
 
-Os comandos `status`, `cluster` e `jupyter` também têm saída `--json`, para ferramentas: [tnrx-connect-json.md](tnrx-connect-json.md).
+Os comandos `status`, `cluster`, `jupyter`, `config`, `rename` e `forget` também têm saída `--json`, para ferramentas: [tnrx-connect-json.md](tnrx-connect-json.md).
 
 ### Onde ficam as coisas (no laptop)
 
 | Caminho | Conteúdo |
 | --- | --- |
-| `~/.config/tnrx-connect/<id>.conf` | Configuração de cada pasta: host, pasta remota, pasta local, porta do Jupyter, opções |
+| `~/.config/tnrx-connect/<id>.conf` | Configuração de cada pasta: host, pasta remota, pasta local, nome, porta do Jupyter, opções |
 | `~/.config/tnrx-connect/jupyter.secret` | Segredo das senhas fixas do Jupyter |
 | `~/.local/share/tnrx-connect/<id>/vfs-*/` | Cache do `rclone`. **Nunca é apagado automaticamente** |
 | `~/.local/share/tnrx-connect/<id>/shadow.git` | Snapshots |

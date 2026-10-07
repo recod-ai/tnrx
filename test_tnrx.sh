@@ -209,7 +209,7 @@ test_config_file_loading() {
     setup_test_env
 
     # Create a test config file
-    cat > tnrx_slurm.conf <<EOF
+    cat > tnrx.conf <<EOF
 PARTITION=h200
 GPUS=2
 CPUS=4
@@ -217,10 +217,10 @@ MEM=32G
 TIME=04:00:00
 EOF
 
-    assert_file_exists "tnrx_slurm.conf" "Config file created"
+    assert_file_exists "tnrx.conf" "Config file created"
 
     # Verify config format
-    if grep -q "PARTITION=h200" tnrx_slurm.conf; then
+    if grep -q "PARTITION=h200" tnrx.conf; then
         pass_test "Config file has correct format"
     else
         fail_test "Config file format invalid"
@@ -254,24 +254,14 @@ EOF
 }
 
 test_missing_sif_error() {
-    log_test "Missing .sif file error handling"
+    log_test "Pasta sem imagem: usa a padrão, sem perguntar"
     setup_test_env
-
-    # Try to run tnrx without .sif file with timeout
-    # Use timeout to prevent hanging on srun
     setup_fake_runtime
-    output=$(PATH="$FAKE_PATH" TNRX_SIF_DIR="$FAKE_STORE" timeout 3 "$TNRX_SCRIPT" uv add test </dev/null 2>&1)
-    local exit_code=$?
-
-    # Either timeout or find_sif error should occur
-    if [ $exit_code -eq 124 ]; then
-        # Timeout occurred (expected when srun tries to allocate resources)
-        pass_test "Missing .sif prevents execution"
-    else
-        # Or we get the explicit error message
-        assert_contains "$output" "Nenhum arquivo .sif encontrado" "Error message for missing .sif"
-    fi
-
+    output=$(PATH="$FAKE_PATH" TNRX_SIF_DIR="$FAKE_STORE" HOME="$PWD/home" timeout 10 "$TNRX_SCRIPT" uv add test </dev/null 2>&1)
+    assert_contains "$output" "RUNTIME-ARGS: pull $FAKE_STORE/.tmp-" "baixa a imagem padrão para o banco"
+    assert_contains "$output" "EXEC-IMAGE: $FAKE_STORE/nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" "e roda com ela"
+    output=$(PATH="$FAKE_PATH" TNRX_SIF_DIR="$FAKE_STORE" HOME="$PWD/home" timeout 10 "$TNRX_SCRIPT" uv add test </dev/null 2>&1)
+    assert_not_contains "$output" "RUNTIME-ARGS: pull" "na segunda vez, já está no banco"
     cleanup_test_env
 }
 
@@ -306,18 +296,18 @@ test_context_awareness() {
     # Create two test directories with different configs
     mkdir -p project1 project2
 
-    cat > project1/tnrx_slurm.conf <<EOF
+    cat > project1/tnrx.conf <<EOF
 PARTITION=l40s
 GPUS=1
 EOF
 
-    cat > project2/tnrx_slurm.conf <<EOF
+    cat > project2/tnrx.conf <<EOF
 PARTITION=h200
 GPUS=4
 EOF
 
     # Verify both configs exist and are different
-    if diff -q project1/tnrx_slurm.conf project2/tnrx_slurm.conf >/dev/null 2>&1; then
+    if diff -q project1/tnrx.conf project2/tnrx.conf >/dev/null 2>&1; then
         fail_test "Configs should be different"
     else
         pass_test "Multiple configs can coexist" "Project-specific configs created"
@@ -637,100 +627,117 @@ FAKERT
 }
 
 test_install_singularity() {
-    log_test "install singularity: imagem no banco, link na pasta"
+    log_test "install singularity: grava IMAGE no tnrx.conf e garante a imagem no banco"
     setup_test_env
     setup_fake_runtime
     mkdir proj && cd proj || return
     local default_name="nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" out
+    local run=(env TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" HOME="$PWD/../home" "$TNRX_SCRIPT")
 
-    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
+    out=$("${run[@]}" install singularity </dev/null 2>&1)
     assert_contains "$out" "pull $FAKE_STORE/.tmp-" "sem tnrx.def: pull da imagem padrão para o banco"
     assert_file_exists "$FAKE_STORE/$default_name" "nome da imagem vem da origem docker"
-    if [[ -L "$default_name" && "$(readlink "$default_name")" == "$FAKE_STORE/$default_name" ]]; then
-        pass_test "link na pasta com o mesmo nome, apontando para o banco"
-    else
-        fail_test "link na pasta" "$(ls -la)"
-    fi
+    assert_contains "$(cat tnrx.conf)" "IMAGE=docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04" "IMAGE gravado no tnrx.conf"
+    if ls ./*.sif >/dev/null 2>&1; then fail_test "criou .sif na pasta do projeto"; else pass_test "nada de .sif na pasta do projeto"; fi
     assert_contains "$out" "cp $SCRIPT_DIR/tnrx.def ." "sem tnrx.def: sugere copiar o modelo"
     if ls "$FAKE_STORE"/.tmp-* >/dev/null 2>&1; then fail_test "sobrou arquivo temporário no banco"; else pass_test "sem temporários no banco"; fi
 
-    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
+    out=$("${run[@]}" install singularity </dev/null 2>&1)
     assert_not_contains "$out" "RUNTIME-ARGS" "imagem já no banco: não baixa de novo"
-    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity --force </dev/null 2>&1)
+    out=$("${run[@]}" install singularity --force </dev/null 2>&1)
     assert_contains "$out" "RUNTIME-ARGS: pull" "--force: baixa de novo"
 
-    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity docker://ubuntu:24.04 </dev/null 2>&1)
+    printf 'PARTITION=a100 # comentário fica\nIMAGE=velha\nGPUS=2\n' > tnrx.conf
+    out=$("${run[@]}" install singularity docker://ubuntu:24.04 </dev/null 2>&1)
     assert_file_exists "$FAKE_STORE/ubuntu_24.04.sif" "origem explícita: ubuntu_24.04.sif"
-    if [[ -L ubuntu_24.04.sif && ! -e "$default_name" && ! -L "$default_name" ]]; then
-        pass_test "o link novo substitui o antigo (um .sif por pasta)"
+    if [[ "$(cat tnrx.conf)" == $'PARTITION=a100 # comentário fica\nIMAGE=docker://ubuntu:24.04\nGPUS=2' ]]; then
+        pass_test "troca só a linha do IMAGE, mantendo o resto"
     else
-        fail_test "troca de link" "$(ls -la)"
+        fail_test "tnrx.conf reescrito errado" "$(cat tnrx.conf)"
     fi
 
     cp "$SCRIPT_DIR/tnrx.def" .
-    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
+    rm tnrx.conf
+    out=$("${run[@]}" install singularity </dev/null 2>&1)
     local def_name="nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04__def-$(sha256sum tnrx.def | cut -c1-8).sif"
     if [ "$(id -u)" -ne 0 ]; then
         assert_contains "$out" "build --fakeroot $FAKE_STORE/.tmp-" "com tnrx.def: build com --fakeroot"
     fi
     assert_file_exists "$FAKE_STORE/$def_name" "imagem do .def: nome da base + hash do conteúdo"
+    assert_contains "$(cat tnrx.conf)" "IMAGE=tnrx.def" "com tnrx.def: IMAGE=tnrx.def"
     echo "# mudança" >> tnrx.def
-    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
-    assert_contains "$out" "RUNTIME-ARGS: build" ".def editado: gera uma imagem nova"
+    out=$("${run[@]}" uv sync </dev/null 2>&1)
+    assert_contains "$out" "RUNTIME-ARGS: build" ".def editado: o próximo comando gera a imagem nova sozinho"
 
-    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity ausente.def </dev/null 2>&1)
+    out=$("${run[@]}" install singularity ausente.def </dev/null 2>&1)
     assert_contains "$out" "Definition file não encontrado: ausente.def" ".def inexistente: erro"
 
-    rm -f ./*.sif tnrx.def
-    echo real > proprio.sif
-    out=$(echo n | TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity 2>&1)
-    if [[ -f proprio.sif && ! -L proprio.sif ]]; then pass_test ".sif próprio e resposta 'n': mantido"; else fail_test ".sif próprio apagado"; fi
-    out=$(echo y | TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity 2>&1)
-    if [[ ! -e proprio.sif && -L "$default_name" ]]; then pass_test ".sif próprio e resposta 'y': trocado pelo link"; else fail_test "troca do .sif próprio" "$(ls -la)"; fi
-
-    rm -f ./*.sif
-    out=$(FAKE_RUNTIME_FAIL=1 TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity docker://falha:1 </dev/null 2>&1)
-    assert_exit_code 1 $? "download falho: exit 1"
-    if [[ ! -e "$FAKE_STORE/falha_1.sif" ]] && ! ls "$FAKE_STORE"/.tmp-* >/dev/null 2>&1; then
-        pass_test "download falho não deixa imagem nem temporário no banco"
+    rm -f tnrx.conf tnrx.def
+    printf 'PARTITION=h200\n' > tnrx_slurm.conf
+    out=$("${run[@]}" install singularity </dev/null 2>&1)
+    if [[ -f tnrx.conf && ! -e tnrx_slurm.conf && "$(cat tnrx.conf)" == *"PARTITION=h200"* ]]; then
+        pass_test "tnrx_slurm.conf antigo vira tnrx.conf ao gravar"
     else
-        fail_test "restos de download falho" "$(ls -la "$FAKE_STORE")"
+        fail_test "migração do tnrx_slurm.conf" "$(ls; cat tnrx.conf 2>&1)"
+    fi
+
+    rm -f tnrx.conf
+    out=$(FAKE_RUNTIME_FAIL=1 "${run[@]}" install singularity docker://falha:1 </dev/null 2>&1)
+    assert_exit_code 1 $? "download falho: exit 1"
+    if [[ ! -e "$FAKE_STORE/falha_1.sif" && ! -e tnrx.conf ]] && ! ls "$FAKE_STORE"/.tmp-* >/dev/null 2>&1; then
+        pass_test "download falho: não grava IMAGE nem deixa restos no banco"
+    else
+        fail_test "restos de download falho" "$(ls -la "$FAKE_STORE"; cat tnrx.conf 2>&1)"
     fi
     cp "$SCRIPT_DIR/tnrx.def" .
-    out=$(FAKE_RUNTIME_FAIL=1 TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity tnrx.def --force </dev/null 2>&1)
+    out=$(FAKE_RUNTIME_FAIL=1 "${run[@]}" install singularity tnrx.def --force </dev/null 2>&1)
     assert_contains "$out" "gere a imagem em outra máquina" "build falho: explica a alternativa"
 
     cleanup_test_env
 }
 
-test_missing_sif_prompt() {
-    log_test "Pasta sem .sif: oferece as imagens do banco e cria o link"
+test_image_resolution() {
+    log_test "Qual imagem vale: IMAGE do tnrx.conf > .sif na pasta > tnrx.def > padrão"
     setup_test_env
     setup_fake_runtime
     mkdir proj && cd proj || return
-    local default_name="nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" out
+    local out run=(env TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" HOME="$PWD/../home" "$TNRX_SCRIPT" uv sync)
 
-    out=$(HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync </dev/null 2>&1)
-    assert_contains "$out" "Nenhum arquivo .sif encontrado" "sem terminal: erro, sem perguntar"
+    cp "$SCRIPT_DIR/tnrx.def" .
+    out=$("${run[@]}" </dev/null 2>&1)
+    assert_contains "$out" "EXEC-IMAGE: $FAKE_STORE/nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04__def-" "sem IMAGE: o tnrx.def do projeto"
 
-    out=$(echo n | TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync 2>&1)
-    assert_contains "$out" "[1] $default_name  (padrão; será baixada)" "menu: padrão primeiro, avisando que vai baixar"
-    assert_contains "$out" "Cancelado" "'n' cancela"
-    assert_not_contains "$out" "UV:" "cancelado: o comando não roda"
+    echo real > antigo.sif
+    out=$("${run[@]}" </dev/null 2>&1)
+    assert_contains "$out" "EXEC-IMAGE: antigo.sif" "um .sif na pasta vale antes do tnrx.def"
 
-    echo fake > "$FAKE_STORE/outra_imagem_1.0.sif"
-    out=$(echo 2 | TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync 2>&1)
-    assert_contains "$out" "[2] outra_imagem_1.0.sif" "menu: lista as outras imagens do banco"
-    assert_contains "$out" "EXEC-IMAGE: outra_imagem_1.0.sif" "escolha: cria o link e o comando segue com ela"
+    printf 'IMAGE=ubuntu:24.04\n' > tnrx.conf
+    out=$("${run[@]}" </dev/null 2>&1)
+    assert_contains "$out" "RUNTIME-ARGS: pull $FAKE_STORE/.tmp-" "IMAGE sem esquema: tratado como docker://"
+    assert_contains "$out" "EXEC-IMAGE: $FAKE_STORE/ubuntu_24.04.sif" "IMAGE vale antes de tudo"
 
-    rm -f ./*.sif
-    out=$(echo | TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync 2>&1)
-    assert_contains "$out" "RUNTIME-ARGS: pull" "Enter: baixa a padrão"
-    assert_contains "$out" "EXEC-IMAGE: $default_name" "Enter: liga a padrão e segue"
+    echo x > "$PWD/../minha.sif"
+    printf 'IMAGE=%s\n' "$PWD/../minha.sif" > tnrx.conf
+    out=$("${run[@]}" </dev/null 2>&1)
+    assert_contains "$out" "EXEC-IMAGE: $PWD/../minha.sif" "IMAGE com caminho de um .sif: usa direto"
+    printf 'IMAGE=/nao/existe.sif\n' > tnrx.conf
+    out=$("${run[@]}" </dev/null 2>&1)
+    assert_contains "$out" "IMAGE=/nao/existe.sif (no tnrx.conf) não existe" ".sif inexistente: erro claro"
 
-    rm -f "$FAKE_STORE/$default_name"
-    out=$(TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync </dev/null 2>&1)
-    assert_contains "$out" "aponta para uma imagem que não existe mais" "link quebrado: avisa"
+    rm -f tnrx.conf antigo.sif tnrx.def
+    out=$(IMAGE=docker://do-ambiente:1 "${run[@]}" </dev/null 2>&1)
+    assert_not_contains "$out" "do-ambiente" "IMAGE do ambiente não vale (só o do tnrx.conf)"
+
+    printf 'IMAGE=docker://legado:2\n' > tnrx_slurm.conf
+    out=$("${run[@]}" </dev/null 2>&1)
+    assert_contains "$out" "EXEC-IMAGE: $FAKE_STORE/legado_2.sif" "tnrx_slurm.conf antigo ainda é lido"
+    assert_contains "$out" "agora se chama tnrx.conf" "e avisa para renomear"
+    rm tnrx_slurm.conf
+
+    ln -s /nao/existe.sif quebrado.sif
+    out=$("${run[@]}" </dev/null 2>&1)
+    assert_contains "$out" "Ignorando quebrado.sif" "link quebrado (do banco antigo): ignorado com aviso"
+    assert_contains "$out" "EXEC-IMAGE: $FAKE_STORE/nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" "e cai na imagem padrão"
 
     cleanup_test_env
 }
@@ -891,7 +898,7 @@ run_all_tests() {
 
     # Imagem do container
     test_install_singularity
-    test_missing_sif_prompt
+    test_image_resolution
     test_install_setup
     test_installer
 

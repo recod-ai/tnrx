@@ -31,6 +31,12 @@ case "$1" in
   cluster) cat '${tmp}/cluster.json' ;;
   jupyter) cat '${tmp}/jupyter.json' ;;
   umount) rc=$(cat '${tmp}/umount_rc' 2>/dev/null || echo 0); [ "$rc" != 0 ] && echo "❌ Ainda em uso." >&2; exit "$rc" ;;
+  config) if [ -f '${tmp}/config_err' ]; then echo '{"v":1,"ok":false,"error":{"code":"invalid_value","message":"GPUS: use um número inteiro."}}'; exit 2; fi
+          echo '{"v":1,"ok":true,"dir":"x","slurm":null}' ;;
+  rename) echo '{"v":1,"ok":true,"id":"x","name":"y"}' ;;
+  forget) if [ -f '${tmp}/forget_pending' ] && [[ " $* " != *" --force "* ]]; then
+            echo '{"v":1,"ok":false,"error":{"code":"pending_writes","message":"escritas pendentes"}}'; exit 1; fi
+          echo '{"v":1,"ok":true,"id":"x"}' ;;
 esac
 `, { mode: 0o755 });
 }
@@ -99,7 +105,7 @@ test('as quatro vistas mostram os dados', () => {
     assert.equal(ti.contextValue, 'mount-ok');
     assert.equal(ti.iconPath.id, 'pass-filled');
     const key = roots('tnrx.slurm')[0].children[0];
-    assert.equal(fake.views.get('tnrx.slurm').provider.getTreeItem(key).command.command, 'tnrx.openSlurm');
+    assert.equal(fake.views.get('tnrx.slurm').provider.getTreeItem(key).command.command, 'tnrx.editConfigKey', 'clicar numa chave edita o valor');
 });
 
 test('terminal do servidor: tnrx-connect ssh na pasta; reaproveita o terminal aberto', async () => {
@@ -148,15 +154,111 @@ test('desmontar: pede confirmação, roda umount; se falhar, oferece -f', async 
     fs.rmSync(path.join(tmp, 'umount_rc'));
 });
 
-test('slurm: editar cria o tnrx_slurm.conf com os valores atuais se não existir', async () => {
+const slurmKey = (k) => roots('tnrx.slurm')[0].children.find((c) => c.key === k);
+// Última chamada de config (depois de gravar, a extensão também atualiza o status).
+const lastCall = () => calls().filter((c) => c.startsWith('config')).at(-1);
+
+test('configuração: abrir o tnrx.conf que não existe cria pelo tnrx-connect, sem a IMAGE', async () => {
     const st = JSON.parse(JSON.stringify(fx.status));
     const m = st.mounts.find((x) => x.name === 'proj');
-    const file = path.join(tmp, 'tnrx_slurm.conf');
-    m.slurm.file = file;
+    m.slurm.file = path.join(tmp, 'tnrx.conf');
     fake.answers.info = 'Criar';
     await fake.vscode.commands.executeCommand('tnrx.openSlurm', { mount: m });
-    assert.match(fs.readFileSync(file, 'utf8'), /PARTITION=a100\nGPUS=2\nCPUS=2\nMEM=4G\nTIME=04:00:00/);
-    assert.equal(fake.calls.opened.at(-1), file);
+    assert.equal(lastCall(), `config --dir /tmp/tnrx-x/proj set PARTITION=a100 GPUS=2 CPUS=2 MEM=4G TIME=04:00:00 --json`);
+    assert.equal(fake.calls.opened.at(-1), m.slurm.file);
+});
+
+test('configuração: GPUS pela caixa de texto, com validação; cancelar não grava', async () => {
+    fake.answers.input = '4';
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('GPUS'));
+    assert.equal(lastCall(), 'config --dir /tmp/tnrx-x/proj set GPUS=4 --json');
+    const box = fake.calls.inputs.at(-1);
+    assert.equal(box.value, '2', 'começa com o valor atual');
+    assert.match(box.validateInput('duas'), /inteiro/);
+    assert.equal(box.validateInput('8'), null);
+    const n = calls().filter((c) => c.startsWith('config')).length;
+    fake.answers.input = undefined;
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('MEM'));
+    assert.equal(calls().filter((c) => c.startsWith('config')).length, n, 'cancelado: nada roda');
+});
+
+test('configuração: PARTITION escolhida da lista do cluster, com GPUs livres', async () => {
+    fake.answers.pick = 'l40s';
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('PARTITION'));
+    const items = fake.calls.picks.at(-1).items;
+    assert.deepEqual(items.map((i) => i.label), ['l40s', 'a100', '$(edit) Outra partição…']);
+    assert.match(items[0].detail, /3 de 8 GPUs livres/);
+    assert.match(items[1].description, /atual/);
+    assert.equal(lastCall(), 'config --dir /tmp/tnrx-x/proj set PARTITION=l40s --json');
+    fake.answers.pick = '$(edit) Outra partição…';
+    fake.answers.input = 'rtx8000';
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('PARTITION'));
+    assert.equal(lastCall(), 'config --dir /tmp/tnrx-x/proj set PARTITION=rtx8000 --json');
+});
+
+test('configuração: IMAGE com a padrão, o tnrx.def do projeto ou outra origem', async () => {
+    fs.writeFileSync('/tmp/tnrx-x/proj/tnrx.def', 'Bootstrap: docker\n');
+    fake.answers.pick = 'tnrx.def';
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('IMAGE'));
+    assert.deepEqual(fake.calls.picks.at(-1).items.map((i) => i.label), ['Padrão do tnrx', 'tnrx.def', '$(edit) Outra origem…']);
+    assert.equal(lastCall(), 'config --dir /tmp/tnrx-x/proj set IMAGE=tnrx.def --json');
+    fake.answers.pick = '$(edit) Outra origem…';
+    fake.answers.input = ' docker://ubuntu:24.04 ';
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('IMAGE'));
+    assert.equal(lastCall(), 'config --dir /tmp/tnrx-x/proj set IMAGE=docker://ubuntu:24.04 --json');
+    const n = calls().filter((c) => c.startsWith('config')).length;
+    fake.answers.pick = 'Padrão do tnrx';
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('IMAGE'));
+    assert.equal(calls().filter((c) => c.startsWith('config')).length, n, 'já está no padrão: nada a fazer');
+    fs.rmSync('/tmp/tnrx-x/proj/tnrx.def');
+});
+
+test('configuração: voltar ao padrão; erro do tnrx-connect vira mensagem', async () => {
+    await fake.vscode.commands.executeCommand('tnrx.resetConfigKey', slurmKey('TIME'));
+    assert.equal(lastCall(), 'config --dir /tmp/tnrx-x/proj unset TIME --json');
+    fs.writeFileSync(path.join(tmp, 'config_err'), '');
+    fake.answers.input = '3';
+    await fake.vscode.commands.executeCommand('tnrx.editConfigKey', slurmKey('GPUS'));
+    assert.match(fake.calls.messages.filter((x) => x[0] === 'error').at(-1)[1], /use um número inteiro/);
+    fs.rmSync(path.join(tmp, 'config_err'));
+});
+
+test('montagens: renomear pelo id; nome igual ou cancelado não faz nada', async () => {
+    const n = item('tnrx.mounts', 'proj');
+    fake.answers.input = 'code do artigo';
+    await fake.vscode.commands.executeCommand('tnrx.renameMount', n);
+    assert.ok(calls().includes('rename --id recod-headnode_proj code do artigo --json'));
+    const before = calls().length;
+    fake.answers.input = 'proj';
+    await fake.vscode.commands.executeCommand('tnrx.renameMount', n);
+    assert.ok(!calls().slice(before).some((c) => c.startsWith('rename')), 'mesmo nome: nada roda');
+});
+
+test('montagens: apagar pede confirmação; escritas pendentes oferecem montar ou apagar mesmo assim', async () => {
+    const n = item('tnrx.mounts', 'velho');
+    fake.answers.warning = undefined;
+    await fake.vscode.commands.executeCommand('tnrx.forgetMount', n);
+    assert.ok(!calls().some((c) => c.startsWith('forget')), 'cancelado: nada roda');
+
+    fake.answers.warning = 'Apagar';
+    await fake.vscode.commands.executeCommand('tnrx.forgetMount', n);
+    assert.equal(calls().filter((c) => c.startsWith('forget')).at(-1), 'forget --id recod-headnode_velho --json');
+
+    fs.writeFileSync(path.join(tmp, 'forget_pending'), '');
+    const answers = ['Apagar', 'Apagar mesmo assim'];
+    fake.answers.warning = undefined;
+    const orig = fake.vscode.window.showWarningMessage;
+    fake.vscode.window.showWarningMessage = async (...a) => { await orig(...a); return answers.shift(); };
+    await fake.vscode.commands.executeCommand('tnrx.forgetMount', n);
+    fake.vscode.window.showWarningMessage = orig;
+    assert.ok(calls().includes('forget --id recod-headnode_velho --force --json'), 'com escritas pendentes, só apaga com --force depois de perguntar');
+    fs.rmSync(path.join(tmp, 'forget_pending'));
+});
+
+test('menus: apagar só aparece para montagem desmontada; voltar ao padrão só para chave do arquivo', () => {
+    const ctx = pkg.contributes.menus['view/item/context'];
+    assert.equal(ctx.find((m) => m.command === 'tnrx.forgetMount').when, 'view == tnrx.mounts && viewItem == mount-unmounted');
+    assert.match(ctx.find((m) => m.command === 'tnrx.resetConfigKey').when, /viewItem == slurm-key-file/);
 });
 
 test('jupyter: copiar URL de uma ponte aberta; terminal do jupyter na pasta do projeto', async () => {

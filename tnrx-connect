@@ -65,6 +65,7 @@ CONF_DIR_CACHE_TIME=""
 CONF_SNAPSHOT_INTERVAL=""
 CONF_SNAPSHOT_MAX_FILE_MB=""
 CONF_JUPYTER_PORT=""
+CONF_NAME=""
 LOCK_DIR=""
 LOCK_PID=""
 OLD_MOUNT_PID=""
@@ -435,7 +436,7 @@ pid_is_rclone() {
 
 # --- Config por host_pasta (~/.config/tnrx-connect/<host>_<pasta>.conf) ---
 
-CONF_KEYS="HOST REMOTE_PATH LOCAL_DIR LAST_USED CACHE_MAX_SIZE DIR_CACHE_TIME SNAPSHOT_INTERVAL SNAPSHOT_MAX_FILE_MB JUPYTER_PORT"
+CONF_KEYS="HOST REMOTE_PATH LOCAL_DIR LAST_USED NAME CACHE_MAX_SIZE DIR_CACHE_TIME SNAPSHOT_INTERVAL SNAPSHOT_MAX_FILE_MB JUPYTER_PORT"
 
 conf_get() {
     ( unset $CONF_KEYS; source "$1" >/dev/null 2>&1; printf '%s' "${!2}" )
@@ -459,6 +460,7 @@ load_optional_from_conf() {
     CONF_SNAPSHOT_INTERVAL=$(conf_get "$1" SNAPSHOT_INTERVAL)
     CONF_SNAPSHOT_MAX_FILE_MB=$(conf_get "$1" SNAPSHOT_MAX_FILE_MB)
     CONF_JUPYTER_PORT=$(conf_get "$1" JUPYTER_PORT)
+    CONF_NAME=$(conf_get "$1" NAME)
 }
 
 set_effective() {
@@ -495,11 +497,12 @@ save_conf() {
     mkdir -p "$CONF_DIR"
     {
         echo "# tnrx-connect (modo mount) — regravado a cada execução."
-        echo "# Opcionais (adicione a linha pra mudar): CACHE_MAX_SIZE, DIR_CACHE_TIME, SNAPSHOT_INTERVAL, SNAPSHOT_MAX_FILE_MB"
+        echo "# Opcionais (adicione a linha pra mudar): NAME, CACHE_MAX_SIZE, DIR_CACHE_TIME, SNAPSHOT_INTERVAL, SNAPSHOT_MAX_FILE_MB"
         printf 'HOST=%q\n' "$HOST"
         printf 'REMOTE_PATH=%q\n' "$REMOTE_PATH"
         printf 'LOCAL_DIR=%q\n' "$LOCAL_DIR"
         printf 'LAST_USED=%s\n' "$(now_epoch)"
+        emit_opt NAME "$CONF_NAME"
         emit_opt CACHE_MAX_SIZE "$CONF_CACHE_MAX_SIZE"
         emit_opt DIR_CACHE_TIME "$CONF_DIR_CACHE_TIME"
         emit_opt SNAPSHOT_INTERVAL "$CONF_SNAPSHOT_INTERVAL"
@@ -1246,6 +1249,7 @@ do_status() {
     fi
     load_session_for_dir "$1" || exit 1
     local mpid cache_dir count last
+    echo "Nome:      ${CONF_NAME:-$(basename "$LOCAL_DIR")}"
     echo "Pasta:     $LOCAL_DIR"
     echo "Config:    $CONF_FILE"
     echo "Servidor:  $HOST:$REMOTE_PATH"
@@ -1511,6 +1515,13 @@ conf_for_remote() {
         [ "$(conf_get "$f" HOST)" == "$HOST" ] && [ "$(conf_get "$f" REMOTE_PATH)" == "$1" ] && { printf '%s' "$f"; return 0; }
     done
     return 1
+}
+
+project_label() {
+    # Nome de um projeto (pasta remota $1 deste host): o NAME da montagem, senão o nome da pasta.
+    local f n=""
+    f=$(conf_for_remote "$1") && n=$(conf_get "$f" NAME)
+    printf '%s' "${n:-$(basename "$1")}"
 }
 
 known_projects() {
@@ -1788,7 +1799,7 @@ do_jupyter_auto() {
     done < <(discover_jupyters "${projects[@]}" | grep '^TNRXJ|' | sort -t'|' -k6 -rn)
 
     local name ans pick i=1 tag node port token job started proj mark
-    name=$(basename "$project")
+    name=$(project_label "$project")
     J_PICKED=""
     if [ "${#lines[@]}" -eq 0 ]; then
         echo "Nenhum servidor Jupyter no ar em $HOST (nos projetos que este laptop conhece)."
@@ -1807,7 +1818,7 @@ do_jupyter_auto() {
             IFS='|' read -r tag node port token job started proj <<< "$l"
             mark=""
             [ "$proj" == "$project" ] && mark="  ← este projeto"
-            echo "  [$i] $(basename "$proj")  $node:$port  (job ${job:-?}, há $(fmt_age "$started"))$mark"
+            echo "  [$i] $(project_label "$proj")  $node:$port  (job ${job:-?}, há $(fmt_age "$started"))$mark"
             i=$((i + 1))
         done
         echo "  [n] Iniciar um novo Jupyter em $name ($project)"
@@ -1851,7 +1862,7 @@ connect_picked() {
     fi
     print_bridge "/lab?token=$token"
     if [ "$token" == "$(jupyter_token "$HOST" "$proj")" ] && conf_for_remote "$proj" >/dev/null; then
-        echo "📌 Esta URL é fixa para $(basename "$proj"): no VS Code, configure uma vez (Existing Jupyter Server) e depois só escolha o servidor."
+        echo "📌 Esta URL é fixa para $(project_label "$proj"): no VS Code, configure uma vez (Existing Jupyter Server) e depois só escolha o servidor."
     else
         echo "ℹ️  Este Jupyter não usa a senha fixa do projeto (foi iniciado antes dela, ou o tnrx do servidor está desatualizado); a URL vale só para ele."
     fi
@@ -1872,14 +1883,18 @@ JSON=false
 JSON_STREAM=false
 BRIDGE_END_REASON=""
 
-# Padrões do tnrx (servidor) quando o tnrx_slurm.conf não define a chave. Um teste
+# Padrões do tnrx (servidor) quando o tnrx.conf do projeto não define a chave. Um teste
 # confere que continuam iguais aos DEFAULT_* do script tnrx.
-SLURM_KEYS="PARTITION GPUS CPUS MEM TIME"
+SLURM_KEYS="PARTITION GPUS CPUS MEM TIME IMAGE"
 SLURM_DEFAULT_PARTITION="l40s"
 SLURM_DEFAULT_GPUS="1"
 SLURM_DEFAULT_CPUS="2"
 SLURM_DEFAULT_MEM="4G"
 SLURM_DEFAULT_TIME="00:10:00"
+SLURM_DEFAULT_IMAGE="docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04"
+# Configuração do projeto, e o nome antigo dela (ainda lido quando não há tnrx.conf).
+PROJECT_CONF="tnrx.conf"
+LEGACY_PROJECT_CONF="tnrx_slurm.conf"
 
 json_str() {
     local s="$1"
@@ -1946,11 +1961,15 @@ mounted_hosts() {
 }
 
 parse_api_opts() {
-    # Opções comuns: --json, --host H, --project P, --job J. O resto fica em API_ARGS.
-    API_HOST=""; API_PROJECT=""; API_JOB=""; API_ARGS=()
+    # Opções comuns: --json, --host H, --project P, --job J, --dir D, --id ID, --force.
+    # O resto fica em API_ARGS.
+    API_HOST=""; API_PROJECT=""; API_JOB=""; API_DIR=""; API_ID=""; API_FORCE=false; API_ARGS=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) JSON=true ;;
+            --dir) API_DIR="$2"; shift ;;
+            --id) API_ID="$2"; shift ;;
+            --force|-f) API_FORCE=true ;;
             --host) API_HOST="$2"; shift ;;
             --project) API_PROJECT="$2"; shift ;;
             --job) API_JOB="$2"; shift ;;
@@ -1978,10 +1997,38 @@ read_quick() {
     if command -v timeout >/dev/null 2>&1; then timeout 3 cat -- "$1" 2>/dev/null; else cat -- "$1" 2>/dev/null; fi
 }
 
-slurm_json() {
-    # Valores efetivos do tnrx_slurm.conf (arquivo + padrões do tnrx) de uma pasta montada.
-    local file="$1/tnrx_slurm.conf" content="" exists=false line k v out="" key def from
+project_conf_file() {
+    # O arquivo de configuração da pasta de projeto $1: tnrx.conf, ou o tnrx_slurm.conf antigo.
+    if [ ! -e "$1/$PROJECT_CONF" ] && [ -e "$1/$LEGACY_PROJECT_CONF" ]; then
+        printf '%s' "$1/$LEGACY_PROJECT_CONF"
+    else
+        printf '%s' "$1/$PROJECT_CONF"
+    fi
+}
+
+image_default() {
+    # A imagem que o tnrx usa na pasta $1 quando o tnrx.conf não tem IMAGE
+    # (a mesma ordem do tnrx: um .sif na pasta, o tnrx.def, a padrão).
+    local f
+    local -a sifs=()
+    for f in "$1"/*.sif; do [ -e "$f" ] && sifs+=("$(basename "$f")"); done
+    if [ ${#sifs[@]} -eq 1 ]; then
+        printf '%s' "${sifs[0]}"
+    elif [ -e "$1/tnrx.def" ]; then
+        printf 'tnrx.def'
+    else
+        printf '%s' "$SLURM_DEFAULT_IMAGE"
+    fi
+}
+
+config_values() {
+    # Valores efetivos do tnrx.conf (arquivo + padrões do tnrx) da pasta montada $1,
+    # uma linha "KEY|valor|true/false (do arquivo)" por chave. A primeira linha é
+    # "FILE|caminho|existe".
+    local file content="" exists=false line k v key def from
+    file=$(project_conf_file "$1")
     if content=$(read_quick "$file") && [ -e "$file" ]; then exists=true; fi
+    printf 'FILE|%s|%s\n' "$file" "$exists"
     for key in $SLURM_KEYS; do
         v=""; from=false
         while IFS= read -r line; do
@@ -1994,16 +2041,35 @@ slurm_json() {
             v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
             from=true
         done <<< "$content"
-        def="SLURM_DEFAULT_$key"
-        [ "$from" == "true" ] || v="${!def}"
-        out+="${out:+,}$(json_str "$key"):{\"value\":$(json_str "$v"),\"from_file\":$(json_bool "$from")}"
+        if [ "$from" != "true" ]; then
+            if [ "$key" == "IMAGE" ]; then
+                v=$(image_default "$1")
+            else
+                def="SLURM_DEFAULT_$key"
+                v="${!def}"
+            fi
+        fi
+        printf '%s|%s|%s\n' "$key" "$v" "$from"
     done
+}
+
+slurm_json() {
+    # Os valores de config_values em JSON. (O campo se chama "slurm" desde antes do
+    # IMAGE; ver docs/tnrx-connect-json.md.)
+    local k v from file exists out=""
+    while IFS='|' read -r k v from; do
+        if [ "$k" == "FILE" ]; then
+            file="$v"; exists="$from"
+            continue
+        fi
+        out+="${out:+,}$(json_str "$k"):{\"value\":$(json_str "$v"),\"from_file\":$(json_bool "$from")}"
+    done < <(config_values "$1")
     printf '{"file":%s,"exists":%s,"values":{%s}}' "$(json_str "$file")" "$(json_bool "$exists")" "$out"
 }
 
 do_status_json() {
     # Todas as pastas que este laptop conhece, com estado da montagem e da conexão.
-    local f d ld rp mine state connected mpid since first=true host checked="|" alive="|" h
+    local f d ld rp mine state connected mpid since first=true host checked="|" alive="|" h name
     printf '{"v":1,"ok":true,"mounts":['
     for f in "$CONF_DIR"/*.conf; do
         [ -f "$f" ] || continue
@@ -2020,6 +2086,7 @@ do_status_json() {
         ld=$(lock_dir_for "$d")
         rp=$(conf_get "$f" REMOTE_PATH)
         mpid=""; since=""; mine=false
+        name=$(conf_get "$f" NAME); name="${name:-$(basename "$d")}"
         # A mesma pasta local pode ter configurações de hosts diferentes: só conta a do lock.
         [ "$(lock_get "$ld" HOST)" == "$HOST" ] && [ "$(lock_get "$ld" REMOTE_PATH)" == "$rp" ] && mine=true
         if [ -d "$ld" ] && [ "$mine" == "true" ] && pid_is_tnrx "$(lock_get "$ld" PID)"; then
@@ -2038,7 +2105,7 @@ do_status_json() {
         [ "$first" == "true" ] || printf ','
         first=false
         printf '{"id":%s,"name":%s,"local_dir":%s,"host":%s,"remote_path":%s,"state":%s,"connected":%s,"rclone_pid":%s,"since":%s,"last_used":%s,"jupyter_port":%s,"log":%s,"slurm":' \
-            "$(json_str "$(basename "$f" .conf)")" "$(json_str "$(basename "$d")")" "$(json_str "$d")" \
+            "$(json_str "$(basename "$f" .conf)")" "$(json_str "$name")" "$(json_str "$d")" \
             "$(json_str "$HOST")" "$(json_str "$rp")" "$(json_str "$state")" \
             "$(json_bool "$connected")" "$(json_num "$mpid")" "$(json_num "$since")" \
             "$(json_num "$(conf_get "$f" LAST_USED)")" "$(json_num "$(conf_get "$f" JUPYTER_PORT)")" \
@@ -2296,7 +2363,7 @@ do_jupyter_list() {
                 ld=""; f=$(conf_for_remote "$p") && ld=$(conf_get "$f" LOCAL_DIR)
                 [ "$firstp" == "true" ] || printf ','
                 firstp=false
-                printf '{"name":%s,"remote_path":%s,"local_dir":%s,"servers":[' "$(json_str "$(basename "$p")")" "$(json_str "$p")" "$(json_str_or_null "$ld")"
+                printf '{"name":%s,"remote_path":%s,"local_dir":%s,"servers":[' "$(json_str "$(project_label "$p")")" "$(json_str "$p")" "$(json_str_or_null "$ld")"
                 firsts=true
                 for l in "${lines[@]}"; do
                     [ "$(printf '%s' "$l" | cut -d'|' -f7-)" == "$p" ] || continue
@@ -2310,7 +2377,7 @@ do_jupyter_list() {
         else
             echo "$h$([ "$connected" == "true" ] || echo ' (sem conexão)')"
             for p in "${projects[@]}"; do
-                echo "  $(basename "$p")  ($p)"
+                echo "  $(project_label "$p")  ($p)"
                 for l in "${lines[@]}"; do
                     [ "$(printf '%s' "$l" | cut -d'|' -f7-)" == "$p" ] || continue
                     IFS='|' read -r _ node port _ job started _ <<< "$l"
@@ -2364,6 +2431,169 @@ do_jupyter_connect() {
     connect_picked
 }
 
+# --- Montagens: nome e esquecer (forget) ---
+
+resolve_mount_conf() {
+    # Acha o .conf de uma montagem: --id, senão a pasta (--dir ou a atual, ou uma acima).
+    # Deixa CONF_FILE, ID, LOCAL_DIR, HOST e REMOTE_PATH.
+    local dir root f
+    local -a confs=()
+    if [ -n "$API_ID" ]; then
+        CONF_FILE="$CONF_DIR/$API_ID.conf"
+        [ -f "$CONF_FILE" ] || json_fail unknown_mount "Montagem desconhecida: $API_ID."
+    else
+        dir=$(cd "${API_DIR:-.}" 2>/dev/null && pwd -P) || json_fail unknown_mount "Pasta não encontrada: ${API_DIR:-.}"
+        root=$(find_session_root "$dir") || json_fail unknown_mount "Nenhuma montagem do tnrx-connect em $dir."
+        while IFS= read -r f; do confs+=("$f"); done < <(find_confs_for_dir "$root")
+        if [ ${#confs[@]} -gt 1 ]; then
+            json_fail usage "$root tem uma configuração por servidor: escolha com --id ($(for f in "${confs[@]}"; do printf '%s ' "$(basename "$f" .conf)"; done))." 2
+        fi
+        CONF_FILE="${confs[0]}"
+    fi
+    ID=$(basename "$CONF_FILE" .conf)
+    LOCAL_DIR=$(conf_get "$CONF_FILE" LOCAL_DIR)
+    HOST=$(conf_get "$CONF_FILE" HOST)
+    REMOTE_PATH=$(conf_get "$CONF_FILE" REMOTE_PATH)
+}
+
+do_rename() {
+    # tnrx-connect rename [--id ID | --dir D] <nome> [--json]. Nome vazio volta ao nome da pasta.
+    mkdir -p "$CONF_DIR"
+    parse_api_opts "$@"
+    resolve_mount_conf
+    local name="${API_ARGS[*]}"
+    name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
+    [[ "$name" == *$'\n'* ]] && json_fail usage "O nome não pode ter quebra de linha." 2
+    [ ${#name} -le 60 ] || json_fail usage "Nome longo demais (máximo 60 caracteres)." 2
+    if [ -n "$name" ]; then
+        conf_set "$CONF_FILE" NAME "$name"
+    else
+        grep -v '^NAME=' "$CONF_FILE" > "$CONF_FILE.tmp" && mv "$CONF_FILE.tmp" "$CONF_FILE"
+        name=$(basename "$LOCAL_DIR")
+    fi
+    if [ "$JSON" == "true" ]; then
+        printf '{"v":1,"ok":true,"id":%s,"name":%s}\n' "$(json_str "$ID")" "$(json_str "$name")"
+    else
+        echo "✏️  $LOCAL_DIR ($HOST) agora se chama: $name"
+    fi
+}
+
+do_forget() {
+    # tnrx-connect forget [--id ID | --dir D] [--force] [--json]: apaga uma montagem
+    # deste laptop (a configuração, o cache e os snapshots). Os arquivos no servidor
+    # e a pasta local ficam. Recusa uma pasta montada, e um cache com escritas que
+    # ainda não chegaram ao servidor (a não ser com --force).
+    mkdir -p "$CONF_DIR" "$DATA_DIR"
+    parse_api_opts "$@"
+    resolve_mount_conf
+    local ld mine=false data="$DATA_DIR/$ID"
+    ld=$(lock_dir_for "$LOCAL_DIR")
+    [ "$(lock_get "$ld" HOST)" == "$HOST" ] && [ "$(lock_get "$ld" REMOTE_PATH)" == "$REMOTE_PATH" ] && mine=true
+    if [ "$mine" == "true" ] && lock_alive "$ld"; then
+        json_fail mounted "$LOCAL_DIR está montada: desmonte antes (tnrx-connect umount)."
+    fi
+    if is_mounted "$LOCAL_DIR" && { [ "$mine" == "true" ] || [ ! -d "$ld" ]; }; then
+        json_fail mounted "A montagem de $LOCAL_DIR caiu mas a pasta continua montada: tnrx-connect umount -f antes."
+    fi
+    if [ "$API_FORCE" != "true" ] && grep -rlqE '"Dirty": *true' "$data"/vfs-*/vfsMeta 2>/dev/null; then
+        json_fail pending_writes "O cache de $LOCAL_DIR tem arquivos salvos que ainda não chegaram ao servidor. Monte de novo para enviá-los (tnrx-connect mount), ou apague mesmo assim com --force."
+    fi
+    rm -f "$CONF_FILE"
+    rm -rf "$data"
+    if [ "$JSON" == "true" ]; then
+        printf '{"v":1,"ok":true,"id":%s}\n' "$(json_str "$ID")"
+    else
+        echo "🗑️  Montagem apagada: $LOCAL_DIR ($HOST:$REMOTE_PATH)."
+        echo "   Foram a configuração, o cache e os snapshots deste laptop; os arquivos no servidor continuam lá."
+    fi
+}
+
+# --- tnrx.conf do projeto (pela pasta montada) ---
+
+config_check_value() {
+    # Ecoa o problema do valor $2 para a chave $1 (nada se estiver certo).
+    case "$1" in
+        PARTITION) [[ "$2" =~ ^[A-Za-z0-9_.-]+$ ]] || echo "PARTITION: use só letras, números, '.', '_' e '-'." ;;
+        GPUS|CPUS) [[ "$2" =~ ^[0-9]+$ ]] || echo "$1: use um número inteiro." ;;
+        MEM) [[ "$2" =~ ^[0-9]+[KMGTkmgt]?$ ]] || echo "MEM: use um número com unidade, ex.: 16G ou 500M." ;;
+        TIME) [[ "$2" =~ ^([0-9]+-)?[0-9]+(:[0-9]{2}){0,2}$ ]] || echo "TIME: use o formato do Slurm, ex.: 02:00:00 ou 1-00:00:00." ;;
+        IMAGE) [[ -n "$2" && "$2" != *[[:space:]]* ]] || echo "IMAGE: use uma origem (docker://...), um .def ou o caminho de um .sif, sem espaços." ;;
+        *) echo "Chave desconhecida: $1 (use $SLURM_KEYS)." ;;
+    esac
+}
+
+config_write() {
+    # Troca, acrescenta (set) ou tira (unset) a linha da chave $3 no arquivo $1, mantendo o resto.
+    local file="$1" mode="$2" key="$3" value="$4" line found=false
+    {
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?$key= ]]; then
+                if [ "$mode" == "set" ] && [ "$found" != "true" ]; then
+                    printf '%s=%q\n' "$key" "$value"
+                fi
+                found=true
+            else
+                printf '%s\n' "$line"
+            fi
+        done < <(cat -- "$file" 2>/dev/null)
+        if [ "$mode" == "set" ] && [ "$found" != "true" ]; then
+            printf '%s=%q\n' "$key" "$value"
+        fi
+    } > "$file.tmp.$$" && mv "$file.tmp.$$" "$file"
+}
+
+do_config() {
+    # tnrx-connect config [--dir D] [--json] [get | set KEY=VALOR ... | unset KEY ...]
+    # Lê ou muda o tnrx.conf da pasta montada (a atual, ou --dir).
+    mkdir -p "$CONF_DIR" "$DATA_DIR"
+    parse_api_opts "$@"
+    local dir root action file kv key value problem
+    dir=$(cd "${API_DIR:-.}" 2>/dev/null && pwd -P) || json_fail not_mounted "Pasta não encontrada: ${API_DIR:-.}"
+    root=$(find_session_root "$dir" alive) || json_fail not_mounted "$dir não está numa pasta montada (tnrx-connect mount)."
+    action="${API_ARGS[0]:-get}"
+    case "$action" in
+        get) ;;
+        set|unset)
+            [ ${#API_ARGS[@]} -ge 2 ] || json_fail usage "Uso: tnrx-connect config set KEY=VALOR ... | unset KEY ..." 2
+            for kv in "${API_ARGS[@]:1}"; do
+                if [ "$action" == "set" ]; then
+                    [[ "$kv" == *=* ]] || json_fail usage "Use KEY=VALOR: $kv" 2
+                    key="${kv%%=*}"; value="${kv#*=}"
+                else
+                    key="$kv"; value="x"
+                fi
+                problem=$(config_check_value "$key" "$value")
+                [ -z "$problem" ] || json_fail invalid_value "$problem" 2
+            done
+            file=$(project_conf_file "$root")
+            if [ "$(basename "$file")" == "$LEGACY_PROJECT_CONF" ]; then
+                mv -- "$file" "$root/$PROJECT_CONF" || json_fail write_failed "Não consegui renomear $file para $PROJECT_CONF."
+                [ "$JSON" == "true" ] || echo "ℹ️  $LEGACY_PROJECT_CONF renomeado para $PROJECT_CONF."
+                file="$root/$PROJECT_CONF"
+            fi
+            for kv in "${API_ARGS[@]:1}"; do
+                if [ "$action" == "set" ]; then
+                    config_write "$file" set "${kv%%=*}" "${kv#*=}" || json_fail write_failed "Não consegui gravar $file."
+                else
+                    [ -e "$file" ] && { config_write "$file" unset "$kv" || json_fail write_failed "Não consegui gravar $file."; }
+                fi
+            done
+            ;;
+        *) json_fail usage "Uso: tnrx-connect config [get | set KEY=VALOR ... | unset KEY ...]" 2 ;;
+    esac
+    if [ "$JSON" == "true" ]; then
+        printf '{"v":1,"ok":true,"dir":%s,"slurm":%s}\n' "$(json_str "$root")" "$(slurm_json "$root")"
+    else
+        while IFS='|' read -r key value problem; do
+            if [ "$key" == "FILE" ]; then
+                echo "$value$([ "$problem" == true ] || echo ' (não existe: valem os padrões)')"
+            else
+                echo "  $key=$value$([ "$problem" == true ] || echo '  (padrão)')"
+            fi
+        done < <(config_values "$root")
+    fi
+}
+
 # --- Lógica de Entrada ---
 
 while [[ "$1" == "--debug" || "$1" == "-x" ]]; do
@@ -2378,6 +2608,9 @@ case "$1" in
     umount|unmount) shift; do_unmount "$@" ;;
     status)     shift; do_status "$@" ;;
     cluster)    shift; do_cluster "$@" ;;
+    config)     shift; do_config "$@" ;;
+    rename)     shift; do_rename "$@" ;;
+    forget)     shift; do_forget "$@" ;;
     refresh)    shift; do_refresh ;;
     jupyter)    shift; do_jupyter "$@" ;;
     snapshot)   shift; do_snapshot "$@" ;;
@@ -2408,12 +2641,17 @@ case "$1" in
         echo "  tnrx-connect jupyter         -> Acha os Jupyters do projeto que estão no ar, você escolhe e ele abre a ponte"
         echo "  tnrx-connect jupyter <URL|nó:porta> -> Abre a ponte pra um Jupyter cuja URL você já tem"
         echo "  tnrx-connect cluster [--host H] -> sinfo (GPUs livres por partição) e seus jobs, nos hosts montados"
+        echo "  tnrx-connect config [set KEY=VALOR | unset KEY] -> Vê ou muda o tnrx.conf do projeto montado"
+        echo "  tnrx-connect rename <nome>   -> Dá um nome à montagem (vazio: volta ao nome da pasta)"
+        echo "  tnrx-connect forget [--force] -> Apaga a montagem deste laptop (config, cache, snapshots); precisa estar desmontada"
         echo ""
         echo "Para ferramentas (VS Code), saída JSON, nunca pergunta nem autentica (docs/tnrx-connect-json.md):"
         echo "  tnrx-connect status --json"
         echo "  tnrx-connect cluster [--host H] --json  |  cluster cancel <job> --host H --json"
         echo "  tnrx-connect jupyter list --json  |  jupyter start|connect --host H --project P [--job J] --json"
         echo "  tnrx-connect jupyter stop <job> --host H --json"
+        echo "  tnrx-connect config [--dir D] [set KEY=VALOR ... | unset KEY ...] --json"
+        echo "  tnrx-connect rename --id ID <nome> --json  |  forget --id ID [--force] --json"
         echo ""
         echo "Modo rsync (cópia local sincronizada, .tnrx_connect na pasta):"
         echo "  tnrx-connect rsync           -> Sincroniza em background e abre o SSH"

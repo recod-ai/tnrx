@@ -71,7 +71,7 @@ Em outra aba do laptop, na mesma pasta, abra o editor ou o Claude Code. O que vo
 | [`tnrx`](tnrx) | `tnrx` | O script |
 | [`tnrx_hosts.conf`](tnrx_hosts.conf) | `tnrx` | O que muda de um servidor para outro: bind path, runtime do container, pasta do Hugging Face |
 | [`tnrx.def`](tnrx.def) | `tnrx` | Modelo da imagem do container, para copiar para um projeto que precise de pacotes do sistema |
-| [`tnrx_slurm.conf`](tnrx_slurm.conf) | `tnrx` | Exemplo de configuração do Slurm de um projeto |
+| [`tnrx.conf`](tnrx.conf) | `tnrx` | Exemplo da configuração de um projeto: recursos do Slurm e a imagem do container |
 | [`download_huggingface`](download_huggingface) | `tnrx` | Usado por `tnrx hf` para baixar modelos e datasets |
 | [`deep_check.py`](deep_check.py), [`deep_check_jax.py`](deep_check_jax.py), [`load_model.py`](load_model.py) | `tnrx` | Scripts de exemplo para conferir a GPU com PyTorch e JAX, e carregar um modelo baixado |
 | [`tnrx-connect`](tnrx-connect) | `tnrx-connect` | O script |

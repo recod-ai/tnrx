@@ -1,6 +1,6 @@
 'use strict';
-// Extensão TNRX: barra lateral com quatro blocos (Montagens, Configuração Slurm, Cluster,
-// Jupyter) sobre o `tnrx-connect --json`. Ela nunca autentica: login (senha/2FA), montar e
+// Extensão TNRX: barra lateral com quatro blocos (Montagens, Configuração do projeto,
+// Cluster, Jupyter) sobre o `tnrx-connect --json`. Ela nunca autentica: login (senha/2FA), montar e
 // o terminal do servidor são sempre num terminal integrado rodando o tnrx-connect.
 
 const vscode = require('vscode');
@@ -37,7 +37,7 @@ class Provider {
         item.tooltip = n.tooltip;
         item.contextValue = n.contextValue;
         if (n.icon) item.iconPath = new vscode.ThemeIcon(n.icon, n.color ? new vscode.ThemeColor(n.color) : undefined);
-        if (n.contextValue === 'slurm-key') item.command = { command: 'tnrx.openSlurm', title: 'Abrir', arguments: [n] };
+        if (String(n.contextValue).startsWith('slurm-key')) item.command = { command: 'tnrx.editConfigKey', title: 'Mudar valor', arguments: [n] };
         return item;
     }
 }
@@ -193,6 +193,75 @@ class Tnrx {
         term.sendText(`${shellQuote(bin)} ${sub}`);
     }
 
+    async cli(args) {
+        // Comando do tnrx-connect com --json que muda algo. Devolve o JSON, ou { error }.
+        try {
+            return await runJson(this.bin(), args);
+        } catch (e) {
+            this.output.appendLine(`[${new Date().toISOString()}] ${args.join(' ')}: ${e.code}: ${e.message}`);
+            return { error: e };
+        }
+    }
+
+    async setConfig(m, args) {
+        // tnrx-connect config --dir <pasta> set|unset ... --json, e atualiza o bloco.
+        const r = await this.cli(['config', '--dir', m.local_dir, ...args, '--json']);
+        if (r.error) {
+            vscode.window.showErrorMessage(`Não consegui mudar o tnrx.conf de ${m.name}: ${r.error.message}`);
+            return false;
+        }
+        await this.refreshStatus();
+        return true;
+    }
+
+    askValue(m, key, current) {
+        return vscode.window.showInputBox({
+            title: `${key} de ${m.name}`,
+            prompt: model.KEY_HELP[key],
+            value: current,
+            validateInput: (v) => model.validateConfigValue(key, v.trim()),
+        });
+    }
+
+    async pickPartition(m, current) {
+        // As partições do cluster desse servidor (com as GPUs livres), ou uma digitada.
+        const host = this.cluster && this.cluster.hosts.find((h) => h.host === m.host && h.ok);
+        if (!host || !host.partitions.length) return this.askValue(m, 'PARTITION', current);
+        const items = host.partitions.map((p) => ({
+            label: p.name,
+            description: [p.name === current ? 'atual' : null, p.default ? 'padrão do Slurm' : null].filter(Boolean).join(' · '),
+            detail: p.gpus ? `${p.gpus.free} de ${p.gpus.total} GPUs livres · tempo máximo ${p.time_limit}` : `sem GPUs · tempo máximo ${p.time_limit}`,
+            value: p.name,
+        }));
+        items.push({ label: '$(edit) Outra partição…', other: true });
+        const pick = await vscode.window.showQuickPick(items, { title: `PARTITION de ${m.name}`, placeHolder: `Atual: ${current}` });
+        if (!pick) return undefined;
+        return pick.other ? this.askValue(m, 'PARTITION', current) : pick.value;
+    }
+
+    async pickImage(m, value) {
+        // Padrão do tnrx (sem IMAGE), o tnrx.def do projeto, ou outra origem digitada.
+        const items = [{ label: 'Padrão do tnrx', description: 'sem IMAGE: o tnrx.def do projeto, se houver, senão a imagem padrão', unset: true }];
+        if (fs.existsSync(path.join(m.local_dir, 'tnrx.def'))) {
+            items.push({ label: 'tnrx.def', description: 'a imagem gerada do tnrx.def deste projeto', value: 'tnrx.def' });
+        }
+        if (value.from_file && value.value !== 'tnrx.def') items.push({ label: value.value, description: 'atual', value: value.value });
+        items.push({ label: '$(edit) Outra origem…', description: 'docker://..., um .def ou o caminho de um .sif', other: true });
+        const pick = await vscode.window.showQuickPick(items, { title: `Imagem do container de ${m.name}`, placeHolder: `Atual: ${value.value}` });
+        if (!pick) return undefined;
+        if (pick.unset) return { unset: true };
+        if (pick.other) {
+            return vscode.window.showInputBox({
+                title: `IMAGE de ${m.name}`,
+                prompt: 'Origem da imagem: docker://usuario/imagem:tag, um .def do projeto, ou o caminho de um .sif',
+                value: value.from_file ? value.value : '',
+                placeHolder: 'docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04',
+                validateInput: (v) => model.validateConfigValue('IMAGE', v.trim()),
+            });
+        }
+        return pick.value;
+    }
+
     mountForHost(host) {
         const ms = (this.status && this.status.mounts) || [];
         return ms.find((m) => m.host === host && m.state === 'mounted') || ms.find((m) => m.host === host);
@@ -247,15 +316,63 @@ class Tnrx {
 
         reg('tnrx.openSlurm', async (n) => {
             if (!n || !n.mount || !n.mount.slurm) return;
-            const s = n.mount.slurm;
+            const m = n.mount;
+            const s = m.slurm;
             if (!fs.existsSync(s.file)) {
                 const ok = await vscode.window.showInformationMessage(
-                    `${n.mount.name} não tem tnrx_slurm.conf (usa os padrões do tnrx). Criar com os valores atuais?`, 'Criar');
+                    `${m.name} não tem tnrx.conf (usa os padrões do tnrx). Criar com os valores atuais?`, 'Criar');
                 if (ok !== 'Criar') return;
-                const body = Object.entries(s.values).map(([k, v]) => `${k}=${v.value}`).join('\n');
-                fs.writeFileSync(s.file, `# Recursos dos jobs do tnrx (tnrx slurm / tnrx uvslurm)\n${body}\n`);
+                // A imagem fica de fora: sem IMAGE, o tnrx continua escolhendo (tnrx.def, senão a padrão).
+                const kv = Object.entries(s.values).filter(([k]) => k !== 'IMAGE').map(([k, v]) => `${k}=${v.value}`);
+                if (!(await this.setConfig(m, ['set', ...kv]))) return;
             }
             await vscode.window.showTextDocument(vscode.Uri.file(s.file));
+        });
+
+        reg('tnrx.editConfigKey', async (n) => {
+            if (!n || !n.key) return;
+            const m = n.mount;
+            const current = n.value.value;
+            let v;
+            if (n.key === 'PARTITION') v = await this.pickPartition(m, current);
+            else if (n.key === 'IMAGE') v = await this.pickImage(m, n.value);
+            else v = await this.askValue(m, n.key, current);
+            if (v === undefined) return;
+            if (v && v.unset) {
+                if (n.value.from_file) await this.setConfig(m, ['unset', 'IMAGE']);
+                return;
+            }
+            v = String(v).trim();
+            if (v === current && n.value.from_file) return;
+            await this.setConfig(m, ['set', `${n.key}=${v}`]);
+        });
+
+        reg('tnrx.resetConfigKey', (n) => n && n.key && this.setConfig(n.mount, ['unset', n.key]));
+
+        reg('tnrx.renameMount', async (n) => {
+            if (!n) return;
+            const m = n.mount;
+            const name = await vscode.window.showInputBox({
+                title: `Renomear ${m.name}`,
+                prompt: `Nome mostrado nas listas (${m.local_dir}). Vazio volta ao nome da pasta.`,
+                value: m.name,
+                validateInput: (v) => (v.length > 60 ? 'Máximo de 60 caracteres.' : null),
+            });
+            if (name === undefined || name === m.name) return;
+            const r = await this.cli(['rename', '--id', m.id, name.trim(), '--json']);
+            if (r.error) vscode.window.showErrorMessage(`Não consegui renomear ${m.name}: ${r.error.message}`);
+            await Promise.all([this.refreshStatus(), this.refreshJupyter(true)]);
+        });
+
+        reg('tnrx.forgetMount', async (n) => {
+            if (!n) return;
+            const m = n.mount;
+            const ok = await vscode.window.showWarningMessage(
+                `Apagar a montagem ${m.name}?`,
+                { modal: true, detail: `${m.local_dir}  →  ${m.host}:${m.remote_path}\n\nApaga deste computador a configuração, o cache e os snapshots (o histórico para desfazer edições). Os arquivos no servidor e a pasta local não são tocados.` },
+                'Apagar');
+            if (ok !== 'Apagar') return;
+            await this.forget(m, false);
         });
 
         reg('tnrx.jupyterTerminal', (n) => n && n.project.local_dir && this.openTerminal(n.project.local_dir, 'jupyter', 'jupyter'));
@@ -265,6 +382,25 @@ class Tnrx {
             await vscode.env.clipboard.writeText(n.server.url);
             vscode.window.showInformationMessage(`URL copiada: ${n.server.url.replace(/token=.*/, 'token=…')}`);
         });
+    }
+
+    async forget(m, force) {
+        const r = await this.cli(['forget', '--id', m.id, ...(force ? ['--force'] : []), '--json']);
+        if (!r.error) {
+            await this.refreshStatus();
+            vscode.window.showInformationMessage(`Montagem ${m.name} apagada.`);
+            return;
+        }
+        if (r.error.code === 'pending_writes') {
+            const pick = await vscode.window.showWarningMessage(
+                `${m.name} tem arquivos salvos que ainda não chegaram ao servidor.`,
+                { modal: true, detail: 'Monte a pasta de novo para enviá-los e depois apague. Apagar agora perde essas mudanças.' },
+                'Montar para enviar', 'Apagar mesmo assim');
+            if (pick === 'Montar para enviar') this.openTerminal(m.local_dir, 'mount', 'mount');
+            else if (pick === 'Apagar mesmo assim') await this.forget(m, true);
+            return;
+        }
+        vscode.window.showErrorMessage(`Não consegui apagar ${m.name}: ${r.error.message}`);
     }
 
     async unmount(m, force) {

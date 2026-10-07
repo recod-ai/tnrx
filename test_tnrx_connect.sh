@@ -1311,6 +1311,7 @@ test_jupyter_start_new_with_fixed_url() {
 
     jt_run '\n'
     wait_out "Ponte aberta" && pass_test "iniciou e conectou" || fail_test "não conectou" "$(cat "$MT/jout")"
+    wait_out "Esta URL é fixa"   # impressa logo depois da ponte
     local out; out=$(cat "$MT/jout")
     assert_contains "$out" "Iniciar um novo Jupyter em proj" "pergunta se inicia um novo"
     assert_contains "$out" "job na fila do Slurm" "mostra o progresso (fila)"
@@ -1413,7 +1414,7 @@ assert_json() {
 }
 
 test_api_status_json() {
-    log_test "api: status --json lista montagens, estado, conexão e tnrx_slurm.conf efetivo"
+    log_test "api: status --json lista montagens, estado, conexão e tnrx.conf efetivo"
     setup_mount_env
     printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
     printf '# comentário\nPARTITION=a100\nGPUS="2"  # duas\nexport TIME=04:00:00\n' > tnrx_slurm.conf
@@ -1434,6 +1435,15 @@ test_api_status_json() {
     assert_json "$out" "$M['slurm']['values']['GPUS']['value']" "2" "aspas e comentário removidos"
     assert_json "$out" "$M['slurm']['values']['TIME']['value']" "04:00:00" "aceita 'export'"
     assert_json "$out" "$M['slurm']['values']['MEM']" "{'value': '4G', 'from_file': False}" "chave ausente: padrão do tnrx"
+    assert_json "$out" "$M['slurm']['file'].endswith('/tnrx_slurm.conf')" "True" "sem tnrx.conf: lê o tnrx_slurm.conf antigo"
+    assert_json "$out" "$M['slurm']['values']['IMAGE']" "{'value': 'docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04', 'from_file': False}" "IMAGE ausente: a imagem padrão"
+    touch tnrx.def
+    out=$("$TNRX_CONNECT" status --json 2>/dev/null </dev/null)
+    assert_json "$out" "$M['slurm']['values']['IMAGE']['value']" "tnrx.def" "IMAGE ausente com tnrx.def: o tnrx.def"
+    printf 'IMAGE=docker://ubuntu:24.04\n' > tnrx.conf
+    out=$("$TNRX_CONNECT" status --json 2>/dev/null </dev/null)
+    assert_json "$out" "($M['slurm']['file'].endswith('/tnrx.conf'), $M['slurm']['values']['IMAGE'])" "(True, {'value': 'docker://ubuntu:24.04', 'from_file': True})" "com tnrx.conf: vale ele"
+    rm -f tnrx.conf tnrx.def
     assert_json "$out" "[(m['state'], m['slurm']) for m in d['mounts'] if m['name']=='velho'][0]" "('unmounted', None)" "pasta desmontada: sem slurm"
     assert_json "$out" "sorted((m['host'], m['state']) for m in d['mounts'] if m['name']=='proj')" "[('user@b', 'unmounted'), ('user@srv', 'mounted')]" "mesma pasta com outro host: só a config do lock conta como montada"
     assert_json "$out" "sorted((h['host'], h['connected']) for h in d['hosts'])" "[('user@b', False), ('user@outro', False), ('user@srv', True)]" "hosts com o estado da conexão"
@@ -1448,12 +1458,95 @@ test_api_status_json() {
 test_api_slurm_defaults_match_tnrx() {
     log_test "api: padrões do Slurm no tnrx-connect iguais aos do tnrx"
     local k a b ok=true
-    for k in PARTITION GPUS CPUS MEM TIME; do
+    for k in PARTITION GPUS CPUS MEM TIME IMAGE; do
         a=$(sed -n "s/^DEFAULT_$k=\"\\(.*\\)\"/\\1/p" "$SCRIPT_DIR/tnrx")
         b=$(sed -n "s/^SLURM_DEFAULT_$k=\"\\(.*\\)\"/\\1/p" "$TNRX_CONNECT")
         [[ -n "$a" && "$a" == "$b" ]] || { ok=false; fail_test "padrão $k difere" "tnrx='$a' tnrx-connect='$b'"; }
     done
-    [[ "$ok" == "true" ]] && pass_test "PARTITION, GPUS, CPUS, MEM e TIME iguais"
+    [[ "$ok" == "true" ]] && pass_test "PARTITION, GPUS, CPUS, MEM, TIME e IMAGE iguais"
+}
+
+test_api_config() {
+    log_test "api: config lê e muda o tnrx.conf da pasta montada"
+    setup_mount_env
+    local out rc
+    out=$("$TNRX_CONNECT" config --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "d['error']['code']" "not_mounted" "pasta não montada: not_mounted"
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    printf '# meus recursos\nPARTITION=h200  # rápida\nTIME=01:00:00\n' > tnrx_slurm.conf
+
+    out=$("$TNRX_CONNECT" config set PARTITION=a100 GPUS=2 IMAGE=docker://ubuntu:24.04 --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['slurm']['values']['PARTITION']" "{'value': 'a100', 'from_file': True}" "set PARTITION"
+    assert_json "$out" "(d['slurm']['values']['GPUS']['value'], d['slurm']['values']['IMAGE']['value'])" "('2', 'docker://ubuntu:24.04')" "set de várias chaves de uma vez"
+    if [[ -f tnrx.conf && ! -e tnrx_slurm.conf ]]; then pass_test "o tnrx_slurm.conf antigo vira tnrx.conf ao gravar"; else fail_test "migração" "$(ls)"; fi
+    assert_contains "$(cat tnrx.conf)" "# meus recursos" "comentários do arquivo ficam"
+    assert_contains "$(cat tnrx.conf)" "TIME=01:00:00" "chaves não mexidas ficam"
+
+    out=$("$TNRX_CONNECT" config set GPUS=duas --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "d['error']['code']" "invalid_value" "valor inválido: invalid_value"
+    [[ $rc -eq 2 ]] && pass_test "valor inválido: saída 2" || fail_test "saída do valor inválido" "$rc"
+    assert_contains "$(cat tnrx.conf)" "GPUS=2" "valor inválido não grava nada"
+    out=$("$TNRX_CONNECT" config set FOO=1 --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['error']['code']" "invalid_value" "chave desconhecida: recusada"
+    out=$("$TNRX_CONNECT" config set TIME=1-00:00:00 MEM=32G --json 2>/dev/null </dev/null)
+    assert_json "$out" "(d['slurm']['values']['TIME']['value'], d['slurm']['values']['MEM']['value'])" "('1-00:00:00', '32G')" "TIME com dias e MEM com unidade"
+
+    out=$("$TNRX_CONNECT" config unset PARTITION IMAGE --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['slurm']['values']['PARTITION']" "{'value': 'l40s', 'from_file': False}" "unset volta ao padrão"
+    assert_not_contains "$(cat tnrx.conf)" "IMAGE=" "unset tira a linha"
+
+    mkdir -p sub/dir
+    out=$(cd sub/dir && "$TNRX_CONNECT" config 2>&1)
+    assert_contains "$out" "PARTITION=l40s  (padrão)" "texto, de uma subpasta: mostra os valores e o que é padrão"
+    out=$("$TNRX_CONNECT" config --dir "$MT/work/proj" --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['dir']" "$(pwd -P)" "--dir escolhe a pasta"
+
+    "$TNRX_CONNECT" umount -f >/dev/null 2>&1
+    cleanup_mount_env
+}
+
+test_api_rename_forget() {
+    log_test "api: rename dá nome à montagem; forget apaga a montagem do laptop"
+    setup_mount_env
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    local out rc id="user@srv_proj" data="$MT/home/.local/share/tnrx-connect/user@srv_proj"
+
+    out=$("$TNRX_CONNECT" rename "code do artigo" --json 2>/dev/null </dev/null)
+    assert_json "$out" "(d['id'], d['name'])" "('$id', 'code do artigo')" "rename na pasta atual"
+    out=$("$TNRX_CONNECT" status --json 2>/dev/null </dev/null)
+    assert_json "$out" "[m['name'] for m in d['mounts'] if m['id']=='$id'][0]" "code do artigo" "status mostra o nome novo"
+    assert_contains "$("$TNRX_CONNECT" status 2>&1)" "Nome:      code do artigo" "status em texto mostra o nome"
+    "$TNRX_CONNECT" mount </dev/null >/dev/null 2>&1
+    out=$("$TNRX_CONNECT" status --json 2>/dev/null </dev/null)
+    assert_json "$out" "[m['name'] for m in d['mounts'] if m['id']=='$id'][0]" "code do artigo" "o nome sobrevive a um novo mount (o .conf é regravado)"
+    out=$("$TNRX_CONNECT" rename --id "$id" "" --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['name']" "proj" "nome vazio: volta ao nome da pasta"
+
+    out=$("$TNRX_CONNECT" forget --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "d['error']['code']" "mounted" "forget com a pasta montada: recusa"
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+
+    mkdir -p "$data/vfs-1/vfsMeta/sftp"
+    printf '{"ModTime":"x","Size":3,"Dirty": true}' > "$data/vfs-1/vfsMeta/sftp/a.py"
+    out=$("$TNRX_CONNECT" forget --id "$id" --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['error']['code']" "pending_writes" "escrita não enviada no cache: recusa"
+    [ -f "$MT/home/.config/tnrx-connect/$id.conf" ] && pass_test "recusado: nada apagado" || fail_test "apagou mesmo recusando"
+
+    printf 'HOST=user@b\nREMOTE_PATH=/b/proj\nLOCAL_DIR=%s\nLAST_USED=1\n' "$(pwd -P)" > "$MT/home/.config/tnrx-connect/user@b_proj.conf"
+    out=$("$TNRX_CONNECT" forget --force --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "d['error']['code']" "usage" "pasta com duas configurações: pede --id"
+
+    out=$("$TNRX_CONNECT" forget --id "$id" --force --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['ok']" "True" "--force apaga"
+    if [[ ! -e "$MT/home/.config/tnrx-connect/$id.conf" && ! -e "$data" && -f "$MT/home/.config/tnrx-connect/user@b_proj.conf" && -d "$MT/work/proj" ]]; then
+        pass_test "apaga a configuração e os dados (cache, snapshots) só desta montagem; a pasta local fica"
+    else
+        fail_test "forget apagou errado" "$(ls -la "$MT/home/.config/tnrx-connect" "$data" 2>&1)"
+    fi
+    out=$("$TNRX_CONNECT" forget --id nao-existe --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['error']['code']" "unknown_mount" "id desconhecido: unknown_mount"
+
+    cleanup_mount_env
 }
 
 test_api_cluster_json() {
@@ -1666,6 +1759,8 @@ run_all_tests() {
     test_jupyter_start_cancel_while_waiting
     test_api_status_json
     test_api_slurm_defaults_match_tnrx
+    test_api_config
+    test_api_rename_forget
     test_api_cluster_json
     test_api_cluster_cancel
     test_api_jupyter_list_json
@@ -1684,5 +1779,18 @@ run_all_tests() {
     fi
     exit 0
 }
+
+# ./test_tnrx_connect.sh <test_nome> [...]: roda só esses testes.
+if [ $# -gt 0 ]; then
+    make_fakes
+    for t in "$@"; do
+        declare -f "$t" >/dev/null || { echo "Teste desconhecido: $t" >&2; exit 2; }
+        "$t"
+    done
+    rm -rf "$FAKES_DIR"
+    echo -e "\n${BLUE}📊 Total: $((TESTS_PASSED + TESTS_FAILED))  Passed: ${GREEN}$TESTS_PASSED${NC}  Failed: ${RED}$TESTS_FAILED${NC}"
+    [[ $TESTS_FAILED -eq 0 ]]
+    exit
+fi
 
 run_all_tests

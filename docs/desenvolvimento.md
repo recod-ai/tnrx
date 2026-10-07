@@ -39,7 +39,8 @@ tnrx update-dev               # ou: tnrx update-dev <pasta>; tnrx-connect update
 
 ```bash
 TNRX_SKIP_RUNTIME_TEST=1 bash test_tnrx.sh    # tnrx
-bash test_tnrx_connect.sh                     # tnrx-connect (~50 s)
+bash test_tnrx_connect.sh                     # tnrx-connect (~1 min)
+bash test_tnrx_connect.sh test_api_config     # um teste só (vale para os dois scripts)
 bash test_tnrx.sh test_install_singularity    # um teste só
 cd vscode && node --test test/                # extensão (precisa só do Node)
 ```
@@ -47,7 +48,7 @@ cd vscode && node --test test/                # extensão (precisa só do Node)
 Os testes trocam `hostname`, `ssh`, `rclone`, `fusermount3`, `srun`, `singularity` e `uv` por versões falsas, que imprimem os argumentos que receberam. Assim eles conferem os comandos montados (muitas vezes pelo `--debug`), as mensagens e os fluxos completos sem servidor, GPU ou rede. O que só um servidor real mostra está em [validacao-manual.md](validacao-manual.md): atualize essa lista quando acrescentar algo que os fakes não cobrem.
 
 * `TNRX_SKIP_RUNTIME_TEST=1` pula o `test_runtime_env_injection`, o único que submete um job de verdade.
-* `TNRX_INTERACTIVE=1` faz o `tnrx` e o `install.sh` agirem como num terminal, para testar o menu de imagens e as perguntas do instalador com as respostas vindas de um `printf`. Para testar o caso sem terminal, o teste roda o instalador com `setsid`.
+* `TNRX_INTERACTIVE=1` faz o `install.sh` agir como num terminal, para testar as perguntas do instalador com as respostas vindas de um `printf`. Para testar o caso sem terminal, o teste roda o instalador com `setsid`.
 * `TNRX_COMPONENTS` escolhe os componentes do instalador sem perguntar.
 * `TNRX_SIF_DIR` aponta o banco de imagens para uma pasta temporária, para os testes não tocarem o `~/.tnrx/sifs` de verdade.
 * Testes que instalam ou desinstalam usam um `HOME` temporário: o `uninstall` apaga `~/.local/bin/tnrx*` e `~/.local/share/tnrx`. O `test_installer` usa um repositório git local (`TNRX_REPO=file://...`) no lugar do GitHub.

@@ -61,6 +61,7 @@ Já funcionou com o `rclone` real (v1.75.0) montando o Headnode. Desde 2026-10-0
 | ☐ | Desempenho | `git status` e `grep -r` numa pasta grande montada | Tempo aceitável; anote se for lento |
 | ☐ | Terminal aberto antes do mount | Rode `tnrx-connect mount` numa pasta em que o terminal já estava | O aviso pede `cd .`; depois disso o mount aparece |
 | ☐ | Recuperação com algo ainda aberto (2026-09-23, Nautilus/terminal deixados abertos, real) | `kill -9` no `rclone` da montagem (PID em `tnrx-connect status`), deixar o Nautilus/um terminal navegando dentro da pasta antiga, rodar `tnrx-connect mount` de novo | Detecta a sessão anterior, desmonta (lazy) e remonta **sem pedir pra fechar nada**; se o `rclone` antigo não morrer em ~5s, o comando o encerra (`kill`, depois `kill -9`). **Validado com fakes; falta confirmar com `rclone` real** que o processo antigo realmente responde ao `kill`/`kill -9` e que os dois mounts (antigo detached + novo) não colidem no mesmo cache-dir |
+| ☐ | `forget` com escrita pendente (rclone real) | Com a pasta montada, desligue a rede, salve um arquivo, rode `tnrx-connect umount -f` e depois `tnrx-connect forget` | Recusa com `pending_writes`. **Confira o formato:** procure o arquivo em `~/.local/share/tnrx-connect/<id>/vfs-*/vfsMeta/` e veja se ele tem `"Dirty": true`. A detecção depende desse campo; se o `rclone` usar outro nome, o `forget` apagaria sem avisar |
 | ☐ | macOS / macFUSE | Rodar num Mac | Ainda não suportado: `is_mounted` lê `/proc/mounts` e o desmonte usa `fusermount3` |
 
 ## 3. Interface `--json` (base da extensão do VS Code)
@@ -86,6 +87,9 @@ Os testes carregam a extensão com um `vscode` falso, e o `.vsix` foi aceito pel
 | ☐ | Reconectar | Derrube a rede com a pasta montada | ⚠ "montada, sem conexão"; Reconectar abre o terminal e, depois do 2FA, volta a ✔ |
 | ☐ | Desmontar com a pasta aberta no próprio VS Code | Desmontar a pasta do workspace atual | Falha com o motivo e oferece `-f` |
 | ☐ | Ícones e cores | Tema claro e escuro | Estados legíveis nos dois |
+| ☐ | Editar a configuração | No bloco Configuração do projeto, clique em `PARTITION`, `GPUS` e `IMAGE` | A lista de partições mostra as GPUs livres; o valor muda no `tnrx.conf` da pasta montada e o bloco atualiza; um valor inválido é recusado na própria caixa |
+| ☐ | Renomear | Menu de contexto de uma montagem → Renomear | O nome novo aparece em Montagens, Configuração e Jupyter |
+| ☐ | Apagar montagem | Numa pasta desmontada: menu de contexto → Apagar montagem | Pede confirmação e some da lista; a pasta local e os arquivos no servidor continuam |
 
 ## 5. `tnrx` no servidor
 
@@ -97,10 +101,13 @@ Os testes carregam a extensão com um `vscode` falso, e o `.vsix` foi aceito pel
 | ☐ | Extensão escolhida e depois desmarcada | No laptop: instale com a extensão, depois `tnrx-connect update --choose` respondendo não para ela | A extensão aparece no VS Code e depois é removida |
 | ☐ | `tnrx update` com uma montagem ativa | Com uma pasta montada pelo `tnrx-connect` no laptop, rode `tnrx-connect update` | Atualiza e mostra o que mudou; a montagem e os snapshots continuam (`tnrx-connect status`) |
 | ☐ | Migração da instalação antiga | Num servidor com `~/.local/bin/tnrx` apontando para `~/tnrx`, rode o `curl` | Os links passam a apontar para `~/.local/share/tnrx`; depois disso a pasta `~/tnrx` pode ser apagada |
-| ☐ | Menu numa pasta sem imagem | Num projeto sem `.sif`: `tnrx uv sync` e Enter | Cria o link para a imagem padrão e o `uv sync` segue |
+| ☐ | Projeto sem imagem | Num projeto sem `.sif` e sem `tnrx.conf`: `tnrx uv sync` | Baixa a imagem padrão para o banco (só na primeira vez) e o `uv sync` segue, sem perguntar nada |
+| ☐ | Jupyter pelo laptop num projeto sem imagem | `tnrx-connect jupyter` → `n` num projeto novo | O progresso fica em "preparando o job" enquanto a imagem baixa; depois o Jupyter sobe normalmente |
+| ☐ | `IMAGE` no `tnrx.conf` | `tnrx-connect config set IMAGE=docker://ubuntu:24.04` no laptop, depois `tnrx slurm cat /etc/os-release` | Baixa a imagem nova no headnode e o job mostra Ubuntu 24.04 |
+| ☐ | Projeto antigo com `tnrx_slurm.conf` e `pytorch_devel.sif` | Rode `tnrx uvslurm python deep_check.py` sem mudar nada | Funciona como antes, com o aviso para renomear o arquivo; o `.sif` da pasta continua valendo |
 | ☐ | Build do `tnrx.def` | Num projeto com `tnrx.def` (copiado do modelo): `tnrx install singularity` no Abaporu e no Headnode | Gera a imagem no banco com `build --fakeroot` (nome `..._def-<hash>.sif`). Se o servidor não permitir fakeroot, a mensagem sugere gerar em outra máquina |
 | ☐ | Banco fora do `/home` | `export TNRX_SIF_DIR=/hadatasets/$USER/sifs` e `tnrx install` | A imagem vai para lá, e o job no nó de GPU a encontra pelo link |
-| ☐ | Imagem padrão nova | Depois do menu, `tnrx uvslurm python deep_check.py` (com `torch` no `.venv`) | A GPU aparece no PyTorch |
+| ☐ | Imagem padrão nova | Num projeto sem configuração, `tnrx uvslurm python deep_check.py` (com `torch` no `.venv`) | A GPU aparece no PyTorch |
 | ☐ | Python baixado pelo `uv` | Num projeto novo com a imagem padrão: `tnrx uv sync`, depois `tnrx uvslurm python -c "import sys; print(sys.executable)"` | O caminho aponta para o `.venv` do projeto, e o Python por trás dele fica em `~/.local/share/uv/python/` (o nó de GPU enxerga o `$HOME`) |
 | ☐ | Jupyter com a imagem padrão | `tnrx uv add jupyterlab ipykernel` e `tnrx-connect jupyter` → `n` | O Jupyter sobe do `.venv` (a imagem não tem Jupyter próprio) e o kernel `Python (TNRX-<pasta>)` aparece |
 | ☐ | `tnrx hf` com a imagem padrão | `tnrx uv add huggingface-hub` e `tnrx hf model <repo pequeno>` | Baixa para o `HUB_ROOT` do servidor |

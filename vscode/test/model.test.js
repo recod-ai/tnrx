@@ -23,7 +23,7 @@ test('montagens: sem dados, vazio', () => {
     assert.deepEqual(model.mountsTree({ v: 1, ok: true, mounts: [], hosts: [] }), []);
 });
 
-test('slurm: só pastas montadas; padrões marcados; sem conexão avisa', () => {
+test('configuração: só pastas montadas; padrões marcados; IMAGE incluída; sem conexão avisa', () => {
     const items = model.slurmTree(fx.status);
     assert.deepEqual(items.map((i) => i.label), ['proj', 'caiu']);
     const keys = items[0].children.map((c) => [c.label, c.description]);
@@ -33,16 +33,23 @@ test('slurm: só pastas montadas; padrões marcados; sem conexão avisa', () => 
         ['CPUS', '2 (padrão)'],
         ['MEM', '4G (padrão)'],
         ['TIME', '04:00:00'],
+        ['IMAGE', 'docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 (padrão)'],
     ]);
-    assert.equal(items[0].children[0].contextValue, 'slurm-key');
+    assert.equal(items[0].children[0].contextValue, 'slurm-key-file', 'do arquivo: pode voltar ao padrão');
+    assert.equal(items[0].children[2].contextValue, 'slurm-key-default');
+    assert.equal(items[0].children[0].key, 'PARTITION');
     assert.equal(items[1].children.length, 1);
     assert.match(items[1].children[0].label, /Sem conexão/);
 });
 
-test('slurm: projeto sem tnrx_slurm.conf diz que usa os padrões', () => {
+test('configuração: sem tnrx.conf diz que usa os padrões; tnrx_slurm.conf antigo é apontado', () => {
     const st = JSON.parse(JSON.stringify(fx.status));
-    st.mounts.find((m) => m.name === 'proj').slurm.exists = false;
-    assert.match(model.slurmTree(st)[0].description, /sem tnrx_slurm.conf/);
+    const m = st.mounts.find((x) => x.name === 'proj');
+    m.slurm.exists = false;
+    assert.match(model.slurmTree(st)[0].description, /sem tnrx.conf/);
+    m.slurm.exists = true;
+    m.slurm.file = '/tmp/tnrx-x/proj/tnrx_slurm.conf';
+    assert.match(model.slurmTree(st)[0].description, /tnrx_slurm.conf \(nome antigo\)/);
 });
 
 test('cluster: GPUs livres por partição, meus jobs com o projeto, host sem conexão', () => {

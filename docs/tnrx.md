@@ -4,9 +4,9 @@
 
 O `tnrx` junta três peças para que todo projeto rode do mesmo jeito em qualquer servidor:
 
-* **Container (Apptainer/Singularity):** o sistema em que o código roda (Ubuntu, CUDA, cuDNN) fica num arquivo `.sif` na pasta do projeto. O resultado não depende do que está instalado no servidor.
+* **Container (Apptainer/Singularity):** o sistema em que o código roda (Ubuntu, CUDA, cuDNN) vem de uma imagem (`.sif`), escolhida no `tnrx.conf` do projeto. O resultado não depende do que está instalado no servidor.
 * **uv:** o Python e as bibliotecas ficam num `.venv` na pasta do projeto, descritos pelo `pyproject.toml` e travados pelo `uv.lock`.
-* **Slurm:** os jobs vão para os nós de GPU com os recursos do `tnrx_slurm.conf` do projeto.
+* **Slurm:** os jobs vão para os nós de GPU com os recursos do `tnrx.conf` do projeto.
 
 Uma regra explica quase todos os comandos: **o headnode tem internet, os nós de computação não.** Por isso, tudo o que baixa algo (bibliotecas, imagem, modelos) roda no headnode, e tudo o que usa GPU roda nos nós, só com o que já foi baixado.
 
@@ -18,7 +18,7 @@ Uma regra explica quase todos os comandos: **o headnode tem internet, os nós de
 | `tnrx uvslurm ...` | nó de GPU, dentro do container, com o `.venv` | Rodar o código do projeto (o modo normal) |
 | `tnrx slurm ...` | nó de GPU, dentro do container, sem o `.venv` | Rodar um comando qualquer; abrir um shell no nó |
 
-Todo comando vale para a **pasta atual**: o `tnrx` usa a imagem, o `.venv`, o `tnrx_slurm.conf` e o `.tnrx_env` da pasta onde você está. Por isso cada projeto pode ter sua imagem, suas bibliotecas e seus recursos de GPU.
+Todo comando vale para a **pasta atual**: o `tnrx` usa o `tnrx.conf`, o `.venv` e o `.tnrx_env` da pasta onde você está. Por isso cada projeto pode ter sua imagem, suas bibliotecas e seus recursos de GPU.
 
 ## Instalação
 
@@ -86,32 +86,58 @@ cp ~/tnrx/deep_check.py .
 tnrx uvslurm python deep_check.py   # confere a GPU
 ```
 
-Na primeira vez que um comando roda numa pasta sem imagem, o `tnrx` pergunta qual usar:
-
-```
-⚠️  Nenhuma imagem (.sif) nesta pasta. Imagens disponíveis (/home/marcos/.tnrx/sifs):
-  [1] nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif  (padrão)
-  [2] nvcr.io_nvidia_pytorch_24.01-py3.sif
-Criar link para qual? [1] (n = cancelar):
-```
-
-Enter escolhe a padrão. Ele cria na pasta um link para a imagem do banco e segue com o comando. Se o projeto tem um [`tnrx.def`](#customizar-a-imagem-tnrxdef), a imagem dele aparece em primeiro lugar e é gerada na hora, se ainda não existir. Fora de um terminal (um Jupyter iniciado pelo `tnrx-connect`, por exemplo), ele não pergunta: avisa que falta a imagem e para.
+Nada mais é obrigatório: sem configuração, o projeto usa a imagem padrão e os recursos padrão do Slurm. A imagem é baixada para o [banco de imagens](#a-imagem-do-container) na primeira vez que precisar.
 
 Arquivos que o `tnrx` usa na pasta do projeto:
 
 | Arquivo | O que é | Vai para o git? |
 | --- | --- | --- |
-| `*.sif` | Link para a imagem do container no banco. Tem que haver **exatamente um** | Não (o `tnrx` recria o link quando falta) |
-| `tnrx.def` | Opcional: a receita da imagem, se o projeto precisa de pacotes do sistema ([detalhes](#a-imagem-do-container)) | Sim |
+| `tnrx.conf` | Opcional: recursos do Slurm e a imagem do container ([detalhes](#configuração-do-projeto-tnrxconf)) | Sim |
+| `tnrx.def` | Opcional: a receita da imagem, se o projeto precisa de pacotes do sistema ([detalhes](#customizar-a-imagem-tnrxdef)) | Sim |
 | `pyproject.toml`, `uv.lock` | Bibliotecas do projeto | Sim |
 | `.venv/` | O ambiente instalado | Não |
-| `tnrx_slurm.conf` | Opcional: partição, GPUs, memória, tempo ([detalhes](#configurar-os-recursos-tnrx_slurmconf)) | Sim |
 | `.tnrx_env` | Opcional: variáveis de ambiente para dentro do container ([detalhes](#variáveis-de-ambiente-tnrx_env)) | Não (pode ter tokens) |
 | `.tnrx/` | Criada pelo `tnrx`: registro dos Jupyters no ar, com a senha deles | Não (tem um `.gitignore` próprio) |
 
+## Configuração do projeto (`tnrx.conf`)
+
+Cada projeto pode ter um `tnrx.conf` na pasta. As chaves que faltam ficam com o padrão. Há um exemplo comentado em [`tnrx.conf`](../tnrx.conf):
+
+```bash
+PARTITION=h200
+GPUS=1
+CPUS=4
+MEM=16G
+TIME=02:00:00
+IMAGE=docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+```
+
+| Chave | O que é | Padrão |
+| --- | --- | --- |
+| `PARTITION` | Partição do Slurm (as disponíveis estão no `sinfo`) | `l40s` |
+| `GPUS` | GPUs por job | `1` |
+| `CPUS` | CPUs por job | `2` |
+| `MEM` | Memória por job | `4G` |
+| `TIME` | Tempo máximo do job | `00:10:00` |
+| `IMAGE` | Imagem do container ([detalhes](#a-imagem-do-container)) | o `tnrx.def` do projeto, se existir, senão `docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04` |
+
+O arquivo é lido como um script `bash`, então não use espaços em volta do `=`. Ele é do projeto e vai para o git: quem clonar o projeto roda com os mesmos recursos e a mesma imagem. No laptop, dá para editá-lo como qualquer arquivo da pasta montada, com `tnrx-connect config set GPUS=2` ou pela [extensão do VS Code](../vscode/README.md).
+
+O nome antigo, `tnrx_slurm.conf`, ainda é lido quando o projeto não tem `tnrx.conf`; o `tnrx` avisa para renomear. O `tnrx install singularity` e o `tnrx-connect config` renomeiam sozinhos quando gravam algo.
+
 ## A imagem do container
 
-As imagens ficam num **banco por usuário**, `~/.tnrx/sifs/` (mude com a variável `TNRX_SIF_DIR`). Cada imagem é baixada ou gerada uma vez, e os projetos só guardam um link simbólico para ela, então dez projetos com a mesma imagem ocupam o espaço de uma. O nome diz de onde a imagem veio:
+O `IMAGE` do `tnrx.conf` aceita três formas:
+
+| Valor | Exemplo |
+| --- | --- |
+| Uma imagem Docker | `IMAGE=docker://nvcr.io/nvidia/pytorch:24.01-py3` (sem `docker://`, ele assume Docker) |
+| Um *definition file* do projeto | `IMAGE=tnrx.def` ([detalhes](#customizar-a-imagem-tnrxdef)) |
+| O caminho de um `.sif` pronto | `IMAGE=/hadatasets/imagens/minha.sif` |
+
+Sem `IMAGE`, o `tnrx` usa, nesta ordem: um `.sif` que esteja na pasta do projeto (o jeito antigo), o `tnrx.def` do projeto, a imagem padrão.
+
+As imagens Docker e as de `.def` ficam num **banco por usuário**, `~/.tnrx/sifs/` (mude com a variável `TNRX_SIF_DIR`). Cada imagem é baixada ou gerada uma vez, no primeiro comando que precisar dela, sempre no headnode (os nós de GPU não têm internet); dez projetos com a mesma imagem ocupam o espaço de uma. O nome no banco diz de onde a imagem veio:
 
 | Origem | Nome no banco |
 | --- | --- |
@@ -119,7 +145,7 @@ As imagens ficam num **banco por usuário**, `~/.tnrx/sifs/` (mude com a variáv
 | `docker://nvcr.io/nvidia/pytorch:24.01-py3` | `nvcr.io_nvidia_pytorch_24.01-py3.sif` |
 | um `tnrx.def` com `From: nvidia/cuda:12.6.3-...` | `nvidia_cuda_12.6.3-...__def-<hash>.sif` |
 
-O `<hash>` vem do conteúdo do `.def`: projetos com o mesmo `.def` compartilham a imagem, e editar o `.def` gera uma imagem nova. As antigas continuam no banco até você apagá-las (`ls -lh ~/.tnrx/sifs`); um projeto que apontava para uma imagem apagada volta a perguntar qual usar. Se a sua cota no `/home` for pequena, aponte o `TNRX_SIF_DIR` para o armazenamento compartilhado (ex.: `export TNRX_SIF_DIR=/hadatasets/$USER/sifs` no `~/.bashrc`).
+O `<hash>` vem do conteúdo do `.def`: projetos com o mesmo `.def` compartilham a imagem, e editar o `.def` faz o próximo comando gerar uma imagem nova. As antigas continuam no banco até você apagá-las (`ls -lh ~/.tnrx/sifs`); se uma imagem apagada for necessária de novo, ela é baixada ou gerada outra vez. Se a sua cota no `/home` for pequena, aponte o `TNRX_SIF_DIR` para o armazenamento compartilhado (ex.: `export TNRX_SIF_DIR=/hadatasets/$USER/sifs` no `~/.bashrc`).
 
 A imagem padrão é `nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04`: Ubuntu 24.04, CUDA 12.6 e cuDNN 9, **sem Python**. O Python vem do `uv`: no primeiro `tnrx uv sync` ou `tnrx uv add`, ele baixa a versão pedida no `pyproject.toml` (em `~/.local/share/uv/python/`) e cria o `.venv` com ela. Para fixar a versão do Python, crie um arquivo `.python-version` no projeto (ex.: `echo 3.12 > .python-version`) e coloque-o no git.
 
@@ -133,15 +159,7 @@ cp ~/tnrx/tnrx.def .
 tnrx install singularity
 ```
 
-Para trocar a imagem de um projeto, use `tnrx install singularity [origem]`. Ele garante a imagem no banco e troca o link da pasta:
-
-| Situação | Imagem |
-| --- | --- |
-| Você passou a origem: um `.def` ou uma URL `docker://...` | A dessa origem |
-| O projeto tem um `tnrx.def` | A gerada a partir dele (`build --fakeroot`) |
-| Nenhum dos dois | A padrão (`pull`) |
-
-Uma imagem que já está no banco não é baixada de novo; `--force` baixa ou gera outra vez. Se a pasta tem um `.sif` de verdade (de antes do banco), ele pergunta antes de apagá-lo.
+Para trocar a imagem, mude o `IMAGE` no `tnrx.conf`, ou use `tnrx install singularity [origem]`: ele grava o `IMAGE` e já baixa ou gera a imagem, para o primeiro job não esperar por isso. Sem origem, ele usa o `tnrx.def` do projeto, se existir, senão a imagem padrão. `--force` baixa ou gera a imagem de novo.
 
 **Build sem root:** gerar a imagem a partir de um `.def` usa `--fakeroot`, que só funciona se o admin configurou `/etc/subuid` e `/etc/subgid` para o seu usuário. Se o build falhar por isso, a mensagem diz o nome que a imagem deve ter: gere-a numa máquina em que você tenha root (`apptainer build <nome> tnrx.def`) e copie para o banco no servidor.
 
@@ -173,27 +191,7 @@ O `tnrx uvslurm` roda `uv run --frozen` no nó: usa o `uv.lock` como está, sem 
 
 O job roda em primeiro plano: a saída aparece no terminal, e `Ctrl-C` o cancela. Para acompanhar e cancelar de outro terminal: `squeue -u $USER` e `scancel <job>`.
 
-### Configurar os recursos (`tnrx_slurm.conf`)
-
-Cada projeto pode ter um `tnrx_slurm.conf` na pasta. As chaves que faltam ficam com o padrão:
-
-```bash
-PARTITION=h200
-GPUS=1
-CPUS=4
-MEM=16G
-TIME=02:00:00
-```
-
-| Chave | Padrão |
-| --- | --- |
-| `PARTITION` | `l40s` |
-| `GPUS` | `1` |
-| `CPUS` | `2` |
-| `MEM` | `4G` |
-| `TIME` | `00:10:00` |
-
-O arquivo é lido como um script `bash`, então não use espaços em volta do `=`. As partições disponíveis aparecem no `sinfo` (ou em `tnrx-connect cluster`, no laptop).
+Os recursos do job (partição, GPUs, CPUs, memória e tempo) vêm do [`tnrx.conf`](#configuração-do-projeto-tnrxconf) do projeto. As partições disponíveis aparecem no `sinfo` (ou em `tnrx-connect cluster`, no laptop).
 
 ### Variáveis de ambiente (`.tnrx_env`)
 
@@ -305,7 +303,7 @@ Para usar o `tnrx` num servidor novo, basta acrescentar uma linha. Se o `RUNTIME
 | `tnrx uninstall` | Remove os comandos e a pasta da instalação |
 | `tnrx install` | Prepara o servidor: o `uv` e a imagem padrão (o instalador já roda isto) |
 | `tnrx install uv` | Instala o `uv` em `~/.local/bin` |
-| `tnrx install singularity [arquivo.def\|docker://imagem] [--force]` | Liga a pasta a uma imagem do banco, gerando-a se preciso ([detalhes](#a-imagem-do-container)) |
+| `tnrx install singularity [origem] [--force]` | Grava o `IMAGE` no `tnrx.conf` e baixa ou gera a imagem ([detalhes](#a-imagem-do-container)) |
 | `tnrx uv {add\|remove\|sync\|init\|lock\|tree\|export} ...` | O `uv` no container, no headnode |
 | `tnrx uvslurm <comando>` | `uv run --frozen <comando>` num nó de GPU |
 | `tnrx slurm [comando]` | O comando num nó de GPU, sem o `.venv`. Sem comando (ou `bash`): shell interativo |
@@ -319,13 +317,14 @@ Para usar o `tnrx` num servidor novo, basta acrescentar uma linha. Se o `RUNTIME
 | --- | --- | --- |
 | `Hostname '...' não está configurado` | O servidor não está em `tnrx_hosts.conf` | Acrescente uma linha ([detalhes](#servidores-tnrx_hostsconf)) |
 | `'apptainer' não foi encontrado nesta máquina` | Você está num nó sem o runtime do container | Rode o `tnrx` no nó de login certo do servidor |
-| `Nenhum arquivo .sif encontrado` | A pasta não tem imagem, e o comando rodou fora de um terminal | Rode qualquer comando do `tnrx` no terminal, ou `tnrx install singularity` (e confira se está na raiz do projeto) |
-| `O link ... aponta para uma imagem que não existe mais` | A imagem foi apagada do banco | Escolha outra no menu que aparece em seguida |
-| `Mais de um .sif encontrado` | Sobrou uma imagem antiga | Apague a que não usa |
+| `IMAGE=... (no tnrx.conf) não existe` | O `IMAGE` aponta para um `.sif` ou `.def` que não está lá | Corrija o caminho, ou apague a linha para usar o padrão |
+| `Ignorando ... aponta para uma imagem que não existe mais` | Sobrou um link de uma versão anterior do `tnrx` | Pode apagar o link; o `tnrx` já segue sem ele |
+| `Mais de um .sif encontrado` | Sobraram imagens antigas na pasta, e o `tnrx.conf` não tem `IMAGE` | Apague as que não usa, ou escolha com `IMAGE` |
+| `tnrx_slurm.conf agora se chama tnrx.conf` | O projeto ainda usa o nome antigo | `mv tnrx_slurm.conf tnrx.conf` |
 | `No interpreter found` ou erro de Python no `tnrx uv` | O `uv` não pôde baixar o Python | Confira se `UV_PYTHON_DOWNLOADS` não está como `never` no seu ambiente |
 | `ModuleNotFoundError` no `tnrx uvslurm` | A biblioteca não está no `.venv` | `tnrx uv add <biblioteca>` |
 | `jupyter: command not found` | O Jupyter não está no `.venv` | `tnrx uv add jupyterlab ipykernel` |
 | Erro de rede ou de download no `tnrx uvslurm` | O `.venv` não está em dia com o `uv.lock`, e o nó não tem internet | `tnrx uv sync` no headnode e rode de novo |
-| O job não sai da fila | Faltam recursos na partição | `squeue -u $USER`; mude `PARTITION` ou `GPUS` no `tnrx_slurm.conf` |
+| O job não sai da fila | Faltam recursos na partição | `squeue -u $USER`; mude `PARTITION` ou `GPUS` no `tnrx.conf` |
 | O build do `tnrx.def` falha falando de fakeroot | O servidor não permite build sem root | Gere o `.sif` em outra máquina ([detalhes](#customizar-a-imagem-tnrxdef)) |
 | `HF_TOKEN inválido ou expirado` | Token errado ou revogado | Crie outro no Hugging Face e atualize o `~/.bashrc` |

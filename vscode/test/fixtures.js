@@ -10,6 +10,7 @@ const slurm = (file, exists = true) => ({
         CPUS: { value: '2', from_file: false },
         MEM: { value: '4G', from_file: false },
         TIME: { value: '04:00:00', from_file: true },
+        IMAGE: { value: 'docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04', from_file: false },
     },
 });
 
@@ -19,7 +20,7 @@ const status = {
     mounts: [
         { id: 'recod-headnode_velho', name: 'velho', local_dir: '/tmp/tnrx-x/velho', host: 'recod-headnode', remote_path: '/home/u/velho', state: 'unmounted', connected: true, rclone_pid: null, since: null, last_used: 50, jupyter_port: null, log: '/tmp/tnrx-x/velho.log', slurm: null },
         { id: 'recod_caiu', name: 'caiu', local_dir: '/tmp/tnrx-x/caiu', host: 'recod', remote_path: '/home/u/caiu', state: 'mounted', connected: false, rclone_pid: 11, since: 1759590000, last_used: 90, jupyter_port: null, log: '/tmp/tnrx-x/caiu.log', slurm: null },
-        { id: 'recod-headnode_proj', name: 'proj', local_dir: '/tmp/tnrx-x/proj', host: 'recod-headnode', remote_path: '/home/u/proj', state: 'mounted', connected: true, rclone_pid: 10, since: 1759590000, last_used: 100, jupyter_port: 18342, log: '/tmp/tnrx-x/proj.log', slurm: slurm('/tmp/tnrx-x/proj/tnrx_slurm.conf') },
+        { id: 'recod-headnode_proj', name: 'proj', local_dir: '/tmp/tnrx-x/proj', host: 'recod-headnode', remote_path: '/home/u/proj', state: 'mounted', connected: true, rclone_pid: 10, since: 1759590000, last_used: 100, jupyter_port: 18342, log: '/tmp/tnrx-x/proj.log', slurm: slurm('/tmp/tnrx-x/proj/tnrx.conf') },
         { id: 'recod-headnode_parado', name: 'parado', local_dir: '/tmp/tnrx-x/parado', host: 'recod-headnode', remote_path: '/home/u/parado', state: 'stale', connected: true, rclone_pid: null, since: null, last_used: 80, jupyter_port: null, log: '/tmp/tnrx-x/parado.log', slurm: null },
     ],
     hosts: [{ host: 'recod-headnode', connected: true }, { host: 'recod', connected: false }],

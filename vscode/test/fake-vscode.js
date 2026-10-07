@@ -6,8 +6,9 @@
 const Module = require('module');
 
 function makeFake() {
-    const calls = { terminals: [], messages: [], executed: [], clipboard: null, opened: [] };
-    const answers = { warning: undefined, error: undefined, info: undefined, openDialog: undefined };
+    const calls = { terminals: [], messages: [], executed: [], clipboard: null, opened: [], inputs: [], picks: [] };
+    // input/pick: um valor fixo, ou uma função (que recebe as opções/itens) para respostas em sequência.
+    const answers = { warning: undefined, error: undefined, info: undefined, openDialog: undefined, input: undefined, pick: undefined };
     const commands = new Map();
     const views = new Map();
     const settings = {};
@@ -58,6 +59,15 @@ function makeFake() {
             showWarningMessage: async (msg) => { calls.messages.push(['warning', msg]); return answers.warning; },
             showErrorMessage: async (msg, opts) => { calls.messages.push(['error', msg, opts && opts.detail]); return answers.error; },
             showOpenDialog: async () => answers.openDialog,
+            showInputBox: async (opts) => {
+                calls.inputs.push(opts);
+                return typeof answers.input === 'function' ? answers.input(opts) : answers.input;
+            },
+            showQuickPick: async (items, opts) => {
+                calls.picks.push({ items, opts });
+                const a = typeof answers.pick === 'function' ? answers.pick(items, opts) : answers.pick;
+                return typeof a === 'string' ? items.find((i) => i.label === a) : a;
+            },
             showTextDocument: async (uri) => { calls.opened.push(uri.fsPath); },
             withProgress: async (_opts, fn) => fn(),
             onDidChangeWindowState: (h) => { listeners.windowState.push(h); return { dispose() {} }; },

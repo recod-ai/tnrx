@@ -1,6 +1,6 @@
 # TNRX para VS Code
 
-Barra lateral com o estado do [`tnrx-connect`](../docs/tnrx-connect.md): o que está montado, a configuração Slurm de cada projeto, as GPUs livres no cluster e os Jupyters no ar. Ela só mostra o que o `tnrx-connect --json` informa ([contrato](../docs/tnrx-connect-json.md)): toda a lógica continua no `tnrx-connect`.
+Barra lateral com o estado do [`tnrx-connect`](../docs/tnrx-connect.md): o que está montado, a configuração de cada projeto (`tnrx.conf`), as GPUs livres no cluster e os Jupyters no ar. Ela só mostra o que o `tnrx-connect --json` informa ([contrato](../docs/tnrx-connect-json.md)): toda a lógica continua no `tnrx-connect`.
 
 **Ela nunca pede senha nem 2FA.** Login, montagem e o terminal do servidor abrem num terminal integrado rodando o próprio `tnrx-connect`, e é lá que você digita a senha.
 
@@ -20,8 +20,8 @@ Recarregue a janela (*Developer: Reload Window*). O ícone **TNRX** aparece na b
 
 | Bloco | O que mostra | Botões |
 | --- | --- | --- |
-| **Montagens** | Cada pasta do `tnrx-connect`: ✔ montada, ⚠ montada sem conexão (rede caiu), ✖ montagem caiu (rclone parado), ○ desmontada | Terminal do servidor (`tnrx-connect ssh`), Reconectar ou Montar (terminal com `tnrx-connect mount`, onde vai a senha/2FA), Desmontar. No menu de contexto: abrir a pasta numa janela nova, ver o log. No título: **+** monta uma pasta nova |
-| **Configuração Slurm** | Os valores efetivos do `tnrx_slurm.conf` de cada pasta montada; `(padrão)` quando a chave não está no arquivo e vale o padrão do `tnrx` | Editar (cria o arquivo com os valores atuais, se ainda não existir). Clicar numa chave também abre o arquivo |
+| **Montagens** | Cada pasta do `tnrx-connect`, com o nome dela: ✔ montada, ⚠ montada sem conexão (rede caiu), ✖ montagem caiu (rclone parado), ○ desmontada | Terminal do servidor (`tnrx-connect ssh`), Reconectar ou Montar (terminal com `tnrx-connect mount`, onde vai a senha/2FA), Desmontar. No menu de contexto: abrir a pasta numa janela nova, ver o log, **Renomear** e, numa pasta desmontada, **Apagar montagem**. No título: **+** monta uma pasta nova |
+| **Configuração do projeto** | Os valores efetivos do `tnrx.conf` de cada pasta montada (partição, GPUs, CPUs, memória, tempo e imagem); `(padrão)` quando a chave não está no arquivo e vale o padrão do `tnrx` | Clicar num valor muda ele: a partição sai de uma lista com as GPUs livres de cada uma, a imagem pode ser a padrão, o `tnrx.def` do projeto ou outra origem, e o resto é digitado (com validação). Num valor do arquivo, **Voltar ao padrão**. Na pasta: abrir o `tnrx.conf` (cria com os valores atuais, se ainda não existir) |
 | **Cluster** | Por servidor com pasta montada: cada partição com GPUs livres/total, nós livres e tempo máximo; e **Meus jobs** (rodando/na fila, com o projeto de cada um) | Reconectar, num servidor sem conexão |
 | **Jupyter** | Por projeto: os Jupyters no ar (nó:porta, job, idade, se a ponte está aberta) | Terminal com `tnrx-connect jupyter` (listar, iniciar, conectar); copiar a URL de uma ponte aberta |
 
@@ -36,6 +36,8 @@ Montagens e Jupyter atualizam a cada 30 s (o Jupyter só com o bloco visível); 
 | `tnrx.clusterRefreshInterval` | `300` | Segundos entre consultas ao Cluster; `0` = só no botão |
 
 Os erros do `tnrx-connect` aparecem no próprio bloco e no painel **Output → TNRX**.
+
+**Apagar montagem** apaga deste computador a configuração, o cache e os snapshots da pasta (o mesmo que `tnrx-connect forget`). Os arquivos no servidor e a pasta local ficam. Se o cache tiver arquivos que ainda não chegaram ao servidor, ela oferece montar a pasta de novo, para enviá-los, antes de apagar.
 
 ## Desenvolvimento
 

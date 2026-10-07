@@ -1,7 +1,10 @@
 #!/bin/bash
 
 # --- Configurações Fixas ---
-CONFIG_FILE="tnrx_slurm.conf"
+# Configuração do projeto: recursos do Slurm e a imagem do container.
+CONFIG_FILE="tnrx.conf"
+# Nome antigo, ainda lido quando o projeto não tem tnrx.conf.
+LEGACY_CONFIG_FILE="tnrx_slurm.conf"
 
 # Diretório onde o script `tnrx` de verdade mora (resolve symlinks), usado
 # para achar tnrx_hosts.conf independentemente da pasta do projeto atual.
@@ -15,12 +18,12 @@ DEFAULT_CPUS="2"
 DEFAULT_MEM="4G"
 DEFAULT_TIME="00:10:00"
 
-# Imagem usada quando o projeto não tem um tnrx.def próprio.
-DEFAULT_DOCKER_SOURCE="docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04"
-# Banco de imagens do usuário: cada .sif é gerado uma vez aqui, e os projetos
-# só guardam um link simbólico para ele.
+# Imagem usada quando o tnrx.conf não define IMAGE e o projeto não tem tnrx.def.
+DEFAULT_IMAGE="docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04"
+# Banco de imagens do usuário: cada imagem é baixada ou gerada uma vez aqui,
+# com o nome derivado da origem.
 SIF_DIR="${TNRX_SIF_DIR:-$HOME/.tnrx/sifs}"
-# Definition file do projeto; se existir, o .sif é gerado a partir dele.
+# Definition file do projeto; sem IMAGE no tnrx.conf, a imagem sai dele.
 PROJECT_DEF="tnrx.def"
 # Modelo de definition file que acompanha o tnrx, para copiar para o projeto.
 TEMPLATE_DEF="$SCRIPT_DIR/tnrx.def"
@@ -51,9 +54,24 @@ run_cmd() {
     "$@"
 }
 
+config_file() {
+    # O arquivo de configuração do projeto: tnrx.conf, ou o tnrx_slurm.conf antigo.
+    if [ ! -f "$CONFIG_FILE" ] && [ -f "$LEGACY_CONFIG_FILE" ]; then
+        echo "$LEGACY_CONFIG_FILE"
+    else
+        echo "$CONFIG_FILE"
+    fi
+}
+
 load_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
+    local file
+    file=$(config_file)
+    # IMAGE é um nome genérico: não deixa um valor do ambiente vazar para o projeto.
+    unset IMAGE
+    if [ -f "$file" ]; then
+        [ "$file" == "$LEGACY_CONFIG_FILE" ] &&
+            echo "ℹ️  $LEGACY_CONFIG_FILE agora se chama $CONFIG_FILE: mv $LEGACY_CONFIG_FILE $CONFIG_FILE" >&2
+        source "$file"
     fi
     PARTITION=${PARTITION:-$DEFAULT_PARTITION}
     GPUS=${GPUS:-$DEFAULT_GPUS}
@@ -166,96 +184,73 @@ ensure_image() {
     mv -f "$tmp" "$target"
 }
 
-link_image() {
-    # Põe na pasta atual um link para a imagem $1 do banco, no lugar dos links
-    # antigos. Um .sif que é arquivo de verdade só sai com confirmação.
-    local name="$1" f resp
-    for f in *.sif; do
-        [ -e "$f" ] || [ -L "$f" ] || continue
-        [ "$f" == "$name" ] && [ -L "$f" ] && continue
-        if [ -L "$f" ]; then
-            rm -f "$f"
-        else
-            echo "ℹ️  Esta pasta tem uma imagem própria: $f ($(du -h "$f" | cut -f1))."
-            read -p "Apagar e usar o link para o banco? (y/N) " resp
-            if [[ "$resp" != "y" ]]; then
-                echo "❌ Mantida. Só pode haver um .sif na pasta, então o link não foi criado." >&2
-                exit 1
+set_config_key() {
+    # Grava KEY=valor no tnrx.conf, trocando a linha da chave ou acrescentando uma.
+    # Um tnrx_slurm.conf antigo vira tnrx.conf primeiro.
+    local key="$1" value="$2" line found=false
+    if [ ! -f "$CONFIG_FILE" ] && [ -f "$LEGACY_CONFIG_FILE" ]; then
+        mv "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"
+        echo "ℹ️  $LEGACY_CONFIG_FILE renomeado para $CONFIG_FILE."
+    fi
+    touch "$CONFIG_FILE"
+    {
+        while IFS= read -r line || [ -n "$line" ]; do
+            if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?$key= ]]; then
+                [ "$found" == "true" ] || printf '%s=%q\n' "$key" "$value"
+                found=true
+            else
+                printf '%s\n' "$line"
             fi
-            rm -f "$f"
+        done < "$CONFIG_FILE"
+        [ "$found" == "true" ] || printf '%s=%q\n' "$key" "$value"
+    } > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
+resolve_image() {
+    # Deixa em SIF a imagem do projeto (chame depois de load_config). Ordem:
+    #   1. IMAGE no tnrx.conf: uma origem (docker://..., um .def) ou o caminho de um .sif;
+    #   2. um .sif na pasta (projetos de antes do banco de imagens);
+    #   3. o tnrx.def do projeto;
+    #   4. a imagem padrão.
+    # Uma origem que ainda não está no banco é baixada ou gerada aqui, no headnode
+    # (os nós de computação não têm internet).
+    local src="" f
+    local -a sifs=()
+    if [ -n "$IMAGE" ]; then
+        if [[ "$IMAGE" == *.sif ]]; then
+            [ -f "$IMAGE" ] || { echo "❌ Erro: IMAGE=$IMAGE (no $(config_file)) não existe." >&2; exit 1; }
+            SIF="$IMAGE"
+            return 0
+        elif [[ "$IMAGE" == *.def ]]; then
+            [ -f "$IMAGE" ] || { echo "❌ Erro: IMAGE=$IMAGE (no $(config_file)): definition file não encontrado." >&2; exit 1; }
+            src="$IMAGE"
+        elif [[ "$IMAGE" == *://* ]]; then
+            src="$IMAGE"
+        else
+            src="docker://$IMAGE"
         fi
-    done
-    ln -sfn "$SIF_DIR/$name" "$name"
-    echo "🔗 $name -> $SIF_DIR/$name"
-}
-
-is_interactive() {
-    # TNRX_INTERACTIVE=1 força o modo interativo (usado pelos testes).
-    [ "$TNRX_INTERACTIVE" == "1" ] || { [ -t 0 ] && [ -t 2 ]; }
-}
-
-choose_image() {
-    # Pasta sem .sif: oferece as imagens do banco (o tnrx.def do projeto e a
-    # padrão primeiro, gerando-as se faltarem) e cria o link para a escolhida.
-    local -a names=() sources=() labels=()
-    local name f i choice
-    if [ -f "$PROJECT_DEF" ]; then
-        name=$(sif_name_for_source "$PROJECT_DEF")
-        names+=("$name"); sources+=("$PROJECT_DEF")
-        labels+=("$name  (do $PROJECT_DEF deste projeto$([ -f "$SIF_DIR/$name" ] || echo '; será gerada'))")
-    fi
-    name=$(sif_name_for_source "$DEFAULT_DOCKER_SOURCE")
-    names+=("$name"); sources+=("$DEFAULT_DOCKER_SOURCE")
-    labels+=("$name  (padrão$([ -f "$SIF_DIR/$name" ] || echo '; será baixada'))")
-    for f in "$SIF_DIR"/*.sif; do
-        [ -f "$f" ] || continue
-        name=$(basename "$f")
-        [[ " ${names[*]} " == *" $name "* ]] && continue
-        names+=("$name"); sources+=(""); labels+=("$name")
-    done
-
-    echo "⚠️  Nenhuma imagem (.sif) nesta pasta. Imagens disponíveis ($SIF_DIR):" >&2
-    for i in "${!labels[@]}"; do
-        echo "  [$((i + 1))] ${labels[$i]}" >&2
-    done
-    read -p "Criar link para qual? [1] (n = cancelar): " choice
-    choice="${choice:-1}"
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#names[@]}" ]; then
-        echo "❌ Cancelado. Para criar depois: tnrx install singularity" >&2
-        exit 1
-    fi
-    i=$((choice - 1))
-    [ -n "${sources[$i]}" ] && ensure_image "${sources[$i]}" >&2
-    link_image "${names[$i]}" >&2
-}
-
-find_sif() {
-    # Deixa em SIF a imagem da pasta atual. Sem nenhuma, pergunta (num terminal)
-    # qual imagem do banco usar.
-    local f
-    local -a sifs=() broken=()
-    for f in *.sif; do
-        if [ -e "$f" ]; then
-            sifs+=("$f")
-        elif [ -L "$f" ]; then
-            broken+=("$f")
-        fi
-    done
-    for f in "${broken[@]}"; do
-        echo "⚠️  O link $f aponta para uma imagem que não existe mais ($(readlink "$f"))." >&2
-    done
-    if [ ${#sifs[@]} -gt 1 ]; then
-        echo "❌ Erro: Mais de um .sif encontrado. Mantenha apenas um no diretório." >&2
-        exit 1
-    elif [ ${#sifs[@]} -eq 0 ]; then
-        if ! is_interactive; then
-            echo "❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install singularity'." >&2
+    else
+        for f in *.sif; do
+            if [ -e "$f" ]; then
+                sifs+=("$f")
+            elif [ -L "$f" ]; then
+                echo "⚠️  Ignorando $f: aponta para uma imagem que não existe mais ($(readlink "$f"))." >&2
+            fi
+        done
+        if [ ${#sifs[@]} -gt 1 ]; then
+            echo "❌ Erro: Mais de um .sif encontrado. Mantenha apenas um no diretório, ou escolha com IMAGE no $CONFIG_FILE." >&2
             exit 1
+        elif [ ${#sifs[@]} -eq 1 ]; then
+            SIF="${sifs[0]}"
+            return 0
+        elif [ -f "$PROJECT_DEF" ]; then
+            src="$PROJECT_DEF"
+        else
+            src="$DEFAULT_IMAGE"
         fi
-        choose_image
-        sifs=(*.sif)
     fi
-    SIF="${sifs[0]}"
+    ensure_image "$src" >&2
+    SIF="$SIF_DIR/$IMAGE_NAME"
 }
 
 load_env_vars() {
@@ -311,9 +306,9 @@ do_install() {
             ;;
 
         singularity)
-            # tnrx install singularity [arquivo.def|docker://imagem] [--force]
-            # Garante a imagem no banco e põe na pasta atual um link para ela.
-            # Origem: a pedida, senão o tnrx.def do projeto, senão a padrão.
+            # tnrx install singularity [arquivo.def|docker://imagem|caminho.sif] [--force]
+            # Grava a origem como IMAGE no tnrx.conf e garante a imagem no banco.
+            # Sem origem: o tnrx.def do projeto, senão a imagem padrão.
             shift
             local source="" force="" arg
             for arg in "$@"; do
@@ -327,16 +322,27 @@ do_install() {
                 if [ -f "$PROJECT_DEF" ]; then
                     source="$PROJECT_DEF"
                 else
-                    source="$DEFAULT_DOCKER_SOURCE"
+                    source="$DEFAULT_IMAGE"
                 fi
             fi
             if [[ "$source" == *.def ]] && [ ! -f "$source" ]; then
                 echo "❌ Erro: Definition file não encontrado: $source" >&2
                 exit 1
             fi
-            load_host_config
-            ensure_image "$source" "$force"
-            link_image "$IMAGE_NAME"
+            if [[ "$source" == *.sif ]]; then
+                [ -f "$source" ] || { echo "❌ Erro: Imagem não encontrada: $source" >&2; exit 1; }
+            else
+                load_host_config
+                ensure_image "$source" "$force"
+            fi
+            set_config_key IMAGE "$source"
+            echo "📝 IMAGE=$source gravado em $CONFIG_FILE."
+            local f
+            for f in *.sif; do
+                [ -e "$f" ] || [ -L "$f" ] || continue
+                [ "$f" == "$source" ] && continue
+                echo "ℹ️  $f não é mais usado (vale o IMAGE do $CONFIG_FILE); pode apagá-lo."
+            done
             if [ -z "$explicit" ] && [[ "$source" != *.def ]]; then
                 echo "💡 Para customizar a imagem deste projeto, copie o modelo e rode de novo:"
                 echo "   cp $TEMPLATE_DEF ."
@@ -353,14 +359,14 @@ do_install() {
                 do_install uv
             fi
             load_host_config
-            ensure_image "$DEFAULT_DOCKER_SOURCE"
-            echo "✅ Servidor pronto. Num projeto, rode qualquer comando do tnrx: ele oferece a imagem."
+            ensure_image "$DEFAULT_IMAGE"
+            echo "✅ Servidor pronto."
             ;;
 
         *)
             echo "Uso: tnrx install                    (instala o tnrx: links, uv e a imagem padrão)"
             echo "     tnrx install uv"
-            echo "     tnrx install singularity [arquivo.def|docker://imagem] [--force]"
+            echo "     tnrx install singularity [arquivo.def|docker://imagem|caminho.sif] [--force]"
             ;;
     esac
 }
@@ -372,8 +378,9 @@ do_uv() {
         add|remove|sync|init|lock|tree|export)
             check_hostname
             load_env_vars
+            load_config
             local image
-            find_sif; image="$SIF"
+            resolve_image; image="$SIF"
             local bind_path=$(get_bind_path) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
             run_cmd "$HOST_RUNTIME" exec --bind "$bind_path" "$image" "$UV_BIN" "$@"
@@ -394,7 +401,7 @@ do_slurm() {
     load_env_vars
     load_config
     local image
-    find_sif; image="$SIF"
+    resolve_image; image="$SIF"
     local bind_path=$(get_bind_path) || exit 1
 
     # Se não houver argumentos ou se o primeiro for 'bash', abre modo interativo
@@ -418,7 +425,7 @@ do_uvslurm() {
     load_env_vars
     load_config
     local image
-    find_sif; image="$SIF"
+    resolve_image; image="$SIF"
     local bind_path=$(get_bind_path) || exit 1
 
     if [ $# -eq 0 ]; then
@@ -530,7 +537,8 @@ do_huggingface() {
     echo "✅ Token validado com sucesso."
 
     local image
-    find_sif; image="$SIF"
+    load_config
+    resolve_image; image="$SIF"
 
     # Nota: Removi o 'uv sync' para tornar o download mais direto,
     # partindo do princípio que o usuário já preparou o ambiente.
@@ -600,7 +608,7 @@ case $1 in
         echo "  tnrx update-dev [pasta]     -> Instala a sua cópia de desenvolvimento (padrão: a pasta atual)"
         echo "                                (update e update-dev aceitam --choose: pergunta de novo o que instalar)"
         echo "  tnrx install                -> Prepara o servidor: uv e a imagem padrão"
-        echo "  tnrx install singularity    -> Liga a pasta a uma imagem do banco (do tnrx.def, se houver)"
+        echo "  tnrx install singularity [origem] -> Escolhe a imagem do projeto (IMAGE no tnrx.conf)"
         echo "  tnrx uv add <pkg>           -> Gerencia dependências no Headnode"
         echo "  tnrx slurm <cmd>            -> Roda comando genérico no Slurm"
         echo "  tnrx uvslurm <script>       -> Roda script Python via UV no Slurm"

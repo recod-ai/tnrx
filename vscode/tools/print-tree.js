@@ -32,7 +32,7 @@ async function section(title, fn) {
     console.log(`tnrx-connect: ${bin || 'não encontrado'}`);
     const status = await runJson(bin, ['status', '--json']).catch(() => null);
     await section('Montagens', async () => model.mountsTree(status));
-    await section('Configuração Slurm', async () => model.slurmTree(status));
+    await section('Configuração do projeto', async () => model.slurmTree(status));
     if (!process.argv.includes('--no-cluster')) {
         await section('Cluster', async () => model.clusterTree(await runJson(bin, ['cluster', '--json']), status));
     }
