@@ -15,8 +15,15 @@ DEFAULT_CPUS="2"
 DEFAULT_MEM="4G"
 DEFAULT_TIME="00:10:00"
 
-DEFAULT_SIF_NAME="pytorch_devel.sif"
-DEFAULT_DOCKER_SOURCE="docker://nvcr.io/nvidia/pytorch:24.01-py3"
+# Imagem usada quando o projeto não tem um tnrx.def próprio.
+DEFAULT_DOCKER_SOURCE="docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04"
+# Banco de imagens do usuário: cada .sif é gerado uma vez aqui, e os projetos
+# só guardam um link simbólico para ele.
+SIF_DIR="${TNRX_SIF_DIR:-$HOME/.tnrx/sifs}"
+# Definition file do projeto; se existir, o .sif é gerado a partir dele.
+PROJECT_DEF="tnrx.def"
+# Modelo de definition file que acompanha o tnrx, para copiar para o projeto.
+TEMPLATE_DEF="$SCRIPT_DIR/tnrx.def"
 
 UV_BIN="$HOME/.local/bin/uv"
 
@@ -98,16 +105,157 @@ check_hostname() {
     load_host_config
 }
 
-find_sif() {
-    local sifs=( *.sif )
-    if [ ! -e "${sifs[0]}" ]; then
-        echo "❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install singularity'." >&2
-        exit 1
-    elif [ ${#sifs[@]} -gt 1 ]; then
-        echo "❌ Erro: Mais de um .sif encontrado. Mantenha apenas um no diretório." >&2
+# --- Banco de imagens (.sif) ---
+
+sif_name_for_source() {
+    # Nome da imagem no banco, derivado da origem, para o nome dizer de onde ela veio:
+    #   docker://nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 -> nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif
+    #   tnrx.def (From: nvidia/cuda:...)                      -> nvidia_cuda_...__def-<8 hex do conteúdo>.sif
+    # O hash faz projetos com o mesmo .def compartilharem a imagem, e um .def
+    # editado gerar uma imagem nova.
+    local src="$1" base hash
+    if [[ "$src" == *.def ]]; then
+        base=$(awk 'tolower($1) == "from:" { print $2; exit }' "$src")
+        hash=$(sha256sum "$src" | cut -c1-8)
+        base="${base:-def}"
+        base="${base#*://}"; base="${base//\//_}"; base="${base//:/_}"; base="${base//@/_}"
+        echo "${base}__def-${hash}.sif"
+    else
+        base="${src#*://}"; base="${base//\//_}"; base="${base//:/_}"; base="${base//@/_}"
+        echo "${base}.sif"
+    fi
+}
+
+ensure_image() {
+    # Garante a imagem da origem $1 no banco (pull ou build), e a regenera com $2=force.
+    # Deixa o nome em IMAGE_NAME. Gera num arquivo temporário e só depois renomeia,
+    # para um download interrompido nunca deixar uma imagem pela metade no banco.
+    local src="$1" force="$2" target tmp
+    IMAGE_NAME=$(sif_name_for_source "$src")
+    target="$SIF_DIR/$IMAGE_NAME"
+    if [ -f "$target" ] && [ "$force" != "force" ]; then
+        echo "ℹ️  Imagem já está no banco: $target"
+        return 0
+    fi
+    mkdir -p "$SIF_DIR"
+    tmp="$SIF_DIR/.tmp-$$-$IMAGE_NAME"
+    if [[ "$src" == *.def ]]; then
+        # Sem root, o build depende do --fakeroot (o admin precisa ter
+        # configurado /etc/subuid e /etc/subgid para o usuário).
+        local fakeroot=()
+        [ "$(id -u)" -ne 0 ] && fakeroot=(--fakeroot)
+        echo "🔨 Gerando imagem a partir de: $src"
+        echo "💾 Destino: $target"
+        if ! run_cmd "$HOST_RUNTIME" build "${fakeroot[@]}" "$tmp" "$src"; then
+            rm -f "$tmp"
+            echo "❌ Erro: O build falhou." >&2
+            echo "   Se a mensagem fala de fakeroot/subuid, este servidor não permite build sem root:" >&2
+            echo "   gere a imagem em outra máquina ($HOST_RUNTIME build $IMAGE_NAME $src)" >&2
+            echo "   e copie para $target." >&2
+            exit 1
+        fi
+    else
+        echo "📥 Baixando imagem: $src"
+        echo "💾 Destino: $target"
+        if ! run_cmd "$HOST_RUNTIME" pull "$tmp" "$src"; then
+            rm -f "$tmp"
+            echo "❌ Erro: O download da imagem falhou." >&2
+            exit 1
+        fi
+    fi
+    mv -f "$tmp" "$target"
+}
+
+link_image() {
+    # Põe na pasta atual um link para a imagem $1 do banco, no lugar dos links
+    # antigos. Um .sif que é arquivo de verdade só sai com confirmação.
+    local name="$1" f resp
+    for f in *.sif; do
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        [ "$f" == "$name" ] && [ -L "$f" ] && continue
+        if [ -L "$f" ]; then
+            rm -f "$f"
+        else
+            echo "ℹ️  Esta pasta tem uma imagem própria: $f ($(du -h "$f" | cut -f1))."
+            read -p "Apagar e usar o link para o banco? (y/N) " resp
+            if [[ "$resp" != "y" ]]; then
+                echo "❌ Mantida. Só pode haver um .sif na pasta, então o link não foi criado." >&2
+                exit 1
+            fi
+            rm -f "$f"
+        fi
+    done
+    ln -sfn "$SIF_DIR/$name" "$name"
+    echo "🔗 $name -> $SIF_DIR/$name"
+}
+
+is_interactive() {
+    # TNRX_INTERACTIVE=1 força o modo interativo (usado pelos testes).
+    [ "$TNRX_INTERACTIVE" == "1" ] || { [ -t 0 ] && [ -t 2 ]; }
+}
+
+choose_image() {
+    # Pasta sem .sif: oferece as imagens do banco (o tnrx.def do projeto e a
+    # padrão primeiro, gerando-as se faltarem) e cria o link para a escolhida.
+    local -a names=() sources=() labels=()
+    local name f i choice
+    if [ -f "$PROJECT_DEF" ]; then
+        name=$(sif_name_for_source "$PROJECT_DEF")
+        names+=("$name"); sources+=("$PROJECT_DEF")
+        labels+=("$name  (do $PROJECT_DEF deste projeto$([ -f "$SIF_DIR/$name" ] || echo '; será gerada'))")
+    fi
+    name=$(sif_name_for_source "$DEFAULT_DOCKER_SOURCE")
+    names+=("$name"); sources+=("$DEFAULT_DOCKER_SOURCE")
+    labels+=("$name  (padrão$([ -f "$SIF_DIR/$name" ] || echo '; será baixada'))")
+    for f in "$SIF_DIR"/*.sif; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        [[ " ${names[*]} " == *" $name "* ]] && continue
+        names+=("$name"); sources+=(""); labels+=("$name")
+    done
+
+    echo "⚠️  Nenhuma imagem (.sif) nesta pasta. Imagens disponíveis ($SIF_DIR):" >&2
+    for i in "${!labels[@]}"; do
+        echo "  [$((i + 1))] ${labels[$i]}" >&2
+    done
+    read -p "Criar link para qual? [1] (n = cancelar): " choice
+    choice="${choice:-1}"
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#names[@]}" ]; then
+        echo "❌ Cancelado. Para criar depois: tnrx install singularity" >&2
         exit 1
     fi
-    echo "${sifs[0]}"
+    i=$((choice - 1))
+    [ -n "${sources[$i]}" ] && ensure_image "${sources[$i]}" >&2
+    link_image "${names[$i]}" >&2
+}
+
+find_sif() {
+    # Deixa em SIF a imagem da pasta atual. Sem nenhuma, pergunta (num terminal)
+    # qual imagem do banco usar.
+    local f
+    local -a sifs=() broken=()
+    for f in *.sif; do
+        if [ -e "$f" ]; then
+            sifs+=("$f")
+        elif [ -L "$f" ]; then
+            broken+=("$f")
+        fi
+    done
+    for f in "${broken[@]}"; do
+        echo "⚠️  O link $f aponta para uma imagem que não existe mais ($(readlink "$f"))." >&2
+    done
+    if [ ${#sifs[@]} -gt 1 ]; then
+        echo "❌ Erro: Mais de um .sif encontrado. Mantenha apenas um no diretório." >&2
+        exit 1
+    elif [ ${#sifs[@]} -eq 0 ]; then
+        if ! is_interactive; then
+            echo "❌ Erro: Nenhum arquivo .sif encontrado. Use 'tnrx install singularity'." >&2
+            exit 1
+        fi
+        choose_image
+        sifs=(*.sif)
+    fi
+    SIF="${sifs[0]}"
 }
 
 load_env_vars() {
@@ -163,25 +311,56 @@ do_install() {
             ;;
 
         singularity)
-            # Alteração 1: Uso de parâmetros com fallback para defaults
-            load_host_config
-            local sif_name="${2:-$DEFAULT_SIF_NAME}"
-            local docker_url="${3:-$DEFAULT_DOCKER_SOURCE}"
-
-            if [ -f "$sif_name" ]; then
-                echo "ℹ️  A imagem $sif_name já existe localmente."
-                read -p "Deseja baixar novamente? (y/N) " resp
-                [[ "$resp" != "y" ]] && return
+            # tnrx install singularity [arquivo.def|docker://imagem] [--force]
+            # Garante a imagem no banco e põe na pasta atual um link para ela.
+            # Origem: a pedida, senão o tnrx.def do projeto, senão a padrão.
+            shift
+            local source="" force="" arg
+            for arg in "$@"; do
+                case "$arg" in
+                    --force) force=force ;;
+                    *) source="$arg" ;;
+                esac
+            done
+            local explicit="$source"
+            if [ -z "$source" ]; then
+                if [ -f "$PROJECT_DEF" ]; then
+                    source="$PROJECT_DEF"
+                else
+                    source="$DEFAULT_DOCKER_SOURCE"
+                fi
             fi
+            if [[ "$source" == *.def ]] && [ ! -f "$source" ]; then
+                echo "❌ Erro: Definition file não encontrado: $source" >&2
+                exit 1
+            fi
+            load_host_config
+            ensure_image "$source" "$force"
+            link_image "$IMAGE_NAME"
+            if [ -z "$explicit" ] && [[ "$source" != *.def ]]; then
+                echo "💡 Para customizar a imagem deste projeto, copie o modelo e rode de novo:"
+                echo "   cp $TEMPLATE_DEF ."
+            fi
+            echo "✅ Pronto."
+            ;;
 
-            echo "📥 Baixando imagem: $docker_url"
-            echo "💾 Destino: $sif_name"
-            run_cmd "$HOST_RUNTIME" pull "$sif_name" "$docker_url"
-            echo "✅ Instalação concluída."
+        "")
+            # Preparação do servidor: o uv e a imagem padrão no banco. O
+            # install.sh roda isto ao instalar ou atualizar num servidor.
+            if [ -x "$UV_BIN" ]; then
+                echo "ℹ️  uv já instalado: $UV_BIN"
+            else
+                do_install uv
+            fi
+            load_host_config
+            ensure_image "$DEFAULT_DOCKER_SOURCE"
+            echo "✅ Servidor pronto. Num projeto, rode qualquer comando do tnrx: ele oferece a imagem."
             ;;
 
         *)
-            echo "Uso: ./tnrx install {uv|singularity}"
+            echo "Uso: tnrx install                    (instala o tnrx: links, uv e a imagem padrão)"
+            echo "     tnrx install uv"
+            echo "     tnrx install singularity [arquivo.def|docker://imagem] [--force]"
             ;;
     esac
 }
@@ -194,7 +373,7 @@ do_uv() {
             check_hostname
             load_env_vars
             local image
-            image=$(find_sif) || exit 1
+            find_sif; image="$SIF"
             local bind_path=$(get_bind_path) || exit 1
             echo "🌐 [HEADNODE] Gestão de pacotes: uv $cmd"
             run_cmd "$HOST_RUNTIME" exec --bind "$bind_path" "$image" "$UV_BIN" "$@"
@@ -215,7 +394,7 @@ do_slurm() {
     load_env_vars
     load_config
     local image
-    image=$(find_sif) || exit 1
+    find_sif; image="$SIF"
     local bind_path=$(get_bind_path) || exit 1
 
     # Se não houver argumentos ou se o primeiro for 'bash', abre modo interativo
@@ -239,7 +418,7 @@ do_uvslurm() {
     load_env_vars
     load_config
     local image
-    image=$(find_sif) || exit 1
+    find_sif; image="$SIF"
     local bind_path=$(get_bind_path) || exit 1
 
     if [ $# -eq 0 ]; then
@@ -263,11 +442,12 @@ do_uvslurm() {
         # 2. Adiciona as flags de IP e Origem para evitar o erro 403 Forbidden
         EXTRA_FLAGS="--ip=0.0.0.0 --no-browser"
 
-        # 3. A imagem NGC traz um jupyter_notebook_config.py com
+        # 3. Algumas imagens (ex.: as NGC da NVIDIA) trazem um jupyter_notebook_config.py com
         # custom_display_url='http://hostname:8888' (literal). O nome do nó e a
         # porta livre só existem dentro do job, então o wrapper os resolve lá e
         # passa a URL certa ao Jupyter (a última flag da linha vence a config).
         # port_retries=0: a porta escolhida é a impressa, sem deslocar sozinha.
+        # A senha (token) é a fixa do projeto, se o tnrx-connect a gravou em .tnrx/jupyter/token.
         # Um processo em segundo plano espera a porta responder e só então registra o
         # servidor em .tnrx/jupyter/<job>.env (600), que o `tnrx-connect jupyter` lê.
         # Sem stdout/stderr pra não segurar o srun; o .gitignore próprio evita que o token
@@ -275,7 +455,10 @@ do_uvslurm() {
         local jupyter_wrapper='port=${TNRX_JUPYTER_PORT:-8888}
             while (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; do port=$((port + 1)); done
             node=$(hostname 2>/dev/null || echo "$HOSTNAME")
-            token=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n")
+            # Senha fixa do projeto, gravada pelo tnrx-connect (laptop) em .tnrx/jupyter/token;
+            # sem ela (ou inválida), uma aleatória por execução.
+            token=$(tr -dc "0-9a-fA-F" < "$PWD/.tnrx/jupyter/token" 2>/dev/null | head -c 64)
+            [ "${#token}" -ge 32 ] || token=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d " \n")
             echo "🌐 [tnrx] Nó: $node | porta: $port  (do laptop: tnrx-connect jupyter)"
             (
                 umask 077
@@ -347,7 +530,7 @@ do_huggingface() {
     echo "✅ Token validado com sucesso."
 
     local image
-    image=$(find_sif) || exit 1
+    find_sif; image="$SIF"
 
     # Nota: Removi o 'uv sync' para tornar o download mais direto,
     # partindo do princípio que o usuário já preparou o ambiente.
@@ -366,27 +549,30 @@ do_huggingface() {
     unset_env_vars
 }
 
-do_uninstall() {
-    echo "🗑️  Removendo links simbólicos do ambiente local..."
-
-    # Lista de links criados em ~/.local/bin/
-    local links=("tnrx" "download_huggingface")
-    local bin_dir="$HOME/.local/bin"
-    local found=false
-
-    for link in "${links[@]}"; do
-        if [ -L "$bin_dir/$link" ]; then
-            rm "$bin_dir/$link"
-            echo "✅ Removido: $bin_dir/$link"
-            found=true
-        fi
-    done
-
-    if ! $found; then
-        echo "phi  Nenhum link simbólico do tnrx foi encontrado em $bin_dir."
+do_version() {
+    local commit date source
+    commit=$(sed -n 's/^COMMIT=//p' "$SCRIPT_DIR/VERSION" 2>/dev/null)
+    date=$(sed -n 's/^DATE=//p' "$SCRIPT_DIR/VERSION" 2>/dev/null)
+    source=$(sed -n 's/^SOURCE=//p' "$SCRIPT_DIR/VERSION" 2>/dev/null)
+    if [ -n "$commit" ]; then
+        echo "tnrx $commit ($date), de $source"
     else
-        echo "✨ Desinstalação concluída. Os arquivos originais permanecem intactos."
+        echo "tnrx rodando direto de $SCRIPT_DIR (não instalado pelo install.sh)"
     fi
+}
+
+do_update_dev() {
+    # Instala a cópia de desenvolvimento ($1, ou a pasta atual) no lugar da
+    # instalação, com as mudanças ainda não commitadas.
+    local src="$PWD" arg extra=()
+    for arg in "$@"; do
+        case "$arg" in
+            --choose) extra+=(--choose) ;;
+            *) src="$arg" ;;
+        esac
+    done
+    [ -f "$src/install.sh" ] || { echo "❌ $src não é o repositório do tnrx. Uso: tnrx update-dev [pasta do repositório]" >&2; exit 1; }
+    exec bash "$src/install.sh" --from "$src" "${extra[@]}"
 }
 
 # --- Lógica de Entrada ---
@@ -403,11 +589,18 @@ case $1 in
     slurm)   shift; do_slurm "$@" ;;
     uvslurm) shift; do_uvslurm "$@" ;;
     huggingface|hf) shift; do_huggingface "$@" ;;
-    uninstall) shift; do_uninstall ;;
+    update)  shift; exec bash "$SCRIPT_DIR/install.sh" --update "$@" ;;
+    update-dev) shift; do_update_dev "$@" ;;
+    uninstall) exec bash "$SCRIPT_DIR/install.sh" --uninstall ;;
+    version|--version|-V) do_version ;;
     *)
-        echo "Uso: tnrx [--debug|-x] {install|uninstall|uv|slurm|uvslurm|hf}"
+        echo "Uso: tnrx [--debug|-x] {install|uv|slurm|uvslurm|hf|update|update-dev|uninstall|version}"
         echo "  --debug, -x                 -> Imprime o comando real (srun/singularity) antes de executá-lo"
-        echo "  tnrx install singularity      -> Cria o .sif"
+        echo "  tnrx update                 -> Atualiza o tnrx e o tnrx-connect a partir do GitHub"
+        echo "  tnrx update-dev [pasta]     -> Instala a sua cópia de desenvolvimento (padrão: a pasta atual)"
+        echo "                                (update e update-dev aceitam --choose: pergunta de novo o que instalar)"
+        echo "  tnrx install                -> Prepara o servidor: uv e a imagem padrão"
+        echo "  tnrx install singularity    -> Liga a pasta a uma imagem do banco (do tnrx.def, se houver)"
         echo "  tnrx uv add <pkg>           -> Gerencia dependências no Headnode"
         echo "  tnrx slurm <cmd>            -> Roda comando genérico no Slurm"
         echo "  tnrx uvslurm <script>       -> Roda script Python via UV no Slurm"

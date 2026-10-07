@@ -260,14 +260,23 @@ test_usage_output() {
 }
 
 test_uninstall_no_symlink() {
-    log_test "uninstall sem symlink não falha"
+    log_test "uninstall: remove os comandos e a pasta da instalação (num HOME temporário)"
     setup_test_env
 
-    local output
-    output=$("$TNRX_CONNECT" uninstall 2>&1)
-    local exit_code=$?
+    # HOME temporário: o uninstall apaga ~/.local/bin/tnrx* e ~/.local/share/tnrx.
+    local output exit_code
+    output=$(HOME="$TEST_TEMP_DIR/home" "$TNRX_CONNECT" uninstall 2>&1)
+    exit_code=$?
+    [[ $exit_code -eq 0 ]] && pass_test "uninstall exits 0 with nothing installed" || fail_test "uninstall should exit 0 even with nothing to remove" "$output"
 
-    [[ $exit_code -eq 0 ]] && pass_test "uninstall exits 0 with no symlink present" || fail_test "uninstall should exit 0 even with nothing to remove"
+    mkdir -p home/.local/bin home/.local/share/tnrx
+    ln -s "$TEST_TEMP_DIR/home/.local/share/tnrx/tnrx-connect" home/.local/bin/tnrx-connect
+    output=$(HOME="$TEST_TEMP_DIR/home" "$TNRX_CONNECT" uninstall 2>&1)
+    if [[ ! -L home/.local/bin/tnrx-connect && ! -d home/.local/share/tnrx ]]; then
+        pass_test "uninstall remove o link e a pasta da instalação"
+    else
+        fail_test "uninstall deixou restos" "$output"
+    fi
 
     cleanup_test_env
 }
@@ -312,27 +321,90 @@ EOF
 # rclone falso: registra argumentos/ambiente e "monta" adicionando uma linha na
 # tabela de montagens (TNRX_MOUNTS_FILE); sai quando recebe TERM.
 [ "$1" == mount ] || exit 0
+[ -n "$FAKE_RCLONE_FAIL" ] && exit 1
 dir="$3"; esc="${dir// /\\040}"
 printf '%s\n' "$*" > "$FAKE_STATE/rclone.args"
 printf '%s\n' "$RCLONE_SFTP_SSH" > "$FAKE_STATE/rclone.env"
 echo $$ > "$FAKE_STATE/rclone.pid"
+mkdir -p "$FAKE_STATE/pids"; echo $$ > "$FAKE_STATE/pids/$(printf '%s' "$dir" | cksum | cut -d' ' -f1)"
 printf 'rclone %s fuse.rclone rw 0 0\n' "$esc" >> "$TNRX_MOUNTS_FILE"
 bye() { grep -vF "rclone $esc " "$TNRX_MOUNTS_FILE" > "$TNRX_MOUNTS_FILE.n"; mv "$TNRX_MOUNTS_FILE.n" "$TNRX_MOUNTS_FILE"; exit 0; }
 trap bye TERM INT
+trap 'touch "$FAKE_STATE/got_hup"' HUP
 while true; do sleep 0.2; done
 EOF
 
     cat > "$FAKES_DIR/fusermount3" <<'EOF'
 #!/bin/bash
-# fusermount3 falso: falha se existir $FAKE_STATE/busy; senão remove a linha da
-# tabela de montagens e encerra o rclone falso.
-[ -e "$FAKE_STATE/busy" ] && { echo "busy" >&2; exit 1; }
+# fusermount3 falso: com $FAKE_STATE/busy, "-u" simples falha (como um leitor ainda
+# aberto travando um umount educado de verdade); "-uz" (lazy) sempre desanexa na hora,
+# como o umount -l real faz, e mantém o processo fake do rclone vivo se ainda houver
+# leitor (o teste só confere a desmontagem em si, não a demora do rclone morrer).
+lazy=false; for a in "$@"; do [ "$a" == "-uz" ] && lazy=true; done
+if [ -e "$FAKE_STATE/busy" ] && [ "$lazy" != "true" ]; then echo "busy" >&2; exit 1; fi
 dir="${@: -1}"; esc="${dir// /\\040}"
 grep -vF "rclone $esc " "$TNRX_MOUNTS_FILE" > "$TNRX_MOUNTS_FILE.n"; mv "$TNRX_MOUNTS_FILE.n" "$TNRX_MOUNTS_FILE"
-[ -f "$FAKE_STATE/rclone.pid" ] && kill "$(cat "$FAKE_STATE/rclone.pid")" 2>/dev/null
+if [ -e "$FAKE_STATE/busy" ] && [ "$lazy" == "true" ]; then exit 0; fi
+pf="$FAKE_STATE/pids/$(printf '%s' "$dir" | cksum | cut -d' ' -f1)"
+[ -f "$pf" ] && kill "$(cat "$pf")" 2>/dev/null
 exit 0
 EOF
-    chmod +x "$FAKES_DIR"/ssh "$FAKES_DIR"/rclone "$FAKES_DIR"/fusermount3
+    cat > "$FAKES_DIR/tnrx" <<'EOF'
+#!/bin/bash
+# tnrx falso (servidor): "uvslurm jupyter lab" escreve no log como o srun, espera
+# FAKE_TNRX_DELAY, escuta numa porta (o Jupyter) e registra .tnrx/jupyter/777.env com a
+# senha de .tnrx/jupyter/token. TERM (cancelamento) derruba tudo e deixa um marcador.
+[ "$1 $2" == "uvslurm jupyter" ] || exit 0
+[ -n "$FAKE_TNRX_FAIL" ] && { echo "Erro: Nenhum arquivo .sif encontrado"; exit 1; }
+echo "srun: job 777 queued and waiting for resources"
+lp=""
+trap 'touch "$FAKE_STATE/tnrx_cancelled"; [ -n "$lp" ] && kill "$lp"; exit 143' TERM
+sleep "${FAKE_TNRX_DELAY:-1}" & wait $!
+port="${FAKE_TNRX_PORT:-48990}"
+python3 -c "
+import socket, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('0.0.0.0', $port)); s.listen(); time.sleep(20)" &
+lp=$!
+sleep 0.3
+token=$(cat .tnrx/jupyter/token 2>/dev/null || echo ffff)
+printf 'NODE=127.0.0.1\nPORT=%s\nTOKEN=%s\nJOBID=777\nSTARTED=%s\n' "$port" "$token" "$(date +%s)" > .tnrx/jupyter/777.env
+wait "$lp"
+EOF
+    # Slurm falso (servidor): l40s com 4 nós (um em drain), a100 com 2 nós fora do ar.
+    cat > "$FAKES_DIR/sinfo" <<'EOF'
+#!/bin/bash
+echo 'P|l40s*|up|7-00:00:00|2/1/0/3|gpu:l40s:2'
+echo 'P|a100|up|2-00:00:00|0/0/1/1|gpu:a100:4'
+echo 'P|l40s*|up|7-00:00:00|0/0/1/1|gpu:l40s:2'
+echo 'P|a100|up|2-00:00:00|0/0/1/1|gpu:a100:4'
+EOF
+    cat > "$FAKES_DIR/scontrol" <<'EOF'
+#!/bin/bash
+echo 'NodeName=dl-01 Arch=x86_64 State=MIXED Partitions=l40s CfgTRES=cpu=32,mem=256G,billing=32,gres/gpu=2 AllocTRES=cpu=4,mem=16G,gres/gpu=1 OS=Linux 5.15 #1 SMP'
+echo 'NodeName=dl-02 State=IDLE Partitions=l40s CfgTRES=cpu=32,gres/gpu=2 AllocTRES='
+echo 'NodeName=dl-03 State=IDLE+DRAIN Partitions=l40s CfgTRES=cpu=32,gres/gpu=2 AllocTRES= Reason=Not responding [root@2026-10-01]'
+echo 'NodeName=dl-04 State=ALLOCATED Partitions=l40s CfgTRES=cpu=32,gres/gpu=2,gres/gpu:l40s=2 AllocTRES=cpu=32,gres/gpu=2'
+echo 'NodeName=a-01 State=DOWN* Partitions=a100 CfgTRES=cpu=64,gres/gpu=4 AllocTRES='
+echo 'NodeName=a-02 State=DOWN* Partitions=a100 CfgTRES=cpu=64,gres/gpu=4 AllocTRES='
+EOF
+    cat > "$FAKES_DIR/squeue" <<'EOF'
+#!/bin/bash
+# "-o %i" (ids dos jobs vivos, usado na descoberta do Jupyter): só com $FAKE_STATE/squeue_ids;
+# sem ele, falha (como um servidor sem squeue) e a descoberta usa só o teste da porta.
+if [[ "$*" == *"-o %i"* ]]; then [ -f "$FAKE_STATE/squeue_ids" ] && cat "$FAKE_STATE/squeue_ids" && exit 0; exit 1; fi
+echo 'J|95272|l40s|jupyter|RUNNING|3:01|2:00:00|dl-05|/data/proj'
+echo 'J|95300|a100|train "x"|PENDING|0:00|1-00:00:00|(Resources)|/data/outro proj'
+EOF
+    cat > "$FAKES_DIR/scancel" <<'EOF'
+#!/bin/bash
+echo "$*" >> "$FAKE_STATE/scancel"
+[ "$1" == 999 ] && { echo "scancel: error: Invalid job id specified" >&2; exit 1; }
+pkill -TERM -f "$(dirname "$0")/tnrx uvslurm" 2>/dev/null
+exit 0
+EOF
+    chmod +x "$FAKES_DIR"/ssh "$FAKES_DIR"/rclone "$FAKES_DIR"/fusermount3 "$FAKES_DIR"/tnrx \
+        "$FAKES_DIR"/sinfo "$FAKES_DIR"/scontrol "$FAKES_DIR"/squeue "$FAKES_DIR"/scancel
 }
 
 setup_mount_env() {
@@ -348,6 +420,9 @@ setup_mount_env() {
 }
 
 cleanup_mount_env() {
+    # Montagens que um teste deixou de pé: o rclone falso sai e o loop de snapshots junto.
+    local pf
+    for pf in "$FAKE_STATE"/pids/*; do [ -f "$pf" ] && kill "$(cat "$pf")" 2>/dev/null; done
     export PATH="$ORIG_PATH" HOME="$ORIG_HOME"
     unset FAKE_STATE TNRX_MOUNTS_FILE TNRX_MOUNT_WAIT_SECS TNRX_UNMOUNT_RETRIES \
         TNRX_UNMOUNT_SLEEP TNRX_RCLONE_EXIT_WAIT_SECS FAKE_SSH_SESSION_SECS
@@ -357,9 +432,12 @@ cleanup_mount_env() {
 mount_count() { grep -c "rclone" "$MT/mounts"; }
 lock_count() { find "$HOME/.local/share/tnrx-connect/locks" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
 conf_count() { find "$HOME/.config/tnrx-connect" -name '*.conf' 2>/dev/null | wc -l | tr -d ' '; }
+ctrl_sock() { printf '%s/.cache/tnrx-connect/ssh-%s.sock' "$HOME" "$(printf '%s' "${1:-user@srv}" | cksum | awk '{print $1}')"; }
+rclone_pid() { cat "$FAKE_STATE/rclone.pid" 2>/dev/null; }
+snap_loops() { pgrep -f "__snapshot-loop $MT/" 2>/dev/null; }
 
 test_mount_first_run() {
-    log_test "mount: primeira execução cria o .conf, monta com as flags certas e limpa tudo ao sair"
+    log_test "mount: tnrx-connect monta, abre o SSH e a pasta CONTINUA montada ao sair; umount limpa"
     setup_mount_env
 
     local out
@@ -381,44 +459,76 @@ test_mount_first_run() {
     assert_contains "$args" "--exclude .venv/**" "esconde .venv"
     assert_contains "$env" "ControlPath=" "rclone usa a conexão mestra (ControlPath)"
     assert_contains "$env" "user@srv" "rclone usa o host informado"
-
-    [[ "$(mount_count)" == "0" ]] && pass_test "desmontou ao sair" || fail_test "ainda montado após sair"
-    [[ "$(lock_count)" == "0" ]] && pass_test "lock liberado ao sair" || fail_test "lock ficou para trás"
-    ls -d "$HOME/.local/share/tnrx-connect/user@srv_proj/vfs-"* >/dev/null 2>&1 \
-        && pass_test "cache persistente preservado após sair" || fail_test "cache foi apagado"
     assert_contains "$out" "cd '$MT/work/proj' && claude" "mostra como usar em outra aba"
+    assert_contains "$out" "Conectando em user@srv" "abre o terminal SSH"
+    assert_contains "$out" "continua montada" "avisa que sair do terminal não desmonta"
 
+    [[ "$(mount_count)" == "1" ]] && pass_test "continua montado depois que o terminal fechou" || fail_test "desmontou ao sair do terminal"
+    kill -0 "$(rclone_pid)" 2>/dev/null && pass_test "rclone segue vivo sem o tnrx-connect" || fail_test "rclone morreu junto com o terminal"
+    [[ -f "$(ctrl_sock)" ]] && pass_test "conexão mestra segue aberta (o rclone depende dela)" || fail_test "fechou a conexão mestra"
+    [[ -n "$(snap_loops)" ]] && pass_test "loop de snapshots segue rodando" || fail_test "loop de snapshots morreu"
+
+    out=$("$TNRX_CONNECT" umount 2>&1)
+    assert_contains "$out" "desmontada" "umount desmonta"
+    [[ "$(mount_count)" == "0" && "$(lock_count)" == "0" ]] && pass_test "umount libera mount e lock" || fail_test "sobrou estado" "$(cat "$MT/mounts")"
+    [[ ! -f "$(ctrl_sock)" ]] && pass_test "umount fecha a conexão mestra sem uso" || fail_test "conexão mestra ficou aberta"
+    sleep 1.5
+    [[ -z "$(snap_loops)" ]] && pass_test "loop de snapshots terminou" || fail_test "loop de snapshots órfão" "$(pgrep -af "__snapshot-loop")"
+    ls -d "$HOME/.local/share/tnrx-connect/user@srv_proj/vfs-"* >/dev/null 2>&1 \
+        && pass_test "cache persistente preservado após umount" || fail_test "cache foi apagado"
+
+    cleanup_mount_env
+}
+
+test_mount_command_returns_prompt() {
+    log_test "mount: 'tnrx-connect mount' monta e devolve o prompt (sem abrir SSH)"
+    setup_mount_env
+
+    local out
+    out=$(printf 'user@srv\n/data/proj\n' | FAKE_SSH_SESSION_SECS=30 timeout 10 "$TNRX_CONNECT" mount 2>&1)
+    [[ $? -eq 0 ]] && pass_test "mount termina sozinho" || fail_test "mount não devolveu o prompt"
+    assert_not_contains "$out" "Conectando em" "não abre terminal SSH"
+    assert_contains "$out" "tnrx-connect ssh" "explica como abrir o terminal"
+    assert_contains "$out" "tnrx-connect umount" "explica como desmontar"
+    [[ "$(mount_count)" == "1" ]] && pass_test "montado" || fail_test "não montou"
+
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+    cleanup_mount_env
+}
+
+test_mount_is_idempotent() {
+    log_test "mount: montar de novo a mesma pasta só confirma que já está montada"
+    setup_mount_env
+
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    local first out
+    first=$(rclone_pid)
+    out=$("$TNRX_CONNECT" mount 2>&1 </dev/null)
+    assert_contains "$out" "já está montada" "avisa que já está montada"
+    assert_not_contains "$out" "Pasta remota" "não pergunta nada"
+    [[ "$(rclone_pid)" == "$first" && "$(mount_count)" == "1" ]] && pass_test "não sobe outro rclone" || fail_test "montou de novo"
+
+    out=$("$TNRX_CONNECT" 2>&1 </dev/null)
+    assert_not_contains "$out" "Pasta remota" "tnrx-connect sem argumentos numa pasta montada não pergunta nada"
+    assert_contains "$out" "Conectando em user@srv" "e só abre o terminal"
+
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     cleanup_mount_env
 }
 
 test_mount_second_run_uses_saved_defaults() {
-    log_test "mount: segunda execução só com Enter reaproveita host e pasta"
+    log_test "mount: depois de desmontar, montar só com Enter reaproveita host e pasta"
     setup_mount_env
 
-    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" >/dev/null 2>&1
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     local out
-    out=$(printf '\n\n' | "$TNRX_CONNECT" 2>&1)
+    out=$(printf '\n\n' | "$TNRX_CONNECT" mount 2>&1)
 
     assert_contains "$out" "Montando user@srv:/data/proj" "Enter aceita host e pasta anteriores"
     [[ "$(conf_count)" == "1" ]] && pass_test "continua um único .conf" || fail_test "criou .conf duplicado"
 
-    cleanup_mount_env
-}
-
-test_mount_refuses_same_folder_twice() {
-    log_test "mount: recusa segunda sessão na mesma pasta"
-    setup_mount_env
-
-    ( printf 'user@srv\n/data/proj\n' | FAKE_SSH_SESSION_SECS=3 "$TNRX_CONNECT" >/dev/null 2>&1 ) &
-    sleep 1.5
-    local out
-    out=$(printf '\n' | "$TNRX_CONNECT" 2>&1)
-    wait
-
-    assert_contains "$out" "Já existe uma sessão do tnrx-connect ativa nesta pasta" "segunda sessão recusada"
-    assert_not_contains "$out" "Pasta remota" "recusa antes de perguntar qualquer coisa"
-    [[ "$(mount_count)" == "0" ]] && pass_test "tudo limpo depois da primeira sessão" || fail_test "sobrou mount"
-
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     cleanup_mount_env
 }
 
@@ -428,7 +538,7 @@ test_mount_refuses_non_empty_folder() {
 
     touch arquivo.txt
     local out
-    out=$(printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" 2>&1)
+    out=$(printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount 2>&1)
     assert_contains "$out" "não está vazia" "pasta com arquivo é recusada"
     assert_contains "$out" "arquivo.txt" "lista o que encontrou na pasta local"
     assert_contains "$out" "pasta LOCAL" "explica que só a pasta local precisa estar vazia"
@@ -445,7 +555,7 @@ test_mount_rejects_relative_remote_path() {
     setup_mount_env
 
     local out
-    out=$(printf 'user@srv\nrelativo/x\n' | "$TNRX_CONNECT" 2>&1)
+    out=$(printf 'user@srv\nrelativo/x\n' | "$TNRX_CONNECT" mount 2>&1)
     assert_contains "$out" "caminho absoluto" "erro de caminho absoluto"
     [[ "$(conf_count)" == "0" ]] && pass_test "não grava .conf inválido" || fail_test "gravou .conf inválido"
 
@@ -458,60 +568,187 @@ test_mount_refuses_home_dir() {
 
     cd "$HOME" || exit 1
     local out
-    out=$(printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" 2>&1)
+    out=$(printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount 2>&1)
     assert_contains "$out" "pasta de projeto dedicada" "home é recusada"
 
     cleanup_mount_env
 }
 
-test_mount_recovers_after_killed_session() {
-    log_test "mount: sessão morta (kill -9) é recuperada na execução seguinte"
+test_mount_failure_cleans_up() {
+    log_test "mount: se o rclone falha, não sobra lock nem conexão mestra"
     setup_mount_env
 
-    # SNAPSHOT_INTERVAL=1 pra o loop de snapshot órfão notar rápido que o pai morreu
+    local out
+    out=$(printf 'user@srv\n/data/proj\n' | FAKE_RCLONE_FAIL=1 "$TNRX_CONNECT" mount 2>&1)
+    assert_contains "$out" "O rclone terminou antes de montar" "explica a falha"
+    [[ "$(mount_count)" == "0" && "$(lock_count)" == "0" ]] && pass_test "sem mount nem lock" || fail_test "sobrou estado"
+    [[ ! -f "$(ctrl_sock)" ]] && pass_test "fecha a conexão mestra que abriu" || fail_test "conexão mestra ficou aberta"
+
+    cleanup_mount_env
+}
+
+test_ssh_requires_mount() {
+    log_test "ssh: só abre o terminal se a pasta estiver montada"
+    setup_mount_env
+
+    local out
+    out=$("$TNRX_CONNECT" ssh 2>&1)
+    [[ $? -ne 0 ]] && pass_test "sem configuração: falha" || fail_test "deveria falhar"
+    assert_contains "$out" "tnrx-connect mount" "sem configuração: manda montar"
+
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+    out=$("$TNRX_CONNECT" ssh 2>&1)
+    assert_contains "$out" "não está montada" "configurada mas desmontada: recusa"
+    assert_not_contains "$out" "Conectando" "não conecta"
+    assert_not_contains "$out" "Autenticando" "não pede senha/2FA"
+
+    cleanup_mount_env
+}
+
+test_ssh_from_subfolder_and_master_lost() {
+    log_test "ssh: de uma subpasta abre na pasta remota correspondente; com a conexão caída manda remontar"
+    setup_mount_env
+
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    mkdir -p "sub dir/x"
+    local out
+    out=$(cd "sub dir/x" && "$TNRX_CONNECT" --debug ssh 2>&1)
+    assert_contains "$out" "Conectando em user@srv (/data/proj/sub dir/x)" "abre na subpasta remota correspondente"
+    assert_contains "$out" "cd\\ /data/proj/sub" "o comando remoto faz cd nela"
+    assert_contains "$out" "continua montada" "sair do terminal não desmonta"
+    [[ "$(mount_count)" == "1" ]] && pass_test "segue montado depois do ssh" || fail_test "ssh desmontou"
+
+    rm -f "$(ctrl_sock)"
+    out=$("$TNRX_CONNECT" ssh 2>&1)
+    assert_contains "$out" "caiu" "detecta a conexão caída"
+    assert_contains "$out" "tnrx-connect mount" "manda rodar mount"
+    out=$("$TNRX_CONNECT" mount 2>&1 </dev/null)
+    assert_contains "$out" "reautenticando" "mount numa pasta montada reautentica"
+    [[ -f "$(ctrl_sock)" ]] && pass_test "conexão mestra de volta" || fail_test "não reconectou"
+    out=$("$TNRX_CONNECT" status 2>&1)
+    assert_contains "$out" "Conexão:   ativa" "status mostra a conexão ativa"
+
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+    cleanup_mount_env
+}
+
+test_mount_recovers_after_rclone_crash() {
+    log_test "mount: rclone morto (kill -9) deixa a pasta pendurada; o próximo mount recupera"
+    setup_mount_env
+
     mkdir -p "$HOME/.config/tnrx-connect"
     printf 'HOST=user@srv\nREMOTE_PATH=/data/proj\nLOCAL_DIR=%s\nLAST_USED=1\nSNAPSHOT_INTERVAL=1\n' "$(pwd -P)" \
         > "$HOME/.config/tnrx-connect/user@srv_proj.conf"
 
-    ( printf '\n\n' | FAKE_SSH_SESSION_SECS=6 "$TNRX_CONNECT" >/dev/null 2>&1 ) &
-    sleep 1.5
-    local pid
-    pid=$(sed -n 's/^PID=//p' "$HOME"/.local/share/tnrx-connect/locks/*/info | head -1)
-    kill -9 "$pid" 2>/dev/null
-    sleep 0.5
+    printf '\n\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    kill -9 "$(rclone_pid)" 2>/dev/null
+    sleep 0.3
     [[ "$(mount_count)" == "1" ]] && pass_test "mount órfão ficou pendurado (cenário reproduzido)" || fail_test "não reproduziu o mount órfão"
-
     local out
-    out=$(printf '\n\n' | "$TNRX_CONNECT" 2>&1)
-    assert_contains "$out" "sessão anterior" "detecta e recupera a sessão anterior"
-    assert_contains "$out" "Montando user@srv:/data/proj" "remonta normalmente"
-    [[ "$(mount_count)" == "0" && "$(lock_count)" == "0" ]] && pass_test "limpo ao final" || fail_test "sobrou estado"
+    out=$("$TNRX_CONNECT" status 2>&1)
+    assert_contains "$out" "o rclone não está rodando" "status aponta o mount pendurado"
 
-    sleep 2.5
-    # padrão ancorado no início da linha: só casa com "bash <caminho>/tnrx-connect ..."
+    out=$(printf '\n\n' | "$TNRX_CONNECT" mount 2>&1)
+    assert_contains "$out" "sessão anterior" "detecta e recupera a montagem anterior"
+    assert_contains "$out" "Montando user@srv:/data/proj" "remonta normalmente"
+    [[ "$(mount_count)" == "1" ]] && pass_test "montado de novo" || fail_test "não remontou"
+
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+    [[ "$(mount_count)" == "0" && "$(lock_count)" == "0" ]] && pass_test "limpo ao final" || fail_test "sobrou estado"
+    sleep 1.5
     local orphan_re="^(/[A-Za-z0-9_./-]*/)?bash $TNRX_CONNECT( |\$)"
     [[ -z "$(pgrep -f "$orphan_re")" ]] \
-        && pass_test "o loop de snapshot da sessão morta não ficou órfão" \
+        && pass_test "nenhum loop de snapshot ficou órfão" \
         || fail_test "sobrou processo tnrx-connect órfão" "$(pgrep -af "$orphan_re")"
 
     cleanup_mount_env
 }
 
-test_mount_busy_unmount_keeps_state() {
-    log_test "mount: desmontagem ocupada mantém o mount/lock e 'unmount' resolve depois"
+test_mount_recovers_while_busy() {
+    log_test "mount: recuperação resolve sozinha mesmo com algo ainda “usando” a montagem antiga, sem esperar por isso"
     setup_mount_env
 
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    local old
+    old=$(rclone_pid)
+    # A montagem foi desanexada (ex.: umount -l externo) mas algo segura um descritor
+    # velho (Nautilus, outra aba): o rclone antigo não morre sozinho.
     touch "$FAKE_STATE/busy"
+    fusermount3 -uz "$(pwd -P)"
+    kill -0 "$old" 2>/dev/null && pass_test "rclone antigo segue vivo (cenário reproduzido)" || fail_test "não reproduziu"
+
     local out
-    out=$(printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" 2>&1)
-    assert_contains "$out" "A montagem continua ativa" "avisa que a montagem continua"
-    [[ "$(mount_count)" == "1" ]] && pass_test "continua montado (nada de dados perdidos)" || fail_test "desmontou à força"
-    [[ "$(lock_count)" == "1" ]] && pass_test "lock mantido" || fail_test "lock perdido"
+    out=$(printf '\n\n' | TNRX_RECOVER_KILL_GRACE_SECS=1 "$TNRX_CONNECT" mount 2>&1)
+    assert_contains "$out" "sessão anterior" "detecta a montagem anterior"
+    assert_not_contains "$out" "Feche o que usa a pasta" "não pede pra caçar o que está aberto"
+    assert_contains "$out" "encerrando o processo antigo" "encerra o processo órfão em vez de esperar"
+    assert_contains "$out" "Montando user@srv:/data/proj" "remonta"
+    [[ "$(mount_count)" == "1" ]] && pass_test "montado de novo (o leitor antigo não bloqueou nada)" || fail_test "não remontou"
+    kill -0 "$old" 2>/dev/null && fail_test "rclone antigo ainda vivo" || pass_test "rclone antigo encerrado"
 
     rm -f "$FAKE_STATE/busy"
-    out=$("$TNRX_CONNECT" unmount 2>&1)
-    assert_contains "$out" "desmontada" "unmount desmonta"
-    [[ "$(mount_count)" == "0" && "$(lock_count)" == "0" ]] && pass_test "estado limpo após unmount" || fail_test "sobrou estado"
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+    [[ "$(mount_count)" == "0" && "$(lock_count)" == "0" ]] && pass_test "umount limpa normalmente" || fail_test "sobrou estado"
+
+    cleanup_mount_env
+}
+
+test_mount_busy_unmount_keeps_state() {
+    log_test "umount: pasta em uso mantém montagem, lock e snapshots; -f ou umount depois resolve"
+    setup_mount_env
+
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    touch "$FAKE_STATE/busy"
+    local out
+    out=$("$TNRX_CONNECT" umount 2>&1)
+    assert_contains "$out" "continua montada" "avisa que a montagem continua"
+    assert_contains "$out" "umount . -f" "sugere o -f"
+    [[ "$(mount_count)" == "1" ]] && pass_test "continua montado (nada de dados perdidos)" || fail_test "desmontou à força"
+    [[ "$(lock_count)" == "1" ]] && pass_test "lock mantido" || fail_test "lock perdido"
+    [[ -n "$(snap_loops)" ]] && pass_test "snapshots automáticos voltaram a rodar" || fail_test "loop de snapshots não voltou"
+    [[ -f "$(ctrl_sock)" ]] && pass_test "conexão mestra mantida" || fail_test "fechou a conexão de um mount vivo"
+
+    rm -f "$FAKE_STATE/busy"
+    out=$("$TNRX_CONNECT" umount 2>&1)
+    assert_contains "$out" "desmontada" "umount desmonta"
+    [[ "$(mount_count)" == "0" && "$(lock_count)" == "0" ]] && pass_test "estado limpo após umount" || fail_test "sobrou estado"
+
+    cleanup_mount_env
+}
+
+test_umount_from_subfolder() {
+    log_test "umount: rodado numa subpasta desmonta a pasta montada acima"
+    setup_mount_env
+
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    mkdir -p sub
+    local out
+    out=$(cd sub && "$TNRX_CONNECT" umount 2>&1)
+    assert_contains "$out" "$MT/work/proj desmontada" "desmonta a raiz da montagem"
+    [[ "$(mount_count)" == "0" ]] && pass_test "desmontado" || fail_test "continua montado"
+
+    cleanup_mount_env
+}
+
+test_umount_keeps_master_used_elsewhere() {
+    log_test "umount: não fecha a conexão mestra que outra montagem (ou um terminal ssh) ainda usa"
+    setup_mount_env
+
+    mkdir -p "$MT/work/a" "$MT/work/b"
+    ( cd "$MT/work/a" && printf 'user@srv\n/data/a\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1 )
+    ( cd "$MT/work/b" && printf 'user@srv\n/data/b\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1 )
+    ( cd "$MT/work/a" && "$TNRX_CONNECT" umount >/dev/null 2>&1 )
+    [[ -f "$(ctrl_sock)" ]] && pass_test "conexão mantida enquanto 'b' está montada" || fail_test "fechou a conexão de 'b'"
+    grep -q "$MT/work/b " "$MT/mounts" && pass_test "'b' continua montada" || fail_test "'b' foi desmontada junto"
+
+    ( cd "$MT/work/b" && FAKE_SSH_SESSION_SECS=3 "$TNRX_CONNECT" ssh >/dev/null 2>&1 ) &
+    local spid=$!
+    sleep 1
+    ( cd "$MT/work/b" && "$TNRX_CONNECT" umount >/dev/null 2>&1 )
+    [[ -f "$(ctrl_sock)" ]] && pass_test "conexão mantida enquanto há um terminal ssh aberto" || fail_test "derrubou o terminal ssh"
+    wait "$spid"
+    [[ ! -f "$(ctrl_sock)" ]] && pass_test "o ssh fecha a conexão ao sair quando nada mais a usa" || fail_test "conexão ficou aberta"
 
     cleanup_mount_env
 }
@@ -521,13 +758,16 @@ test_mount_conf_name_collision() {
     setup_mount_env
 
     mkdir -p "$MT/work/a/proj" "$MT/work/b/proj"
-    ( cd "$MT/work/a/proj" && printf 'user@srv\n/data/a\n' | "$TNRX_CONNECT" >/dev/null 2>&1 )
-    ( cd "$MT/work/b/proj" && printf 'user@srv\n/data/b\n' | "$TNRX_CONNECT" >/dev/null 2>&1 )
+    ( cd "$MT/work/a/proj" && printf 'user@srv\n/data/a\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1 )
+    ( cd "$MT/work/b/proj" && printf 'user@srv\n/data/b\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1 )
 
     [[ "$(conf_count)" == "2" ]] && pass_test "dois .conf distintos" || fail_test "colisão de .conf" "$(ls "$HOME/.config/tnrx-connect")"
     ls "$HOME/.config/tnrx-connect" | grep -q 'user@srv_proj-[0-9]*\.conf' \
         && pass_test "o segundo ganhou sufixo de hash" || fail_test "sem sufixo de hash"
+    [[ "$(mount_count)" == "2" ]] && pass_test "as duas montadas ao mesmo tempo" || fail_test "esperava 2 mounts"
 
+    "$TNRX_CONNECT" umount "$MT/work/a/proj" >/dev/null 2>&1
+    "$TNRX_CONNECT" umount "$MT/work/b/proj" >/dev/null 2>&1
     cleanup_mount_env
 }
 
@@ -535,15 +775,18 @@ test_mount_multiple_confs_same_folder() {
     log_test "mount: pasta usada com dois hosts pergunta qual usar (mais recente primeiro)"
     setup_mount_env
 
-    printf 'user@um\n/data/x\n' | "$TNRX_CONNECT" >/dev/null 2>&1
+    printf 'user@um\n/data/x\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     sleep 1
-    printf 'user@dois\n/data/y\n' | "$TNRX_CONNECT" >/dev/null 2>&1
+    printf 'user@dois\n/data/y\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
 
     local out
-    out=$(printf '\n\n\n' | "$TNRX_CONNECT" 2>&1)
+    out=$(printf '\n\n\n' | "$TNRX_CONNECT" mount 2>&1)
     assert_contains "$out" "mais de uma configuração" "lista as configurações da pasta"
     assert_contains "$out" "Montando user@dois:/data/y" "o padrão é o mais recente"
 
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     cleanup_mount_env
 }
 
@@ -551,8 +794,7 @@ test_mount_snapshot_history_restore() {
     log_test "mount: snapshots, history e restore (git sombra fora do projeto)"
     setup_mount_env
 
-    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" >/dev/null 2>&1
-    printf 'rclone %s fuse.rclone rw 0 0\n' "$PWD" >> "$MT/mounts"
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
 
     echo "v1" > a.py; echo "dado" > b.txt
     "$TNRX_CONNECT" snapshot >/dev/null 2>&1
@@ -578,8 +820,36 @@ test_mount_snapshot_history_restore() {
     local status_out
     status_out=$("$TNRX_CONNECT" status)
     assert_contains "$status_out" "Servidor:  user@srv:/data/proj" "status mostra o servidor"
-    assert_contains "$status_out" "Sessão:    inativa" "status mostra sessão inativa"
+    assert_contains "$status_out" "Montada:   sim" "status mostra a montagem ativa"
 
+    echo "v4" > a.py
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+    "$TNRX_CONNECT" history | grep -q "snapshot final" \
+        && pass_test "umount tira o snapshot final" || fail_test "sem snapshot final"
+    status_out=$("$TNRX_CONNECT" status)
+    assert_contains "$status_out" "Montada:   não" "status depois do umount"
+
+    cleanup_mount_env
+}
+
+test_mount_auto_snapshots_without_terminal() {
+    log_test "mount: snapshots automáticos rodam com a pasta montada, sem nenhum terminal aberto"
+    setup_mount_env
+
+    mkdir -p "$HOME/.config/tnrx-connect"
+    printf 'HOST=user@srv\nREMOTE_PATH=/data/proj\nLOCAL_DIR=%s\nLAST_USED=1\nSNAPSHOT_INTERVAL=1\n' "$(pwd -P)" \
+        > "$HOME/.config/tnrx-connect/user@srv_proj.conf"
+    printf '\n\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    echo "x" > auto.txt
+    local i
+    for i in $(seq 1 30); do
+        "$TNRX_CONNECT" history 2>/dev/null | grep -q snapshot && break
+        sleep 0.2
+    done
+    "$TNRX_CONNECT" history 2>/dev/null | grep -q snapshot \
+        && pass_test "snapshot automático registrado" || fail_test "nenhum snapshot automático"
+
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     cleanup_mount_env
 }
 
@@ -587,8 +857,7 @@ test_mount_snapshot_skips_big_files() {
     log_test "mount: snapshot ignora arquivos acima do limite de tamanho"
     setup_mount_env
 
-    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" >/dev/null 2>&1
-    printf 'rclone %s fuse.rclone rw 0 0\n' "$PWD" >> "$MT/mounts"
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
     echo "ok" > pequeno.txt
     head -c 6000000 /dev/zero > grande.bin
     "$TNRX_CONNECT" snapshot >/dev/null 2>&1
@@ -598,6 +867,7 @@ test_mount_snapshot_skips_big_files() {
     assert_contains "$tracked" "pequeno.txt" "arquivo pequeno entra no snapshot"
     assert_not_contains "$tracked" "grande.bin" "arquivo de 6MB fica de fora (limite 5MB)"
 
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     cleanup_mount_env
 }
 
@@ -605,43 +875,31 @@ test_mount_snapshot_requires_mount() {
     log_test "mount: sem montagem não tira snapshot nem restaura (evita gravar 'tudo apagado')"
     setup_mount_env
 
-    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" >/dev/null 2>&1
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     local out
     out=$("$TNRX_CONNECT" snapshot 2>&1)
     assert_contains "$out" "Não foi possível tirar o snapshot" "snapshot recusado sem mount"
     out=$("$TNRX_CONNECT" restore abc123 2>&1)
     assert_contains "$out" "não está montada" "restore recusado sem mount"
+    out=$("$TNRX_CONNECT" refresh 2>&1)
+    assert_contains "$out" "não está montada" "refresh recusado sem mount"
 
     cleanup_mount_env
 }
 
 test_mount_refresh_sends_hup() {
-    log_test "mount: refresh manda SIGHUP ao rclone da sessão ativa"
+    log_test "mount: refresh manda SIGHUP ao rclone da montagem"
     setup_mount_env
 
-    local dir hash owner mpid
-    dir=$(pwd -P)
-    mkdir -p "$HOME/.config/tnrx-connect"
-    printf 'HOST=user@srv\nREMOTE_PATH=/data/proj\nLOCAL_DIR=%s\nLAST_USED=1\n' "$dir" \
-        > "$HOME/.config/tnrx-connect/user@srv_proj.conf"
-
-    bash -c 'exec -a tnrx-connect sleep 20' &
-    owner=$!
-    bash -c "trap 'touch \"$MT/got_hup\"' HUP; while true; do sleep 0.1; done" &
-    mpid=$!
-    hash=$(printf '%s' "$dir" | cksum | awk '{print $1}')
-    mkdir -p "$HOME/.local/share/tnrx-connect/locks/$hash.d"
-    printf 'PID=%s\nHOST=user@srv\nREMOTE_PATH=/data/proj\nLOCAL_DIR=%s\nID=user@srv_proj\nSTART=1\nMOUNT_PID=%s\n' \
-        "$owner" "$dir" "$mpid" > "$HOME/.local/share/tnrx-connect/locks/$hash.d/info"
-
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
     local out
     out=$("$TNRX_CONNECT" refresh 2>&1)
     sleep 0.5
     assert_contains "$out" "Cache de diretórios limpo" "refresh confirma"
-    [[ -f "$MT/got_hup" ]] && pass_test "o processo do rclone recebeu SIGHUP" || fail_test "SIGHUP não chegou"
+    [[ -f "$FAKE_STATE/got_hup" ]] && pass_test "o processo do rclone recebeu SIGHUP" || fail_test "SIGHUP não chegou"
 
-    kill "$owner" "$mpid" 2>/dev/null
-    wait "$owner" "$mpid" 2>/dev/null
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
     cleanup_mount_env
 }
 
@@ -814,21 +1072,25 @@ jt_conf() {
 
 jt_run() {
     # $1 = stdin (formato printf %b). Sobe `tnrx-connect jupyter` em background.
-    printf '%b' "$1" | TNRX_JUPYTER_POLL_SECS=0.1 TNRX_JUPYTER_LIVE_SECS=1 "$TNRX_CONNECT" jupyter > "$MT/jout" 2>&1 &
+    printf '%b' "$1" | TNRX_JUPYTER_POLL_SECS=0.1 TNRX_JUPYTER_LIVE_SECS=1 TNRX_JUPYTER_START_POLL_SECS=0.2 "$TNRX_CONNECT" jupyter > "$MT/jout" 2>&1 &
     JPID=$!
 }
 
 test_jupyter_auto_single_server() {
-    log_test "jupyter (auto): um servidor no ar -> conecta direto, sem perguntar nada"
+    log_test "jupyter (auto): um servidor no ar -> lista e Enter conecta nele"
     setup_mount_env
     local remote="$MT/proj remoto"; jt_conf "$remote"
     jt_listen 48950
     jt_registry "$remote" 95272 127.0.0.1 48950 aabbccdd0011 "$(date +%s)"
 
     jt_run ''
-    wait_out "Ponte aberta" && pass_test "ponte aberta sem prompts" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    wait_out "Ponte aberta" && pass_test "ponte aberta só com Enter" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
     local out; out=$(cat "$MT/jout")
-    assert_contains "$out" "Procurando servidores Jupyter no ar em user@srv:$remote" "usa host e pasta da sessão"
+    assert_contains "$out" "Procurando servidores Jupyter no ar em user@srv" "usa o host da sessão"
+    assert_contains "$out" "[1] proj remoto  127.0.0.1:48950" "lista com o nome do projeto"
+    assert_contains "$out" "← este projeto" "marca o projeto atual"
+    assert_contains "$out" "[n] Iniciar um novo Jupyter em proj remoto" "oferece iniciar um novo"
+    assert_contains "$out" "não usa a senha fixa" "avisa que esse Jupyter não usa a senha fixa"
     assert_not_contains "$out" "Host (" "não pergunta o host"
     assert_contains "$out" "127.0.0.1:48950" "ponte para nó:porta do registro"
     assert_contains "$out" "?token=aabbccdd0011" "link com o token do registro"
@@ -847,8 +1109,10 @@ test_jupyter_auto_none() {
 
     local out rc
     out=$("$TNRX_CONNECT" jupyter < /dev/null 2>&1); rc=$?
-    assert_contains "$out" "Nenhum servidor Jupyter no ar neste projeto" "avisa que não há servidor"
-    assert_contains "$out" "tnrx uvslurm jupyter lab" "diz como iniciar um"
+    assert_contains "$out" "Nenhum servidor Jupyter no ar em user@srv" "avisa que não há servidor"
+    assert_contains "$out" "Iniciar um novo Jupyter em proj" "oferece iniciar um novo"
+    assert_contains "$out" "tnrx-connect jupyter" "sem resposta: diz como iniciar depois"
+    [[ ! -f "$remote/.tnrx/jupyter/launch.log" ]] && pass_test "sem confirmação, não inicia nada" || fail_test "iniciou sem confirmação"
     assert_not_contains "$out" "URL" "não pede para colar URL"
     [[ "$rc" == "1" ]] && pass_test "sai com erro" || fail_test "exit=$rc"
     [[ ! -s "$FAKE_STATE/ssh.fwd" ]] && pass_test "nenhuma ponte aberta" || fail_test "abriu ponte sem servidor"
@@ -870,8 +1134,8 @@ test_jupyter_auto_multiple_servers_menu() {
     jt_run '2\n'
     wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
     local out; out=$(cat "$MT/jout")
-    assert_contains "$out" "[1] 127.0.0.1:48953  (job 22" "o mais recente é o [1]"
-    assert_contains "$out" "[2] 127.0.0.1:48951  (job 11" "o mais antigo é o [2]"
+    assert_contains "$out" "[1] proj  127.0.0.1:48953  (job 22" "o mais recente é o [1]"
+    assert_contains "$out" "[2] proj  127.0.0.1:48951  (job 11" "o mais antigo é o [2]"
     assert_contains "$out" "?token=aa11" "a opção 2 conecta no mais antigo"
     assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" ":127.0.0.1:48951" "encaminha o escolhido"
     kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
@@ -893,9 +1157,40 @@ test_jupyter_auto_ignores_and_prunes_dead() {
     wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
     local out; out=$(cat "$MT/jout")
     assert_contains "$out" "?token=aa11" "conecta no único que responde"
-    assert_not_contains "$out" "[1]" "sem menu: só um estava no ar"
+    assert_not_contains "$out" "[2]" "só um estava no ar"
     [[ -f "$remote/.tnrx/jupyter/2.env" ]] && pass_test "parado há pouco tempo: mantido" || fail_test "apagou registro recente"
     [[ ! -f "$remote/.tnrx/jupyter/3.env" ]] && pass_test "parado há mais de 1 dia: apagado" || fail_test "registro antigo ficou"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    jt_cleanup; cleanup_mount_env
+}
+
+test_jupyter_auto_ignores_stale_registry_on_same_port() {
+    log_test "jupyter (auto): registro velho no mesmo nó:porta de um Jupyter novo é ignorado"
+    setup_mount_env
+    local remote="$MT/proj"; jt_conf "$remote"
+    local now; now=$(date +%s)
+    jt_listen 48966
+    jt_registry "$remote" 100 127.0.0.1 48966 aa11 $((now - 3600))
+    jt_registry "$remote" 101 127.0.0.1 48966 bb22 $((now - 60))
+
+    jt_run ''
+    wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    local out; out=$(cat "$MT/jout")
+    assert_contains "$out" "job 101" "lista o mais recente"
+    assert_not_contains "$out" "job 100" "mesmo nó:porta: o registro mais antigo some (sem squeue)"
+    assert_contains "$out" "?token=bb22" "conecta com a senha do registro certo"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    # Com squeue: só valem os jobs que ainda estão na fila
+    jt_listen 48967
+    jt_registry "$remote" 102 127.0.0.1 48967 cc33 $((now - 30))
+    printf '101\n' > "$FAKE_STATE/squeue_ids"
+    jt_run ''
+    wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    out=$(cat "$MT/jout")
+    assert_not_contains "$out" "job 102" "job fora do squeue é ignorado, mesmo com a porta respondendo"
+    assert_contains "$out" "job 101" "job no squeue continua"
     kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
 
     jt_cleanup; cleanup_mount_env
@@ -973,6 +1268,326 @@ test_jupyter_auto_asks_when_no_session() {
     jt_cleanup; cleanup_mount_env
 }
 
+jt_wait_cmd_end() {
+    local i
+    for i in $(seq 1 100); do kill -0 "$JPID" 2>/dev/null || return 0; sleep 0.1; done
+    return 1
+}
+
+jt_stop_fake_tnrx() {
+    pkill -TERM -f "$FAKES_DIR/tnrx" 2>/dev/null
+    sleep 0.3
+}
+
+test_jupyter_lists_other_projects() {
+    log_test "jupyter (auto): lista também os Jupyters de outros projetos deste host que o laptop conhece"
+    setup_mount_env
+    local remote="$MT/proj" outro="$MT/outro"; mkdir -p "$outro"; jt_conf "$remote"
+    printf 'HOST=user@srv\nREMOTE_PATH=%q\nLOCAL_DIR=/x/outro\nLAST_USED=1\n' "$outro" > "$HOME/.config/tnrx-connect/user@srv_outro.conf"
+    printf 'HOST=user@outro\nREMOTE_PATH=%q\nLOCAL_DIR=/x/y\nLAST_USED=1\n' "$MT/alheio" > "$HOME/.config/tnrx-connect/user@outro_y.conf"
+    mkdir -p "$MT/alheio"
+    local now; now=$(date +%s)
+    jt_listen 48970; jt_listen 48971; jt_listen 48972
+    jt_registry "$remote" 1 127.0.0.1 48970 aa11 $((now - 600))
+    jt_registry "$outro" 2 127.0.0.1 48971 bb22 $((now - 30))
+    jt_registry "$MT/alheio" 3 127.0.0.1 48972 cc33 "$now"
+
+    jt_run '2\n'
+    wait_out "Ponte aberta" || fail_test "ponte não abriu" "$(cat "$MT/jout")"
+    local out; out=$(cat "$MT/jout")
+    assert_contains "$out" "[1] outro  127.0.0.1:48971" "o outro projeto aparece (mais recente)"
+    assert_contains "$out" "[2] proj  127.0.0.1:48970  (job 1, há 10 min)  ← este projeto" "o projeto atual aparece marcado"
+    assert_not_contains "$out" "48972" "não lista projeto de outro host"
+    assert_contains "$out" "?token=aa11" "conecta no escolhido"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    jt_cleanup; cleanup_mount_env
+}
+
+test_jupyter_start_new_with_fixed_url() {
+    log_test "jupyter (auto): inicia um novo pelo laptop, com senha fixa e porta local fixa (URL estável pro VS Code)"
+    setup_mount_env
+    local remote="$MT/proj"; mkdir -p "$remote"; jt_conf "$remote"
+
+    jt_run '\n'
+    wait_out "Ponte aberta" && pass_test "iniciou e conectou" || fail_test "não conectou" "$(cat "$MT/jout")"
+    local out; out=$(cat "$MT/jout")
+    assert_contains "$out" "Iniciar um novo Jupyter em proj" "pergunta se inicia um novo"
+    assert_contains "$out" "job na fila do Slurm" "mostra o progresso (fila)"
+    assert_contains "$out" "Jupyter no ar" "avisa quando subiu"
+    assert_contains "$out" "Esta URL é fixa" "explica que a URL é fixa"
+
+    local token conf port
+    token=$(cat "$remote/.tnrx/jupyter/token" 2>/dev/null)
+    [[ "$token" =~ ^[0-9a-f]{48}$ ]] && pass_test "senha fixa gravada no servidor (48 hex)" || fail_test "token inválido" "$token"
+    [[ "$(stat -c %a "$remote/.tnrx/jupyter/token" 2>/dev/null)" == "600" ]] && pass_test "arquivo da senha com permissão 600" || fail_test "permissão da senha"
+    [[ "$(cat "$remote/.tnrx/.gitignore" 2>/dev/null)" == "*" ]] && pass_test ".tnrx/.gitignore criado" || fail_test "sem .tnrx/.gitignore"
+    assert_contains "$out" "?token=$token" "o link usa a senha fixa"
+    [[ "$(stat -c %a "$HOME/.config/tnrx-connect/jupyter.secret" 2>/dev/null)" == "600" ]] && pass_test "segredo local com permissão 600" || fail_test "segredo local"
+    assert_not_contains "$(ps -Ao command=)" "$token" "a senha não aparece na linha de comando de nenhum processo local"
+    conf="$HOME/.config/tnrx-connect/user@srv_proj.conf"
+    port=$(sed -n 's/^JUPYTER_PORT=//p' "$conf")
+    [[ -n "$port" ]] && pass_test "porta local fixa guardada no .conf ($port)" || fail_test "JUPYTER_PORT não gravado"
+    assert_contains "$out" "http://127.0.0.1:$port/lab?token=$token" "URL do VS Code com porta e senha fixas"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    # Segunda vez (mesmo Jupyter): mesma porta, mesma senha
+    jt_run '1\n'
+    wait_out "Ponte aberta" || fail_test "não reconectou" "$(cat "$MT/jout")"
+    assert_contains "$(cat "$MT/jout")" "http://127.0.0.1:$port/lab?token=$token" "reconectar dá a mesma URL"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    # Outro Jupyter do mesmo projeto, iniciado depois: mesma senha
+    jt_stop_fake_tnrx
+    rm -f "$remote/.tnrx/jupyter/777.env"
+    FAKE_TNRX_PORT=48991 jt_run '\n'
+    wait_out "Ponte aberta" || fail_test "não iniciou de novo" "$(cat "$MT/jout")"
+    assert_contains "$(cat "$MT/jout")" "http://127.0.0.1:$port/lab?token=$token" "novo Jupyter, mesma URL (mesma porta local e senha)"
+    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "forward localhost:$port:127.0.0.1:48991" "a porta fixa aponta pro Jupyter novo"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+
+    jt_stop_fake_tnrx; cleanup_mount_env
+}
+
+test_jupyter_token_depends_on_local_secret() {
+    log_test "jupyter: a senha fixa depende do projeto, do host e do segredo deste laptop"
+    setup_mount_env
+    local a b c d
+    a=$(bash -c "source <(sed '/^# --- Lógica de Entrada ---/,\$d' '$TNRX_CONNECT'); jupyter_token user@srv /p/a")
+    b=$(bash -c "source <(sed '/^# --- Lógica de Entrada ---/,\$d' '$TNRX_CONNECT'); jupyter_token user@srv /p/a")
+    c=$(bash -c "source <(sed '/^# --- Lógica de Entrada ---/,\$d' '$TNRX_CONNECT'); jupyter_token user@srv /p/b")
+    rm -f "$HOME/.config/tnrx-connect/jupyter.secret"
+    d=$(bash -c "source <(sed '/^# --- Lógica de Entrada ---/,\$d' '$TNRX_CONNECT'); jupyter_token user@srv /p/a")
+    [[ "$a" =~ ^[0-9a-f]{48}$ && "$a" == "$b" ]] && pass_test "estável para o mesmo projeto" || fail_test "instável" "$a / $b"
+    [[ "$a" != "$c" ]] && pass_test "muda com o projeto" || fail_test "igual entre projetos"
+    [[ "$a" != "$d" ]] && pass_test "muda com o segredo local (não dá pra deduzir só pelo nome)" || fail_test "não depende do segredo"
+    cleanup_mount_env
+}
+
+test_jupyter_start_failure_shows_log() {
+    log_test "jupyter (auto): se o tnrx falha ao iniciar, mostra o fim do log"
+    setup_mount_env
+    local remote="$MT/proj"; mkdir -p "$remote"; jt_conf "$remote"
+
+    local out rc
+    out=$(printf '\n' | FAKE_TNRX_FAIL=1 TNRX_JUPYTER_START_POLL_SECS=0.2 "$TNRX_CONNECT" jupyter 2>&1); rc=$?
+    assert_contains "$out" "O tnrx terminou sem subir o Jupyter" "explica a falha"
+    assert_contains "$out" "Nenhum arquivo .sif encontrado" "mostra o log do tnrx"
+    [[ "$rc" == "1" ]] && pass_test "sai com erro" || fail_test "exit=$rc"
+
+    cleanup_mount_env
+}
+
+test_jupyter_start_cancel_while_waiting() {
+    log_test "jupyter (auto): interromper enquanto espera o Jupyter subir cancela o job"
+    setup_mount_env
+    local remote="$MT/proj"; mkdir -p "$remote"; jt_conf "$remote"
+
+    FAKE_TNRX_DELAY=30 jt_run '\n'
+    wait_out "Iniciando o Jupyter" || fail_test "não iniciou" "$(cat "$MT/jout")"
+    sleep 0.5
+    kill -TERM "$JPID"
+    jt_wait_cmd_end && pass_test "o comando terminou" || fail_test "comando não terminou"
+    wait "$JPID" 2>/dev/null
+    assert_contains "$(cat "$MT/jout")" "Cancelando o Jupyter" "avisa o cancelamento"
+    local i
+    for i in $(seq 1 20); do [[ -f "$FAKE_STATE/tnrx_cancelled" ]] && break; sleep 0.1; done
+    [[ -f "$FAKE_STATE/tnrx_cancelled" ]] && pass_test "o tnrx (e o srun) no servidor recebeu o cancelamento" || fail_test "o job continuou"
+    [[ -z "$(pgrep -f "$FAKES_DIR/tnrx")" ]] && pass_test "nada ficou rodando no servidor" || fail_test "sobrou processo"
+
+    jt_stop_fake_tnrx; cleanup_mount_env
+}
+
+# --- Interface JSON (VS Code) ---
+
+jq_py() {
+    # $1 = JSON, $2 = expressão python sobre `d` (o JSON carregado). Imprime o resultado.
+    printf '%s' "$1" | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>&1
+}
+
+assert_json() {
+    # $1 = JSON, $2 = expressão python, $3 = valor esperado (texto), $4 = nome
+    local got
+    got=$(jq_py "$1" "$2")
+    [[ "$got" == "$3" ]] && pass_test "$4" || fail_test "$4" "esperado '$3', veio '$got'"
+}
+
+test_api_status_json() {
+    log_test "api: status --json lista montagens, estado, conexão e tnrx_slurm.conf efetivo"
+    setup_mount_env
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+    printf '# comentário\nPARTITION=a100\nGPUS="2"  # duas\nexport TIME=04:00:00\n' > tnrx_slurm.conf
+    # mesma pasta local, configurada também pra outro host: não está montada por esta config
+    printf 'HOST=user@b\nREMOTE_PATH=/b/proj\nLOCAL_DIR=%s\nLAST_USED=1\n' "$(pwd -P)" > "$HOME/.config/tnrx-connect/user@b_proj.conf"
+    mkdir -p "$MT/work/velho"
+    printf 'HOST=user@outro\nREMOTE_PATH=/x/velho\nLOCAL_DIR=%s\nLAST_USED=5\n' "$MT/work/velho" > "$HOME/.config/tnrx-connect/user@outro_velho.conf"
+
+    local out
+    out=$("$TNRX_CONNECT" status --json 2>/dev/null </dev/null)
+    jq_py "$out" "'ok'" | grep -q '^ok$' && pass_test "JSON válido" || fail_test "JSON inválido" "$out"
+    local M="[m for m in d['mounts'] if m['name']=='proj' and m['host']=='user@srv'][0]"
+    assert_json "$out" "$M['state']" "mounted" "pasta montada: state=mounted"
+    assert_json "$out" "$M['connected']" "True" "conexão ativa"
+    assert_json "$out" "$M['remote_path']" "/data/proj" "pasta remota"
+    assert_json "$out" "isinstance($M['rclone_pid'], int)" "True" "PID do rclone"
+    assert_json "$out" "$M['slurm']['values']['PARTITION']" "{'value': 'a100', 'from_file': True}" "PARTITION do arquivo"
+    assert_json "$out" "$M['slurm']['values']['GPUS']['value']" "2" "aspas e comentário removidos"
+    assert_json "$out" "$M['slurm']['values']['TIME']['value']" "04:00:00" "aceita 'export'"
+    assert_json "$out" "$M['slurm']['values']['MEM']" "{'value': '4G', 'from_file': False}" "chave ausente: padrão do tnrx"
+    assert_json "$out" "[(m['state'], m['slurm']) for m in d['mounts'] if m['name']=='velho'][0]" "('unmounted', None)" "pasta desmontada: sem slurm"
+    assert_json "$out" "sorted((m['host'], m['state']) for m in d['mounts'] if m['name']=='proj')" "[('user@b', 'unmounted'), ('user@srv', 'mounted')]" "mesma pasta com outro host: só a config do lock conta como montada"
+    assert_json "$out" "sorted((h['host'], h['connected']) for h in d['hosts'])" "[('user@b', False), ('user@outro', False), ('user@srv', True)]" "hosts com o estado da conexão"
+
+    kill -9 "$(rclone_pid)"; sleep 0.3
+    out=$("$TNRX_CONNECT" status --json 2>/dev/null)
+    assert_json "$out" "[m['state'] for m in d['mounts'] if m['name']=='proj' and m['host']=='user@srv'][0]" "stale" "rclone morto: state=stale"
+    "$TNRX_CONNECT" umount -f >/dev/null 2>&1
+    cleanup_mount_env
+}
+
+test_api_slurm_defaults_match_tnrx() {
+    log_test "api: padrões do Slurm no tnrx-connect iguais aos do tnrx"
+    local k a b ok=true
+    for k in PARTITION GPUS CPUS MEM TIME; do
+        a=$(sed -n "s/^DEFAULT_$k=\"\\(.*\\)\"/\\1/p" "$SCRIPT_DIR/tnrx")
+        b=$(sed -n "s/^SLURM_DEFAULT_$k=\"\\(.*\\)\"/\\1/p" "$TNRX_CONNECT")
+        [[ -n "$a" && "$a" == "$b" ]] || { ok=false; fail_test "padrão $k difere" "tnrx='$a' tnrx-connect='$b'"; }
+    done
+    [[ "$ok" == "true" ]] && pass_test "PARTITION, GPUS, CPUS, MEM e TIME iguais"
+}
+
+test_api_cluster_json() {
+    log_test "api: cluster --json traz partições (nós e GPUs livres) e meus jobs dos hosts montados"
+    setup_mount_env
+    printf 'user@srv\n/data/proj\n' | "$TNRX_CONNECT" mount >/dev/null 2>&1
+
+    # a mesma pasta local também configurada pra outro host (não montado): não entra
+    printf 'HOST=user@b\nREMOTE_PATH=/b/proj\nLOCAL_DIR=%s\nLAST_USED=1\n' "$(pwd -P)" > "$HOME/.config/tnrx-connect/user@b_proj.conf"
+    local out
+    out=$("$TNRX_CONNECT" cluster --json 2>/dev/null </dev/null)
+    assert_json "$out" "[h['host'] for h in d['hosts']]" "['user@srv']" "só os hosts montados (não o outro .conf da mesma pasta)"
+    assert_json "$out" "d['hosts'][0]['ok']" "True" "consulta ok"
+    assert_json "$out" "[(p['name'], p['default']) for p in d['hosts'][0]['partitions']]" "[('l40s', True), ('a100', False)]" "partições, com a padrão marcada"
+    assert_json "$out" "d['hosts'][0]['partitions'][1]['nodes']['total']" "2" "linhas do sinfo da mesma partição somadas (sem repetir partição)"
+    assert_json "$out" "d['hosts'][0]['partitions'][0]['nodes']" "{'allocated': 2, 'idle': 1, 'other': 1, 'total': 4}" "nós A/I/O/T"
+    assert_json "$out" "d['hosts'][0]['partitions'][0]['gpus']" "{'total': 8, 'used': 3, 'unavailable': 2, 'free': 3}" "GPUs l40s (nó em drain não conta como livre)"
+    assert_json "$out" "d['hosts'][0]['partitions'][1]['gpus']['free']" "0" "a100 fora do ar: 0 livres"
+    assert_json "$out" "[(j['id'], j['state'], j['work_dir']) for j in d['hosts'][0]['jobs']]" "[('95272', 'RUNNING', '/data/proj'), ('95300', 'PENDING', '/data/outro proj')]" "meus jobs, com a pasta"
+    assert_json "$out" "d['hosts'][0]['jobs'][1]['name']" 'train "x"' "nome com aspas escapado no JSON"
+
+    out=$("$TNRX_CONNECT" cluster 2>&1 </dev/null)
+    assert_contains "$out" "GPUs livres" "versão de terminal"
+    assert_contains "$out" "95300" "lista os jobs no terminal"
+
+    "$TNRX_CONNECT" umount >/dev/null 2>&1
+    out=$("$TNRX_CONNECT" cluster --json --host user@srv 2>/dev/null </dev/null)
+    assert_json "$out" "(d['hosts'][0]['connected'], d['hosts'][0]['error']['code'])" "(False, 'not_connected')" "sem conexão: not_connected, sem autenticar"
+    [[ ! -f "$(ctrl_sock)" ]] && pass_test "não abriu conexão (não pede 2FA)" || fail_test "abriu conexão"
+    cleanup_mount_env
+}
+
+test_api_cluster_cancel() {
+    log_test "api: cluster cancel / jupyter stop cancelam um job (scancel) sem perguntar nada"
+    setup_mount_env
+    mkdir -p "$HOME/.cache/tnrx-connect"; touch "$(ctrl_sock)"
+    local out rc
+    out=$("$TNRX_CONNECT" cluster cancel 95272 --host user@srv --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "(d['ok'], d['job'])" "(True, '95272')" "cancelado"
+    assert_contains "$(cat "$FAKE_STATE/scancel")" "95272" "scancel chamado no servidor"
+    out=$("$TNRX_CONNECT" jupyter stop 95273 --host user@srv --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['ok']" "True" "jupyter stop também"
+    out=$("$TNRX_CONNECT" cluster cancel 999 --host user@srv --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "d['error']['code']" "scancel_failed" "erro do scancel vira scancel_failed"
+    out=$("$TNRX_CONNECT" cluster cancel '1;rm -rf x' --host user@srv --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "d['error']['code']" "usage" "job inválido recusado"
+    [[ "$rc" == "2" ]] && pass_test "uso inválido sai com 2" || fail_test "exit=$rc"
+    cleanup_mount_env
+}
+
+test_api_jupyter_list_json() {
+    log_test "api: jupyter list --json agrupa por host e projeto, com URL local fixa"
+    setup_mount_env
+    local remote="$MT/proj remoto" outro="$MT/outro"; mkdir -p "$remote" "$outro"; jt_conf "$remote"
+    printf 'HOST=user@srv\nREMOTE_PATH=%q\nLOCAL_DIR=/x/outro\nLAST_USED=1\nJUPYTER_PORT=18555\n' "$outro" > "$HOME/.config/tnrx-connect/user@srv_outro.conf"
+    printf 'HOST=user@off\nREMOTE_PATH=/y\nLOCAL_DIR=/x/y\nLAST_USED=1\n' > "$HOME/.config/tnrx-connect/user@off_y.conf"
+    mkdir -p "$HOME/.cache/tnrx-connect"; touch "$(ctrl_sock)"
+    jt_listen 48980
+    jt_registry "$outro" 41 127.0.0.1 48980 aa11 "$(date +%s)"
+
+    local out
+    out=$("$TNRX_CONNECT" jupyter list --json 2>/dev/null </dev/null)
+    assert_json "$out" "sorted((h['host'], h['connected']) for h in d['hosts'])" "[('user@off', False), ('user@srv', True)]" "hosts com conexão"
+    assert_json "$out" "sorted(p['name'] for h in d['hosts'] if h['host']=='user@srv' for p in h['projects'])" "['outro', 'proj remoto']" "projetos conhecidos do host (inclusive com espaço)"
+    assert_json "$out" "[len(p['servers']) for h in d['hosts'] for p in h['projects'] if p['name']=='proj remoto'][0]" "0" "projeto sem Jupyter: lista vazia"
+    assert_json "$out" "[(s['job'], s['node'], s['port'], s['local_port'], s['bridge_open'], s['token_fixed']) for h in d['hosts'] for p in h['projects'] if p['name']=='outro' for s in p['servers']][0]" "('41', '127.0.0.1', 48980, 18555, False, False)" "servidor com porta local fixa do projeto"
+    assert_json "$out" "[s['url'] for h in d['hosts'] for p in h['projects'] if p['name']=='outro' for s in p['servers']][0]" "http://127.0.0.1:18555/lab?token=aa11" "URL local"
+    jt_cleanup; cleanup_mount_env
+}
+
+test_api_jupyter_start_connect_json() {
+    log_test "api: jupyter start/connect --json emitem eventos; connect mantém a ponte até ser encerrado"
+    setup_mount_env
+    local remote="$MT/proj"; mkdir -p "$remote"; jt_conf "$remote"
+    mkdir -p "$HOME/.cache/tnrx-connect"; touch "$(ctrl_sock)"
+
+    local out
+    out=$(TNRX_JUPYTER_START_POLL_SECS=0.2 "$TNRX_CONNECT" jupyter start --host user@srv --project "$remote" --json 2>/dev/null </dev/null)
+    local events
+    events=$(printf '%s\n' "$out" | python3 -c "import json,sys; print([json.loads(l)['event'] for l in sys.stdin if l.strip()])" 2>&1)
+    assert_contains "$events" "'launching'" "evento launching"
+    assert_contains "$events" "'waiting'" "evento waiting"
+    assert_contains "$events" "'ready']" "termina com ready"
+    local ready token
+    ready=$(printf '%s\n' "$out" | tail -1)
+    token=$(cat "$remote/.tnrx/jupyter/token")
+    assert_json "$ready" "(d['server']['job'], d['server']['token'] == '$token', d['server']['token_fixed'])" "('777', True, True)" "ready traz o servidor com a senha fixa"
+    assert_contains "$(printf '%s\n' "$out" | grep waiting | head -1)" '"phase":"queued"' "fase da fila"
+
+    TNRX_JUPYTER_POLL_SECS=0.1 TNRX_JUPYTER_LIVE_SECS=1 "$TNRX_CONNECT" jupyter connect --host user@srv --project "$remote" --json > "$MT/jout" 2>/dev/null </dev/null &
+    JPID=$!
+    wait_out '"event":"bridge"' && pass_test "evento bridge" || fail_test "sem evento bridge" "$(cat "$MT/jout")"
+    local bridge port
+    bridge=$(head -1 "$MT/jout")
+    port=$(sed -n 's/^JUPYTER_PORT=//p' "$HOME/.config/tnrx-connect/user@srv_proj.conf")
+    assert_json "$bridge" "(d['fixed_port'], d['server']['local_port'], d['server']['bridge_open'])" "(True, $port, True)" "ponte na porta fixa (gravada no .conf)"
+    out=$("$TNRX_CONNECT" jupyter list --json 2>/dev/null </dev/null)
+    assert_json "$out" "[s['bridge_open'] for h in d['hosts'] for p in h['projects'] for s in p['servers']][0]" "True" "list mostra a ponte aberta"
+    kill -TERM "$JPID"; wait "$JPID" 2>/dev/null
+    assert_contains "$(tail -1 "$MT/jout")" '"event":"closed","reason":"signal"' "encerrada: evento closed (signal)"
+    assert_contains "$(cat "$FAKE_STATE/ssh.fwd")" "cancel " "cancela o encaminhamento"
+
+    # a ponte fecha sozinha quando o Jupyter é encerrado (jupyter stop)
+    TNRX_JUPYTER_POLL_SECS=0.1 TNRX_JUPYTER_LIVE_SECS=1 "$TNRX_CONNECT" jupyter connect --host user@srv --project "$remote" --job 777 --json > "$MT/jout" 2>/dev/null </dev/null &
+    JPID=$!
+    wait_out '"event":"bridge"' || fail_test "sem ponte" "$(cat "$MT/jout")"
+    "$TNRX_CONNECT" jupyter stop 777 --host user@srv --json >/dev/null 2>&1 </dev/null
+    jt_wait_cmd_end || { kill -TERM "$JPID"; sleep 3; }
+    jt_wait_cmd_end && pass_test "ponte terminou com o Jupyter" || { fail_test "ponte não terminou"; kill -TERM "$JPID"; }
+    wait "$JPID" 2>/dev/null
+    assert_contains "$(tail -1 "$MT/jout")" '"reason":"server_stopped"' "evento closed (server_stopped)"
+
+    out=$("$TNRX_CONNECT" jupyter connect --host user@srv --project "$remote" --json 2>/dev/null </dev/null)
+    assert_json "$out" "(d['event'], d['code'])" "('error', 'no_server')" "sem Jupyter: erro no_server"
+    jt_stop_fake_tnrx; cleanup_mount_env
+}
+
+test_api_never_authenticates() {
+    log_test "api: sem conexão, os comandos --json falham com not_connected e nunca pedem senha/2FA"
+    setup_mount_env
+    local remote="$MT/proj"; mkdir -p "$remote"; jt_conf "$remote"
+    local out rc
+    out=$("$TNRX_CONNECT" jupyter start --host user@srv --project "$remote" --json 2>/dev/null </dev/null); rc=$?
+    assert_json "$out" "(d['event'], d['code'])" "('error', 'not_connected')" "start: not_connected"
+    [[ "$rc" == "3" ]] && pass_test "sai com 3 (sem conexão)" || fail_test "exit=$rc"
+    out=$("$TNRX_CONNECT" cluster cancel 1 --host user@srv --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['error']['code']" "not_connected" "cancel: not_connected"
+    out=$("$TNRX_CONNECT" jupyter list --json 2>/dev/null </dev/null)
+    assert_json "$out" "d['hosts'][0]['connected']" "False" "list: host sem conexão"
+    [[ ! -f "$(ctrl_sock)" ]] && pass_test "nenhuma conexão aberta" || fail_test "abriu conexão"
+    [[ ! -e "$remote/.tnrx/jupyter/launch.log" ]] && pass_test "nada iniciado no servidor" || fail_test "iniciou algo"
+    cleanup_mount_env
+}
+
 test_usage_lists_both_modes() {
     log_test "uso lista o modo mount e o modo rsync"
     setup_test_env
@@ -1008,16 +1623,24 @@ run_all_tests() {
     make_fakes
     test_usage_lists_both_modes
     test_mount_first_run
+    test_mount_command_returns_prompt
+    test_mount_is_idempotent
     test_mount_second_run_uses_saved_defaults
-    test_mount_refuses_same_folder_twice
     test_mount_refuses_non_empty_folder
     test_mount_rejects_relative_remote_path
     test_mount_refuses_home_dir
-    test_mount_recovers_after_killed_session
+    test_mount_failure_cleans_up
+    test_ssh_requires_mount
+    test_ssh_from_subfolder_and_master_lost
+    test_mount_recovers_after_rclone_crash
+    test_mount_recovers_while_busy
     test_mount_busy_unmount_keeps_state
+    test_umount_from_subfolder
+    test_umount_keeps_master_used_elsewhere
     test_mount_conf_name_collision
     test_mount_multiple_confs_same_folder
     test_mount_snapshot_history_restore
+    test_mount_auto_snapshots_without_terminal
     test_mount_snapshot_skips_big_files
     test_mount_snapshot_requires_mount
     test_mount_refresh_sends_hup
@@ -1031,10 +1654,23 @@ run_all_tests() {
     test_jupyter_auto_none
     test_jupyter_auto_multiple_servers_menu
     test_jupyter_auto_ignores_and_prunes_dead
+    test_jupyter_auto_ignores_stale_registry_on_same_port
     test_jupyter_auto_rejects_bad_registry_files
     test_jupyter_auto_bridge_closes_when_server_ends
     test_jupyter_auto_from_subfolder
     test_jupyter_auto_asks_when_no_session
+    test_jupyter_lists_other_projects
+    test_jupyter_start_new_with_fixed_url
+    test_jupyter_token_depends_on_local_secret
+    test_jupyter_start_failure_shows_log
+    test_jupyter_start_cancel_while_waiting
+    test_api_status_json
+    test_api_slurm_defaults_match_tnrx
+    test_api_cluster_json
+    test_api_cluster_cancel
+    test_api_jupyter_list_json
+    test_api_jupyter_start_connect_json
+    test_api_never_authenticates
     rm -rf "$FAKES_DIR"
 
     echo -e "\n${BLUE}📊 Total: $((TESTS_PASSED + TESTS_FAILED))  Passed: ${GREEN}$TESTS_PASSED${NC}  Failed: ${RED}$TESTS_FAILED${NC}"

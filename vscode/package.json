@@ -1,0 +1,107 @@
+{
+  "name": "tnrx",
+  "displayName": "TNRX",
+  "description": "Montagens do tnrx-connect, configuração Slurm, cluster e Jupyter dos projetos no servidor, na barra lateral.",
+  "version": "0.1.0",
+  "publisher": "tnrx",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Other"],
+  "extensionKind": ["ui"],
+  "main": "./src/extension.js",
+  "activationEvents": [],
+  "scripts": {
+    "test": "node --test test/",
+    "package": "python3 build-vsix.py"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "tnrx", "title": "TNRX", "icon": "media/tnrx.svg" }
+      ]
+    },
+    "views": {
+      "tnrx": [
+        { "id": "tnrx.mounts", "name": "Montagens" },
+        { "id": "tnrx.slurm", "name": "Configuração Slurm" },
+        { "id": "tnrx.cluster", "name": "Cluster" },
+        { "id": "tnrx.jupyter", "name": "Jupyter" }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "tnrx.mounts",
+        "contents": "Nenhuma pasta do tnrx-connect neste computador.\n[Montar uma pasta](command:tnrx.mountNew)\nO login (senha/2FA) é feito no terminal que abre."
+      }
+    ],
+    "commands": [
+      { "command": "tnrx.refresh", "title": "Atualizar", "category": "TNRX", "icon": "$(refresh)" },
+      { "command": "tnrx.mountNew", "title": "Montar uma pasta…", "category": "TNRX", "icon": "$(add)" },
+      { "command": "tnrx.mount", "title": "Montar (abre o terminal)", "category": "TNRX", "icon": "$(play)" },
+      { "command": "tnrx.reconnect", "title": "Reconectar (login no terminal)", "category": "TNRX", "icon": "$(key)" },
+      { "command": "tnrx.ssh", "title": "Abrir terminal do servidor", "category": "TNRX", "icon": "$(terminal)" },
+      { "command": "tnrx.unmount", "title": "Desmontar", "category": "TNRX", "icon": "$(debug-disconnect)" },
+      { "command": "tnrx.openFolder", "title": "Abrir pasta em nova janela", "category": "TNRX", "icon": "$(folder-opened)" },
+      { "command": "tnrx.openLog", "title": "Ver log da montagem", "category": "TNRX", "icon": "$(output)" },
+      { "command": "tnrx.openSlurm", "title": "Editar tnrx_slurm.conf", "category": "TNRX", "icon": "$(edit)" },
+      { "command": "tnrx.reconnectHost", "title": "Reconectar (login no terminal)", "category": "TNRX", "icon": "$(key)" },
+      { "command": "tnrx.jupyterTerminal", "title": "Jupyter no terminal (listar, iniciar, conectar)", "category": "TNRX", "icon": "$(terminal)" },
+      { "command": "tnrx.copyJupyterUrl", "title": "Copiar URL do Jupyter", "category": "TNRX", "icon": "$(copy)" }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "tnrx.mount", "when": "false" },
+        { "command": "tnrx.reconnect", "when": "false" },
+        { "command": "tnrx.ssh", "when": "false" },
+        { "command": "tnrx.unmount", "when": "false" },
+        { "command": "tnrx.openFolder", "when": "false" },
+        { "command": "tnrx.openLog", "when": "false" },
+        { "command": "tnrx.openSlurm", "when": "false" },
+        { "command": "tnrx.reconnectHost", "when": "false" },
+        { "command": "tnrx.jupyterTerminal", "when": "false" },
+        { "command": "tnrx.copyJupyterUrl", "when": "false" }
+      ],
+      "view/title": [
+        { "command": "tnrx.mountNew", "when": "view == tnrx.mounts", "group": "navigation@1" },
+        { "command": "tnrx.refresh", "when": "view =~ /^tnrx\\./", "group": "navigation@9" }
+      ],
+      "view/item/context": [
+        { "command": "tnrx.ssh", "when": "view == tnrx.mounts && viewItem == mount-ok", "group": "inline@1" },
+        { "command": "tnrx.reconnect", "when": "view == tnrx.mounts && viewItem == mount-disconnected", "group": "inline@1" },
+        { "command": "tnrx.mount", "when": "view == tnrx.mounts && viewItem =~ /^mount-(stale|unmounted)$/", "group": "inline@1" },
+        { "command": "tnrx.unmount", "when": "view == tnrx.mounts && viewItem =~ /^mount-(ok|disconnected|stale)$/", "group": "inline@2" },
+        { "command": "tnrx.openFolder", "when": "view == tnrx.mounts && viewItem =~ /^mount-(ok|disconnected)$/", "group": "1_open@1" },
+        { "command": "tnrx.openLog", "when": "view == tnrx.mounts && viewItem =~ /^mount-/", "group": "1_open@2" },
+        { "command": "tnrx.openSlurm", "when": "view == tnrx.slurm && viewItem == slurm-mount", "group": "inline@1" },
+        { "command": "tnrx.reconnectHost", "when": "view == tnrx.cluster && viewItem == cluster-host-disconnected", "group": "inline@1" },
+        { "command": "tnrx.jupyterTerminal", "when": "view == tnrx.jupyter && viewItem == jupyter-project", "group": "inline@1" },
+        { "command": "tnrx.copyJupyterUrl", "when": "view == tnrx.jupyter && viewItem == jupyter-server-bridged", "group": "inline@1" }
+      ]
+    },
+    "configuration": {
+      "title": "TNRX",
+      "properties": {
+        "tnrx.connectPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Caminho do `tnrx-connect`. Vazio: procura no `PATH` e em `~/.local/bin`."
+        },
+        "tnrx.refreshInterval": {
+          "type": "number",
+          "default": 30,
+          "minimum": 5,
+          "markdownDescription": "Segundos entre atualizações de **Montagens** e **Jupyter** (o Jupyter só é consultado com o bloco visível). Montar/desmontar aparece na hora, sem esperar."
+        },
+        "tnrx.clusterRefreshInterval": {
+          "type": "number",
+          "default": 300,
+          "minimum": 0,
+          "markdownDescription": "Segundos entre consultas ao **Cluster** (`sinfo`, com o bloco visível). `0` = só no botão Atualizar. O `sinfo` roda no headnode compartilhado: evite valores baixos."
+        }
+      }
+    }
+  }
+}

@@ -2,10 +2,12 @@
 
 # tnrx-connect: companion do `tnrx` que roda no SEU LAPTOP (não no servidor).
 #
-# Modo principal (mount): monta a pasta do projeto do servidor, via rclone/SFTP,
-# na pasta onde o comando foi rodado, e abre um terminal SSH no servidor. Só
-# existe uma cópia dos arquivos (no servidor); o laptop enxerga por um mount
-# com cache em disco. Um git "sombra" tira snapshots pra permitir rollback.
+# Modo principal (mount): `mount` monta a pasta do projeto do servidor, via
+# rclone/SFTP, na pasta onde o comando foi rodado; a montagem não depende de
+# nenhum terminal e só termina com `umount`. `ssh` abre um terminal no servidor
+# (e só confere se está montado). Só existe uma cópia dos arquivos (no servidor);
+# o laptop enxerga por um mount com cache em disco. Um git "sombra" tira
+# snapshots pra permitir rollback.
 #
 # Modo alternativo (rsync): `tnrx-connect rsync|sync|pull|init` — sincroniza uma
 # cópia local com o servidor via rsync (.tnrx_connect na pasta do projeto).
@@ -36,6 +38,9 @@ RCLONE_EXIT_WAIT_SECS="${TNRX_RCLONE_EXIT_WAIT_SECS:-120}"
 
 DEBUG=0
 
+# Caminho absoluto deste script (o loop de snapshots roda como um processo próprio dele)
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+
 # Preenchidos por load_config() (modo rsync) ou pelos prompts (modo mount)
 HOST=""
 REMOTE_PATH=""
@@ -59,13 +64,13 @@ CONF_CACHE_MAX_SIZE=""
 CONF_DIR_CACHE_TIME=""
 CONF_SNAPSHOT_INTERVAL=""
 CONF_SNAPSHOT_MAX_FILE_MB=""
+CONF_JUPYTER_PORT=""
 LOCK_DIR=""
-LOCK_OWNED=false
+LOCK_PID=""
 OLD_MOUNT_PID=""
+OLD_SNAP_PID=""
 MOUNT_PID=""
 SNAP_PID=""
-MOUNT_STARTED=false
-KEEP_LOCK=false
 SHADOW_DIR=""
 MOUNT_LOG=""
 
@@ -362,14 +367,34 @@ EOF
     echo "✅ $CONFIG_FILE criado (REMOTE_PATH=$remote_path)."
 }
 
-do_uninstall() {
-    local link="$HOME/.local/bin/tnrx-connect"
-    if [ -L "$link" ]; then
-        rm "$link"
-        echo "✅ Removido: $link"
+# --- Instalação (install.sh, na mesma pasta que este script) ---
+
+TNRX_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+do_version() {
+    local commit date source
+    commit=$(sed -n 's/^COMMIT=//p' "$TNRX_DIR/VERSION" 2>/dev/null)
+    date=$(sed -n 's/^DATE=//p' "$TNRX_DIR/VERSION" 2>/dev/null)
+    source=$(sed -n 's/^SOURCE=//p' "$TNRX_DIR/VERSION" 2>/dev/null)
+    if [ -n "$commit" ]; then
+        echo "tnrx-connect $commit ($date), de $source"
     else
-        echo "ℹ️  Nenhum symlink de tnrx-connect encontrado em $link."
+        echo "tnrx-connect rodando direto de $TNRX_DIR (não instalado pelo install.sh)"
     fi
+}
+
+do_update_dev() {
+    # Instala a cópia de desenvolvimento ($1, ou a pasta atual) no lugar da
+    # instalação, com as mudanças ainda não commitadas.
+    local src="$PWD" arg extra=()
+    for arg in "$@"; do
+        case "$arg" in
+            --choose) extra+=(--choose) ;;
+            *) src="$arg" ;;
+        esac
+    done
+    [ -f "$src/install.sh" ] || { echo "❌ $src não é o repositório do tnrx. Uso: tnrx-connect update-dev [pasta do repositório]" >&2; exit 1; }
+    exec bash "$src/install.sh" --from "$src" "${extra[@]}"
 }
 
 # ============================================================================
@@ -404,9 +429,13 @@ pid_is_tnrx() {
     pid_alive "$1" && ps -p "$1" -o command= 2>/dev/null | grep -q 'tnrx-connect'
 }
 
+pid_is_rclone() {
+    pid_alive "$1" && ps -p "$1" -o command= 2>/dev/null | grep -q 'rclone'
+}
+
 # --- Config por host_pasta (~/.config/tnrx-connect/<host>_<pasta>.conf) ---
 
-CONF_KEYS="HOST REMOTE_PATH LOCAL_DIR LAST_USED CACHE_MAX_SIZE DIR_CACHE_TIME SNAPSHOT_INTERVAL SNAPSHOT_MAX_FILE_MB"
+CONF_KEYS="HOST REMOTE_PATH LOCAL_DIR LAST_USED CACHE_MAX_SIZE DIR_CACHE_TIME SNAPSHOT_INTERVAL SNAPSHOT_MAX_FILE_MB JUPYTER_PORT"
 
 conf_get() {
     ( unset $CONF_KEYS; source "$1" >/dev/null 2>&1; printf '%s' "${!2}" )
@@ -429,6 +458,7 @@ load_optional_from_conf() {
     CONF_DIR_CACHE_TIME=$(conf_get "$1" DIR_CACHE_TIME)
     CONF_SNAPSHOT_INTERVAL=$(conf_get "$1" SNAPSHOT_INTERVAL)
     CONF_SNAPSHOT_MAX_FILE_MB=$(conf_get "$1" SNAPSHOT_MAX_FILE_MB)
+    CONF_JUPYTER_PORT=$(conf_get "$1" JUPYTER_PORT)
 }
 
 set_effective() {
@@ -474,6 +504,7 @@ save_conf() {
         emit_opt DIR_CACHE_TIME "$CONF_DIR_CACHE_TIME"
         emit_opt SNAPSHOT_INTERVAL "$CONF_SNAPSHOT_INTERVAL"
         emit_opt SNAPSHOT_MAX_FILE_MB "$CONF_SNAPSHOT_MAX_FILE_MB"
+        emit_opt JUPYTER_PORT "$CONF_JUPYTER_PORT"
     } > "$CONF_FILE.tmp" && mv "$CONF_FILE.tmp" "$CONF_FILE"
 }
 
@@ -577,27 +608,27 @@ lock_dir_for() { printf '%s/locks/%s.d' "$DATA_DIR" "$(hash_of "$1")"; }
 lock_get() { sed -n "s/^$2=//p" "$1/info" 2>/dev/null | head -1; }
 
 write_lock_info() {
-    printf 'PID=%s\nHOST=%s\nREMOTE_PATH=%s\nLOCAL_DIR=%s\nID=%s\nSTART=%s\nMOUNT_PID=%s\n' \
-        "$$" "$HOST" "$REMOTE_PATH" "$LOCAL_DIR" "$ID" "$LOCK_START" "$MOUNT_PID" > "$LOCK_DIR/info"
+    # PID = execução do `tnrx-connect mount` que ainda está montando (vazio depois que
+    # a montagem fica pronta: a partir daí ela não depende de nenhum terminal).
+    printf 'PID=%s\nHOST=%s\nREMOTE_PATH=%s\nLOCAL_DIR=%s\nID=%s\nSTART=%s\nMOUNT_PID=%s\nSNAP_PID=%s\n' \
+        "$LOCK_PID" "$HOST" "$REMOTE_PATH" "$LOCAL_DIR" "$ID" "$LOCK_START" "$MOUNT_PID" "$SNAP_PID" > "$LOCK_DIR/info"
+}
+
+lock_alive() {
+    # A montagem de uma pasta está viva enquanto o rclone dela roda e a pasta está
+    # montada; ou enquanto um `tnrx-connect mount` ainda está montando.
+    local ld="$1"
+    [ -d "$ld" ] || return 1
+    pid_is_tnrx "$(lock_get "$ld" PID)" && return 0
+    pid_is_rclone "$(lock_get "$ld" MOUNT_PID)" && is_mounted "$(lock_get "$ld" LOCAL_DIR)"
 }
 
 refuse_locked() {
     local ld="$1"
-    echo "❌ Já existe uma sessão do tnrx-connect ativa nesta pasta:" >&2
+    echo "❌ Outra execução do tnrx-connect está montando esta pasta agora:" >&2
     echo "   pasta: $LOCAL_DIR" >&2
     echo "   host:  $(lock_get "$ld" HOST):$(lock_get "$ld" REMOTE_PATH)" >&2
     echo "   PID:   $(lock_get "$ld" PID) (desde $(fmt_epoch "$(lock_get "$ld" START)"))" >&2
-    echo "   Encerre-a (saia do terminal SSH dela) antes de abrir outra nesta pasta." >&2
-}
-
-check_lock_free() {
-    local ld
-    ld=$(lock_dir_for "$LOCAL_DIR")
-    if [ -d "$ld" ] && pid_is_tnrx "$(lock_get "$ld" PID)"; then
-        refuse_locked "$ld"
-        return 1
-    fi
-    return 0
 }
 
 acquire_lock() {
@@ -605,12 +636,13 @@ acquire_lock() {
     local ld
     ld=$(lock_dir_for "$LOCAL_DIR")
     if [ -d "$ld" ]; then
-        if pid_is_tnrx "$(lock_get "$ld" PID)"; then
+        if lock_alive "$ld"; then
             refuse_locked "$ld"
             return 1
         fi
         STALE_LOCK_FOUND=true
         OLD_MOUNT_PID=$(lock_get "$ld" MOUNT_PID)
+        OLD_SNAP_PID=$(lock_get "$ld" SNAP_PID)
         rm -rf "$ld"
     fi
     if ! mkdir "$ld" 2>/dev/null; then
@@ -618,7 +650,7 @@ acquire_lock() {
         return 1
     fi
     LOCK_DIR="$ld"
-    LOCK_OWNED=true
+    LOCK_PID=$$
     LOCK_START=$(now_epoch)
     MOUNT_PID="$OLD_MOUNT_PID"
     write_lock_info
@@ -630,9 +662,9 @@ warn_remote_in_use() {
         [ -f "$info" ] || continue
         ld=$(dirname "$info")
         [ "$(lock_get "$ld" LOCAL_DIR)" == "$LOCAL_DIR" ] && continue
-        pid_is_tnrx "$(lock_get "$ld" PID)" || continue
+        lock_alive "$ld" || continue
         if [ "$(lock_get "$ld" HOST)" == "$HOST" ] && [ "$(lock_get "$ld" REMOTE_PATH)" == "$REMOTE_PATH" ]; then
-            echo "⚠️  $HOST:$REMOTE_PATH já está montado em $(lock_get "$ld" LOCAL_DIR) por outra sessão." >&2
+            echo "⚠️  $HOST:$REMOTE_PATH já está montado em $(lock_get "$ld" LOCAL_DIR)." >&2
             echo "   Dois mounts da mesma pasta remota têm caches separados e podem mostrar versões diferentes." >&2
         fi
     done
@@ -643,8 +675,51 @@ other_sessions_on_host() {
     for info in "$DATA_DIR"/locks/*.d/info; do
         [ -f "$info" ] || continue
         ld=$(dirname "$info")
-        pid_is_tnrx "$(lock_get "$ld" PID)" || continue
+        lock_alive "$ld" || continue
         [ "$(lock_get "$ld" HOST)" == "$HOST" ] && return 0
+    done
+    return 1
+}
+
+master_in_use() {
+    # Fechar a conexão mestra derruba tudo que passa por ela: uma montagem viva,
+    # um terminal `tnrx-connect ssh` ou uma ponte do Jupyter (exceto este processo).
+    other_sessions_on_host && return 0
+    local procs
+    procs=$(ps -Ao pid=,ppid=,command= 2>/dev/null | awk -v me="$$" '$1 != me && $2 != me')
+    printf '%s\n' "$procs" | grep -qF -- "-t -o ControlPath=$CTRL_PATH " && return 0
+    local b pid
+    for b in "$DATA_DIR"/bridges/*; do
+        [ -f "$b" ] || continue
+        pid=$(basename "$b")
+        [ "$pid" == "$$" ] && continue
+        if ! pid_is_tnrx "$pid"; then rm -f "$b"; continue; fi
+        [ "$(sed -n 1p "$b" 2>/dev/null)" == "$HOST" ] && return 0
+    done
+    return 1
+}
+
+close_master_if_unused() {
+    [ -n "$HOST" ] && [ -n "$CTRL_PATH" ] || return 0
+    master_in_use && return 0
+    if ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+        echo "🔒 Conexão autenticada com $HOST encerrada."
+    fi
+}
+
+find_session_root() {
+    # Ecoa a pasta (a dada ou uma acima dela) que tem configuração do modo mount.
+    # Com $2=alive, só aceita uma pasta que está montada agora.
+    local d="$1" want="$2" f
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+        f=$(find_confs_for_dir "$d" | head -1)
+        if [ -n "$f" ]; then
+            if [ "$want" != "alive" ] || lock_alive "$(lock_dir_for "$d")"; then
+                printf '%s' "$d"
+                return 0
+            fi
+        fi
+        d=$(dirname "$d")
     done
     return 1
 }
@@ -696,7 +771,9 @@ unmount_dir() {
     done
     echo "⚠️  Não consegui desmontar $dir (em uso?). Quem está usando a pasta:" >&2
     if command -v fuser >/dev/null 2>&1; then
-        fuser -mv "$dir" >&2 2>&1
+        # A linha "root kernel mount" sai sempre, pra qualquer ponto de montagem — não é
+        # um bloqueio real, só ruído; filtrada pra não confundir com o que de fato segura.
+        fuser -mv "$dir" 2>&1 | grep -v ' kernel *mount ' >&2
     elif command -v lsof >/dev/null 2>&1; then
         lsof +f -- "$dir" 2>/dev/null | head -10 >&2
     fi
@@ -704,9 +781,11 @@ unmount_dir() {
 }
 
 wait_rclone_exit() {
-    # Não mata o rclone: ele precisa terminar de enviar as escritas pendentes.
-    local pid="$1" i announced=false
-    for ((i = 0; i < RCLONE_EXIT_WAIT_SECS; i++)); do
+    # Não mata o rclone por padrão: ele precisa terminar de enviar as escritas
+    # pendentes. $2 permite um limite menor que RCLONE_EXIT_WAIT_SECS (usado por
+    # recover_previous, que depois mata o processo se o limite curto estourar).
+    local pid="$1" max="${2:-$RCLONE_EXIT_WAIT_SECS}" i announced=false
+    for ((i = 0; i < max; i++)); do
         pid_alive "$pid" || return 0
         if [ "$announced" == "false" ]; then
             echo "⏳ Aguardando o rclone (PID $pid) terminar de enviar escritas pendentes..."
@@ -718,20 +797,30 @@ wait_rclone_exit() {
 }
 
 recover_previous() {
-    # A sessão anterior nesta pasta terminou sem limpar (lock velho).
+    # A sessão anterior nesta pasta terminou sem limpar (lock velho): ela já morreu de
+    # verdade (o PID do dono não está mais vivo), então o que sobrou é só gente lendo o
+    # mount antigo (um terminal esquecido, o Nautilus, um editor) — não tem mais ninguém
+    # "usando" a pasta no sentido de uma sessão ativa. Por isso a desmontagem aqui é
+    # preguiçosa (lazy): desanexa na hora e deixa os leitores antigos terminarem sozinhos,
+    # sem que o usuário precise caçar e fechar cada janela primeiro.
     if is_mounted "$LOCAL_DIR"; then
         echo "⚠️  A pasta ainda estava montada por uma sessão anterior; desmontando..."
-        if ! unmount_dir "$LOCAL_DIR"; then
-            KEEP_LOCK=true
-            echo "❌ Feche o que usa a pasta e rode: tnrx-connect unmount" >&2
+        if ! unmount_dir "$LOCAL_DIR" "lazy"; then
+            echo "❌ Feche o que usa a pasta e rode: tnrx-connect umount -f" >&2
             return 1
         fi
     fi
     if [ -n "$OLD_MOUNT_PID" ] && pid_alive "$OLD_MOUNT_PID"; then
-        if ! wait_rclone_exit "$OLD_MOUNT_PID"; then
-            KEEP_LOCK=true
-            echo "❌ O rclone anterior (PID $OLD_MOUNT_PID) ainda está enviando escritas pendentes. Tente de novo em instantes." >&2
-            return 1
+        # A pasta já foi desanexada (lazy) — se o processo antigo continua vivo, é porque
+        # algo externo (Nautilus, outro terminal) ainda segura um descritor velho, o que
+        # pode nunca se soltar sozinho. Isso não é motivo pra travar a sessão nova: o
+        # cache em disco é persistente e o próximo mount (start_mount, logo em seguida)
+        # retoma dali qualquer envio que ainda estivesse pendente — então é seguro dar um
+        # empurrão no processo órfão em vez de ficar esperando por esse leitor.
+        if ! wait_rclone_exit "$OLD_MOUNT_PID" "${TNRX_RECOVER_KILL_GRACE_SECS:-5}"; then
+            echo "ℹ️  A sessão anterior ainda tinha algo com a pasta aberta; encerrando o processo antigo (PID $OLD_MOUNT_PID) — nada se perde, o cache é retomado agora." >&2
+            kill "$OLD_MOUNT_PID" 2>/dev/null
+            wait_rclone_exit "$OLD_MOUNT_PID" 5 || kill -9 "$OLD_MOUNT_PID" 2>/dev/null
         fi
     fi
     OLD_MOUNT_PID=""
@@ -759,9 +848,8 @@ start_mount() {
         debug_print rclone "${RCLONE_ARGS[@]}"
     fi
 
-    RCLONE_SFTP_SSH="$ssh_cmd" rclone "${RCLONE_ARGS[@]}" </dev/null >/dev/null 2>&1 &
+    RCLONE_SFTP_SSH="$ssh_cmd" detach rclone "${RCLONE_ARGS[@]}" </dev/null >/dev/null 2>&1
     MOUNT_PID=$!
-    MOUNT_STARTED=true
     write_lock_info
 
     max=$((MOUNT_WAIT_SECS * 5))
@@ -770,7 +858,6 @@ start_mount() {
         if ! pid_alive "$MOUNT_PID"; then
             echo "❌ O rclone terminou antes de montar. Fim do log ($MOUNT_LOG):" >&2
             tail -5 "$MOUNT_LOG" 2>/dev/null >&2
-            MOUNT_STARTED=false
             MOUNT_PID=""
             return 1
         fi
@@ -779,7 +866,6 @@ start_mount() {
     echo "❌ A montagem não ficou pronta em ${MOUNT_WAIT_SECS}s. Fim do log ($MOUNT_LOG):" >&2
     tail -5 "$MOUNT_LOG" 2>/dev/null >&2
     kill "$MOUNT_PID" 2>/dev/null
-    MOUNT_STARTED=false
     MOUNT_PID=""
     return 1
 }
@@ -840,17 +926,6 @@ snapshot_once() {
     shadow_git commit -q -m "$msg" >/dev/null 2>&1
 }
 
-snapshot_loop() {
-    # Encerra sozinho quando a sessão que o criou deixa de existir (ex.: kill -9,
-    # que não roda o cleanup); senão ficaria órfão tirando snapshots pra sempre.
-    local parent="$1"
-    while kill -0 "$parent" 2>/dev/null; do
-        sleep "$EFF_SNAPSHOT_INTERVAL"
-        kill -0 "$parent" 2>/dev/null || break
-        snapshot_once >> "$MOUNT_LOG" 2>&1
-    done
-}
-
 snapshot_retry() {
     local msg="$1" n
     for n in 1 2 3; do
@@ -861,59 +936,71 @@ snapshot_retry() {
     return 1
 }
 
-# --- Ciclo de vida da sessão ---
+# --- Ciclo de vida da montagem ---
+#
+# A montagem é independente de qualquer terminal: `mount` sobe o rclone e o loop de
+# snapshots desacoplados (nova sessão, sem tty) e devolve o prompt; ela continua
+# até `umount`. `ssh`, `refresh`, `snapshot`, `restore`, `history` só verificam
+# se a pasta está montada.
 
-cleanup_mount() {
-    trap - EXIT INT TERM HUP
-    cd / 2>/dev/null
-    local unmounted_ok=true
-
-    if [ -n "$SNAP_PID" ]; then
-        kill "$SNAP_PID" 2>/dev/null
-        wait "$SNAP_PID" 2>/dev/null
-        SNAP_PID=""
-    fi
-
-    if [ "$MOUNT_STARTED" == "true" ]; then
-        if is_mounted "$LOCAL_DIR"; then
-            snapshot_retry "snapshot final $(date '+%F %T')" >/dev/null 2>&1
-            echo "🔌 Desmontando $LOCAL_DIR..."
-            if ! unmount_dir "$LOCAL_DIR"; then
-                unmounted_ok=false
-                KEEP_LOCK=true
-                echo "   A montagem continua ativa. Feche o que usa a pasta e rode: tnrx-connect unmount $LOCAL_DIR" >&2
-            fi
-        fi
-        if [ "$unmounted_ok" == "true" ] && [ -n "$MOUNT_PID" ]; then
-            if ! wait_rclone_exit "$MOUNT_PID"; then
-                unmounted_ok=false
-                KEEP_LOCK=true
-                echo "   O rclone (PID $MOUNT_PID) segue enviando escritas pendentes; elas ficam no cache e não se perdem." >&2
-            fi
-        fi
-    fi
-
-    if [ "$LOCK_OWNED" == "true" ]; then
-        if [ "$KEEP_LOCK" == "true" ]; then
-            write_lock_info
-        else
-            rm -rf "$LOCK_DIR"
-            LOCK_OWNED=false
-        fi
-    fi
-
-    # A conexão SSH mestra é compartilhada entre sessões do mesmo host: só fecha
-    # quando não sobrou outra sessão viva usando ela (e o mount não depende mais dela).
-    if [ "$unmounted_ok" == "true" ] && [ -n "$HOST" ] && [ -n "$CTRL_PATH" ] && ! other_sessions_on_host; then
-        if ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
-            echo "🔒 Conexão autenticada com $HOST encerrada."
-        fi
+detach() {
+    # Roda "$@" em background fora da sessão/grupo do terminal: fechar a aba ou um
+    # Ctrl-C nela não chega ao processo. Sem setsid (macOS), ignora HUP/INT.
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$@" &
+    else
+        ( trap '' HUP INT; exec "$@" ) &
     fi
 }
 
-on_signal() {
-    cleanup_mount
-    exit 130
+start_snapshot_loop() {
+    detach bash "$SELF" __snapshot-loop "$LOCAL_DIR" "$MOUNT_PID" </dev/null >>"$MOUNT_LOG" 2>&1
+    SNAP_PID=$!
+}
+
+stop_snapshot_loop() {
+    local pid="$1" i
+    pid_is_tnrx "$pid" || return 0
+    kill "$pid" 2>/dev/null
+    for ((i = 0; i < 20; i++)); do
+        pid_alive "$pid" || return 0
+        sleep 0.1
+    done
+}
+
+do_snapshot_loop() {
+    # Uso interno (__snapshot-loop <pasta> <pid do rclone>): tira um snapshot a cada
+    # SNAPSHOT_INTERVAL segundos enquanto a montagem existir; termina sozinho quando o
+    # rclone morre ou a pasta é desmontada.
+    trap '' HUP INT
+    load_session_for_dir "$1" || exit 1
+    local mpid="$2" elapsed=0
+    while pid_alive "$mpid" && is_mounted "$LOCAL_DIR"; do
+        sleep 1
+        elapsed=$((elapsed + 1))
+        if [ "$elapsed" -ge "$EFF_SNAPSHOT_INTERVAL" ]; then
+            elapsed=0
+            snapshot_once
+        fi
+    done
+}
+
+mount_abort() {
+    # Só roda se `mount` falhar no meio. Se sobrou um rclone vivo (o nosso ou o de uma
+    # sessão anterior que não deu pra recuperar), o lock fica, como lock velho, pra
+    # próxima execução recuperar; senão é apagado.
+    trap - EXIT INT TERM HUP
+    stop_snapshot_loop "$SNAP_PID"
+    SNAP_PID=""
+    if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+        if [ -n "$MOUNT_PID" ] && pid_alive "$MOUNT_PID"; then
+            LOCK_PID=""
+            write_lock_info
+        else
+            rm -rf "$LOCK_DIR"
+            close_master_if_unused
+        fi
+    fi
 }
 
 check_local_dir_ready() {
@@ -921,7 +1008,7 @@ check_local_dir_ready() {
     # tem não importa; é o conteúdo LOCAL que ficaria escondido).
     local entries count
     if is_mounted "$LOCAL_DIR"; then
-        echo "❌ $LOCAL_DIR já é um ponto de montagem que não é de uma sessão do tnrx-connect." >&2
+        echo "❌ $LOCAL_DIR já é um ponto de montagem que não é do tnrx-connect." >&2
         return 1
     fi
     entries=$(ls -A "$LOCAL_DIR" 2>/dev/null)
@@ -937,18 +1024,38 @@ check_local_dir_ready() {
     fi
 }
 
-do_connect() {
+reconnect_mounted() {
+    # A pasta já está montada: só garante que a conexão mestra está viva. Se ela caiu
+    # (rede), reautentica; o rclone volta a usá-la nas próximas operações.
+    local root="$1"
+    load_session_for_dir "$root" || exit 1
+    compute_ctrl_path
+    if ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+        echo "✅ $LOCAL_DIR já está montada ($HOST:$REMOTE_PATH)."
+        return 0
+    fi
+    echo "⚠️  $LOCAL_DIR está montada, mas a conexão com $HOST caiu; reautenticando..."
+    ensure_master
+    echo "✅ Conexão restabelecida: a pasta volta a sincronizar."
+}
+
+do_mount() {
     check_mount_deps || exit 1
     LOCAL_DIR=$(pwd -P)
+    mkdir -p "$CONF_DIR" "$DATA_DIR"
+
+    local root
+    if root=$(find_session_root "$LOCAL_DIR" alive); then
+        reconnect_mounted "$root"
+        return 0
+    fi
     case "$LOCAL_DIR" in
         /|"$HOME")
             echo "❌ Rode em uma pasta de projeto dedicada (não em / nem na sua home): ela vira o ponto de montagem." >&2
             exit 1
             ;;
     esac
-    mkdir -p "$CONF_DIR" "$DATA_DIR"
-    check_lock_free || exit 1
-    # Com lock velho (sessão que caiu) a pasta pode ainda ter o mount antigo:
+    # Com lock velho (montagem que caiu) a pasta pode ainda ter o mount antigo:
     # recover_previous cuida disso mais adiante; a checagem final vale nos dois casos.
     if [ ! -d "$(lock_dir_for "$LOCAL_DIR")" ]; then
         check_local_dir_ready || exit 1
@@ -976,32 +1083,75 @@ do_connect() {
 
     cd / || exit 1
     acquire_lock || exit 1
-    trap cleanup_mount EXIT
-    trap on_signal INT TERM HUP
+    trap mount_abort EXIT
+    trap 'exit 130' INT TERM HUP
     save_conf
     warn_remote_in_use
 
     ensure_master
 
     if [ "$STALE_LOCK_FOUND" == "true" ]; then
+        stop_snapshot_loop "$OLD_SNAP_PID"
         recover_previous || exit 1
     fi
     check_local_dir_ready || exit 1
 
     echo "📦 Montando $HOST:$REMOTE_PATH em $LOCAL_DIR ..."
     start_mount || exit 1
+    start_snapshot_loop
+    LOCK_PID=""
+    write_lock_info
+    trap - EXIT INT TERM HUP
+    # Senha fixa do Jupyter deste projeto (vale também pra um Jupyter iniciado à mão no servidor).
+    push_jupyter_token "$REMOTE_PATH"
 
-    snapshot_loop "$$" >> "$MOUNT_LOG" 2>&1 &
-    SNAP_PID=$!
-
-    echo "✅ Montado. Cache persistente: $DATA_DIR/$ID/ (log: $MOUNT_LOG)"
-    echo "📁 Em OUTRA aba local (esta vira o terminal do servidor): cd '$LOCAL_DIR' && claude"
-    echo "⚠️  Qualquer terminal que já estava DENTRO desta pasta antes de montar (inclusive este, depois de sair)"
+    echo "✅ Montado. A pasta continua montada até você rodar: tnrx-connect umount"
+    echo "   Cache persistente: $DATA_DIR/$ID/ (log: $MOUNT_LOG)"
+    echo "🖥️  Terminal do servidor: tnrx-connect ssh   |   Claude Code/editor: cd '$LOCAL_DIR' && claude"
+    echo "⚠️  Qualquer terminal que já estava DENTRO desta pasta antes de montar (inclusive este)"
     echo "   continua vendo a pasta vazia de antes: rode 'cd .' (ou reabra o terminal) pra enxergar o mount."
     echo "📸 Snapshots a cada ${EFF_SNAPSHOT_INTERVAL}s — veja: tnrx-connect history | tnrx-connect restore <id>"
+}
 
-    echo "🖥️  Conectando em $HOST..."
-    run_cmd ssh -t -o ControlPath="$CTRL_PATH" "$HOST" "cd '$REMOTE_PATH' && exec \$SHELL -l"
+do_ssh() {
+    # Terminal SSH no servidor, na pasta remota que corresponde à pasta local atual.
+    # Não monta nada: só confere que a pasta está montada e a conexão está viva.
+    local start="${1:-$(pwd -P)}" root sub target
+    if ! root=$(find_session_root "$start"); then
+        echo "❌ Nenhuma pasta do tnrx-connect aqui ($start)." >&2
+        echo "   Monte o projeto primeiro: tnrx-connect mount (ou só tnrx-connect, que monta e abre o terminal)." >&2
+        exit 1
+    fi
+    load_session_for_dir "$root" || exit 1
+    if ! lock_alive "$LOCK_DIR"; then
+        echo "❌ $LOCAL_DIR não está montada. Monte com: cd '$LOCAL_DIR' && tnrx-connect mount" >&2
+        exit 1
+    fi
+    compute_ctrl_path
+    if ! ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+        echo "❌ A conexão autenticada com $HOST caiu (rede?)." >&2
+        echo "   Rode tnrx-connect mount (pede senha/2FA de novo e a pasta volta a sincronizar)." >&2
+        exit 1
+    fi
+    sub="${start#"$root"}"
+    target="$REMOTE_PATH$sub"
+    echo "🖥️  Conectando em $HOST ($target)..."
+    run_cmd ssh -t -o ControlPath="$CTRL_PATH" "$HOST" "cd $(printf '%q' "$target") && exec \$SHELL -l"
+    if lock_alive "$LOCK_DIR"; then
+        echo "ℹ️  $LOCAL_DIR continua montada. Para desmontar: tnrx-connect umount"
+    else
+        # A pasta foi desmontada enquanto este terminal estava aberto.
+        close_master_if_unused
+    fi
+}
+
+do_connect() {
+    # Sem argumentos: monta (se ainda não estiver montada) e abre o terminal SSH.
+    # Sair do terminal NÃO desmonta.
+    local start
+    start=$(pwd -P)
+    do_mount
+    do_ssh "$start"
 }
 
 # --- Subcomandos que operam sobre a pasta (atual ou informada) ---
@@ -1066,7 +1216,7 @@ do_restore() {
         exit 1
     fi
     if ! is_mounted "$LOCAL_DIR"; then
-        echo "❌ A pasta não está montada; restaurar escreve nela. Inicie uma sessão com 'tnrx-connect'." >&2
+        echo "❌ A pasta não está montada; restaurar escreve nela. Monte com 'tnrx-connect mount'." >&2
         exit 1
     fi
     if ! shadow_git rev-parse --verify --quiet "$commit^{commit}" >/dev/null 2>&1; then
@@ -1088,19 +1238,31 @@ do_restore() {
 }
 
 do_status() {
+    if [ "$1" == "--json" ]; then
+        JSON=true
+        mkdir -p "$CONF_DIR" "$DATA_DIR"
+        do_status_json
+        return 0
+    fi
     load_session_for_dir "$1" || exit 1
-    local pid mounted="não" cache_dir count last
+    local mpid cache_dir count last
     echo "Pasta:     $LOCAL_DIR"
     echo "Config:    $CONF_FILE"
     echo "Servidor:  $HOST:$REMOTE_PATH"
-    pid=$(lock_get "$LOCK_DIR" PID)
-    if pid_is_tnrx "$pid"; then
-        echo "Sessão:    ativa (PID $pid, desde $(fmt_epoch "$(lock_get "$LOCK_DIR" START)"))"
+    mpid=$(lock_get "$LOCK_DIR" MOUNT_PID)
+    if lock_alive "$LOCK_DIR"; then
+        echo "Montada:   sim (rclone PID $mpid, desde $(fmt_epoch "$(lock_get "$LOCK_DIR" START)"))"
+        compute_ctrl_path
+        if ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
+            echo "Conexão:   ativa"
+        else
+            echo "Conexão:   caiu — rode 'tnrx-connect mount' pra reautenticar"
+        fi
+    elif is_mounted "$LOCAL_DIR"; then
+        echo "Montada:   sim, mas o rclone não está rodando — rode 'tnrx-connect mount' pra recuperar"
     else
-        echo "Sessão:    inativa"
+        echo "Montada:   não"
     fi
-    is_mounted "$LOCAL_DIR" && mounted="sim"
-    echo "Montada:   $mounted"
     cache_dir="$DATA_DIR/$ID/vfs-$(hash_of "$REMOTE_PATH")"
     if [ -d "$cache_dir" ]; then
         echo "Cache:     $cache_dir ($(du -sh "$cache_dir" 2>/dev/null | cut -f1), limite $EFF_CACHE_MAX_SIZE)"
@@ -1118,11 +1280,10 @@ do_status() {
 
 do_refresh() {
     load_session_for_dir "" || exit 1
-    local pid mpid
-    pid=$(lock_get "$LOCK_DIR" PID)
+    local mpid
     mpid=$(lock_get "$LOCK_DIR" MOUNT_PID)
-    if ! pid_is_tnrx "$pid" || ! pid_alive "$mpid"; then
-        echo "❌ Não há sessão ativa nesta pasta." >&2
+    if ! lock_alive "$LOCK_DIR" || ! pid_alive "$mpid"; then
+        echo "❌ A pasta não está montada. Monte com: tnrx-connect mount" >&2
         exit 1
     fi
     kill -HUP "$mpid"
@@ -1130,7 +1291,9 @@ do_refresh() {
 }
 
 do_unmount() {
-    local a dir_arg="" lazy="" ld pid mpid
+    # Desmonta a pasta: snapshot final, desmontagem, espera o rclone enviar o que está
+    # pendente e fecha a conexão mestra se nada mais a usa.
+    local a dir_arg="" lazy="" ld mpid spid root have_conf=false
     for a in "$@"; do
         case "$a" in
             -f|--force) lazy="lazy" ;;
@@ -1141,40 +1304,66 @@ do_unmount() {
         echo "❌ Pasta inválida: ${dir_arg:-.}" >&2
         exit 1
     }
+    # Rodado de uma subpasta da montagem: desmonta a pasta montada acima dela.
+    if [ -z "$dir_arg" ] && root=$(find_session_root "$LOCAL_DIR"); then
+        LOCAL_DIR="$root"
+    fi
+    if [ -n "$(find_confs_for_dir "$LOCAL_DIR" | head -1)" ]; then
+        load_session_for_dir "$LOCAL_DIR" || exit 1
+        have_conf=true
+    fi
     cd / || exit 1
     ld=$(lock_dir_for "$LOCAL_DIR")
     LOCK_DIR="$ld"
-    pid=$(lock_get "$ld" PID)
-    if pid_is_tnrx "$pid"; then
-        echo "❌ Há uma sessão ativa nesta pasta (PID $pid). Saia do terminal SSH dela pra desmontar normalmente." >&2
+    if pid_is_tnrx "$(lock_get "$ld" PID)"; then
+        echo "❌ Esta pasta está sendo montada agora (PID $(lock_get "$ld" PID)); espere terminar." >&2
         exit 1
     fi
+    mpid=$(lock_get "$ld" MOUNT_PID)
+    spid=$(lock_get "$ld" SNAP_PID)
+    [ -d "$ld" ] && HOST=$(lock_get "$ld" HOST)
+    [ -n "$HOST" ] && compute_ctrl_path
+
     if ! is_mounted "$LOCAL_DIR"; then
         echo "ℹ️  $LOCAL_DIR não está montada."
-        [ -d "$ld" ] && rm -rf "$ld"
+        stop_snapshot_loop "$spid"
+        if [ -n "$mpid" ] && pid_alive "$mpid" && ! wait_rclone_exit "$mpid"; then
+            echo "⚠️  O rclone (PID $mpid) ainda está enviando escritas pendentes; elas ficam no cache." >&2
+            return 0
+        fi
+        rm -rf "$ld"
+        close_master_if_unused
         return 0
     fi
     if [ ! -d "$ld" ] && ! is_rclone_mount "$LOCAL_DIR"; then
         echo "❌ $LOCAL_DIR está montada, mas não parece um mount do rclone/tnrx-connect; não vou mexer." >&2
         exit 1
     fi
-    mpid=$(lock_get "$ld" MOUNT_PID)
-    HOST=$(lock_get "$ld" HOST)
+
+    stop_snapshot_loop "$spid"
+    [ "$have_conf" == "true" ] && snapshot_retry "snapshot final $(date '+%F %T')" >/dev/null 2>&1
+    echo "🔌 Desmontando $LOCAL_DIR..."
     if ! unmount_dir "$LOCAL_DIR" "$lazy"; then
-        echo "❌ Ainda em uso. Saia da pasta (cd ~) e feche o que a usa; ou use --force (desmontagem preguiçosa)." >&2
+        echo "❌ Ainda em uso. Feche o que aparece acima (ou saia da pasta com cd ~), ou use: tnrx-connect umount ${dir_arg:-.} -f" >&2
+        echo "   O -f desmonta na hora, sem esperar essas janelas fecharem, e não afeta os arquivos." >&2
+        echo "   A pasta continua montada; nada foi perdido." >&2
+        # Continua montada: os snapshots automáticos voltam a rodar.
+        if [ "$have_conf" == "true" ] && pid_alive "$mpid" && [ -d "$ld" ]; then
+            MOUNT_PID="$mpid"
+            start_snapshot_loop
+            sed -i.bak "s/^SNAP_PID=.*/SNAP_PID=$SNAP_PID/" "$ld/info" && rm -f "$ld/info.bak"
+        fi
         exit 1
     fi
     echo "✅ $LOCAL_DIR desmontada."
-    if [ -n "$mpid" ] && pid_alive "$mpid"; then
-        wait_rclone_exit "$mpid" || echo "⚠️  O rclone (PID $mpid) ainda está enviando escritas pendentes; elas ficam no cache." >&2
+    if [ -n "$mpid" ] && pid_alive "$mpid" && ! wait_rclone_exit "$mpid"; then
+        # O lock fica (velho): o próximo mount nesta pasta retoma o envio pelo cache.
+        # A conexão mestra também fica: o rclone ainda precisa dela pra enviar.
+        echo "⚠️  O rclone (PID $mpid) segue enviando escritas pendentes; elas ficam no cache e não se perdem." >&2
+        return 0
     fi
     rm -rf "$ld"
-    if [ -n "$HOST" ]; then
-        compute_ctrl_path
-        if ! other_sessions_on_host; then
-            ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1 && echo "🔒 Conexão autenticada com $HOST encerrada."
-        fi
-    fi
+    close_master_if_unused
 }
 
 # --- Jupyter: ponte local -> nó de computação pela conexão SSH mestra ---
@@ -1219,15 +1408,25 @@ parse_jupyter_target() {
     [[ "$J_PORT" =~ ^[0-9]+$ ]] && [ "$J_PORT" -ge 1 ] && [ "$J_PORT" -le 65535 ] || { echo "❌ Porta inválida: '$J_PORT'." >&2; return 1; }
 }
 
+register_bridge() {
+    # Marca este `tnrx-connect jupyter` como usuário da conexão mestra de $HOST, pra um
+    # umount (ou outra ponte) não fechá-la debaixo dele. Linhas: host, nó, porta, porta local
+    # (as três últimas depois que a ponte abre; `jupyter list` mostra quais estão abertas).
+    mkdir -p "$DATA_DIR/bridges"
+    printf '%s\n%s\n%s\n%s\n' "$HOST" "$J_NODE" "$J_PORT" "$LOCAL_PORT" > "$DATA_DIR/bridges/$$"
+}
+
 cleanup_jupyter() {
     trap - EXIT INT TERM HUP
+    rm -f "$DATA_DIR/bridges/$$"
+    if [ -n "$FWD_SPEC" ] && [ "$JSON_STREAM" == "true" ]; then
+        json_event closed ",\"reason\":$(json_str "${BRIDGE_END_REASON:-signal}")"
+    fi
     if [ -n "$FWD_SPEC" ]; then
         ssh -O cancel -L "$FWD_SPEC" -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1
         FWD_SPEC=""
     fi
-    if [ "$MASTER_OWNED" == "true" ] && ! other_sessions_on_host; then
-        ssh -O exit -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1 && echo "🔒 Conexão autenticada com $HOST encerrada."
-    fi
+    [ "$MASTER_OWNED" == "true" ] && close_master_if_unused
 }
 
 jupyter_defaults() {
@@ -1249,18 +1448,20 @@ jupyter_defaults() {
 }
 
 open_bridge() {
-    # Usa J_NODE/J_PORT/HOST/CTRL_PATH. Tenta a mesma porta local; se ocupada, a próxima livre.
-    local lp="$J_PORT" tries=0
+    # Usa J_NODE/J_PORT/HOST/CTRL_PATH. Começa pela porta $1 (padrão: a mesma do
+    # servidor); se ocupada, a próxima livre.
+    local lp="${1:-$J_PORT}" first="${1:-$J_PORT}" tries=0
     FWD_SPEC=""
     while [ "$tries" -lt 50 ]; do
         if ! port_in_use "$lp" && ssh -O forward -L "localhost:$lp:$J_NODE:$J_PORT" -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; then
             FWD_SPEC="localhost:$lp:$J_NODE:$J_PORT"
             LOCAL_PORT="$lp"
+            [ -f "$DATA_DIR/bridges/$$" ] && register_bridge
             return 0
         fi
         lp=$((lp + 1)); tries=$((tries + 1))
     done
-    echo "❌ Não consegui abrir uma porta local (tentei $J_PORT a $((J_PORT + 49))). A conexão com $HOST está ativa?" >&2
+    echo "❌ Não consegui abrir uma porta local (tentei $first a $((first + 49))). A conexão com $HOST está ativa?" >&2
     return 1
 }
 
@@ -1269,9 +1470,78 @@ print_bridge() {
     local label
     label="$J_NODE.$(host_label "$HOST").localhost"
     echo "🔗 Ponte aberta: localhost:$LOCAL_PORT  ->  $J_NODE:$J_PORT  (via $HOST)"
-    [ "$LOCAL_PORT" != "$J_PORT" ] && echo "   (a porta local $J_PORT já estava em uso; usando $LOCAL_PORT)"
     echo "🌐 Abra no navegador:  http://$label:$LOCAL_PORT$1"
     echo "   Programas que não resolvem *.localhost (ex.: VS Code): http://127.0.0.1:$LOCAL_PORT$1"
+}
+
+# --- Senha fixa e porta local fixa por projeto (pra o VS Code lembrar do servidor) ---
+
+sha256_hex() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi
+}
+
+jupyter_token() {
+    # Senha fixa do Jupyter de um projeto: hash de um segredo aleatório deste laptop
+    # (~/.config/tnrx-connect/jupyter.secret, 600, criado uma vez) + host + pasta remota.
+    # Sempre a mesma pro mesmo projeto, e ninguém consegue deduzi-la sem o segredo.
+    local f="$CONF_DIR/jupyter.secret"
+    if [ ! -s "$f" ]; then
+        mkdir -p "$CONF_DIR"
+        ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$f.tmp" && mv "$f.tmp" "$f" )
+    fi
+    printf '%s|%s|%s' "$(cat "$f")" "$1" "$2" | sha256_hex | cut -c1-48
+}
+
+push_jupyter_token() {
+    # Grava a senha fixa do projeto $1 no servidor, em .tnrx/jupyter/token (600; a pasta
+    # .tnrx tem .gitignore próprio). É de lá que o `tnrx uvslurm jupyter` a lê. A senha vai
+    # pelo stdin, nunca pela linha de comando (visível pra outros usuários no `ps`).
+    local remote='[ -d "$1" ] || exit 1; umask 077; d="$1/.tnrx"; mkdir -p "$d/jupyter" || exit 1
+[ -e "$d/.gitignore" ] || printf "*\n" > "$d/.gitignore"
+cat > "$d/jupyter/token"'
+    jupyter_token "$HOST" "$1" | ssh -o ControlPath="$CTRL_PATH" -o BatchMode=yes "$HOST" \
+        "bash -c $(printf '%q' "$remote") bash $(printf '%q' "$1")" >/dev/null 2>&1
+}
+
+conf_for_remote() {
+    # .conf (deste host) cuja pasta remota é $1
+    local f
+    for f in "$CONF_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$(conf_get "$f" HOST)" == "$HOST" ] && [ "$(conf_get "$f" REMOTE_PATH)" == "$1" ] && { printf '%s' "$f"; return 0; }
+    done
+    return 1
+}
+
+known_projects() {
+    # Pastas remotas deste host que este laptop conhece (os .conf), começando por $1.
+    local f p
+    printf '%s\n' "$1"
+    for f in "$CONF_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$(conf_get "$f" HOST)" == "$HOST" ] || continue
+        p=$(conf_get "$f" REMOTE_PATH)
+        [ -n "$p" ] && [ "$p" != "$1" ] && printf '%s\n' "$p"
+    done | awk '!seen[$0]++'
+}
+
+conf_set() {
+    # Troca (ou acrescenta) só a linha KEY=valor de um .conf.
+    local f="$1"
+    { grep -v "^$2=" "$f" 2>/dev/null; printf '%s=%q\n' "$2" "$3"; } > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+project_local_port() {
+    # Porta local fixa do projeto $1 (guardada no .conf como JUPYTER_PORT): a URL do
+    # VS Code fica sempre a mesma. Projeto sem .conf neste laptop: a porta do servidor.
+    local f p
+    if f=$(conf_for_remote "$1"); then
+        p=$(conf_get "$f" JUPYTER_PORT)
+        [ -z "$p" ] && p=$((18000 + $(hash_of "$HOST|$1") % 1000))
+        printf '%s' "$p"
+    else
+        printf '%s' "$J_PORT"
+    fi
 }
 
 jupyter_alive() {
@@ -1289,23 +1559,34 @@ bridge_wait() {
         if [ "$watch" == "watch" ] && [ $(( $(now_epoch) - last )) -ge "$live" ]; then
             last=$(now_epoch)
             if ! jupyter_alive "$J_NODE" "$J_PORT"; then
-                echo "🛑 O Jupyter em $J_NODE:$J_PORT terminou; a ponte foi fechada."
+                BRIDGE_END_REASON=server_stopped
+                echo "🛑 O Jupyter em $J_NODE:$J_PORT terminou; a ponte foi fechada." >&2
                 return 0
             fi
         fi
     done
+    BRIDGE_END_REASON=connection_lost
     echo "⚠️  A conexão SSH com $HOST foi encerrada; a ponte caiu." >&2
 }
 
 discover_jupyters() {
-    # Lê, no servidor, os registros .tnrx/jupyter/*.env da pasta do projeto ($1) e
-    # devolve os que ainda respondem, um por linha: TNRXJ|nó|porta|token|job|início.
+    # Lê, no servidor, os registros .tnrx/jupyter/*.env das pastas de projeto dadas e
+    # devolve os que ainda respondem, um por linha: TNRXJ|nó|porta|token|job|início|projeto.
     # Registros de servidores parados há mais de 1 dia são apagados. O arquivo é
-    # lido como texto (nunca executado) e só vale se for do próprio usuário.
-    ssh -o ControlPath="$CTRL_PATH" "$HOST" "bash -s -- $(printf '%q' "$1")" 2>/dev/null <<'REMOTE'
-proj="$1"; reg="$proj/.tnrx/jupyter"
-[ -d "$reg" ] || exit 0
+    # lido como texto (nunca executado) e só vale se for do próprio usuário. Para o
+    # mesmo nó:porta, só o registro mais recente.
+    local args="" p
+    for p in "$@"; do args+=" $(printf '%q' "$p")"; done
+    ssh -o ControlPath="$CTRL_PATH" "$HOST" "bash -s --$args" 2>/dev/null <<'REMOTE'
 now=$(date +%s); t=""; command -v timeout >/dev/null 2>&1 && t="timeout 3"
+# Jobs vivos do usuário: um registro cujo job já saiu da fila é velho, mesmo que outro
+# Jupyter tenha subido depois no mesmo nó:porta. Sem squeue, vale só o teste da porta.
+jobs=""
+command -v squeue >/dev/null 2>&1 && jobs=$(squeue -h -u "$USER" -o %i 2>/dev/null) && jobs=" $(printf '%s' "$jobs" | tr '\n' ' ') "
+{
+for proj in "$@"; do
+reg="$proj/.tnrx/jupyter"
+[ -d "$reg" ] || continue
 for f in "$reg"/*.env; do
     [ -f "$f" ] && [ -O "$f" ] || continue
     node=$(sed -n 's/^NODE=//p' "$f" | head -1); port=$(sed -n 's/^PORT=//p' "$f" | head -1)
@@ -1316,12 +1597,17 @@ for f in "$reg"/*.env; do
     case "$token" in ""|*[!0-9a-fA-F]*) continue ;; esac
     case "$job" in *[!0-9A-Za-z_-]*) job="" ;; esac
     case "$started" in ""|*[!0-9]*) started=$now ;; esac
-    if $t bash -c "exec 3<>/dev/tcp/$node/$port" 2>/dev/null; then
-        echo "TNRXJ|$node|$port|$token|$job|$started"
+    alive=false
+    $t bash -c "exec 3<>/dev/tcp/$node/$port" 2>/dev/null && alive=true
+    case "$job" in ""|*[!0-9_]*) ;; *) [ -n "$jobs" ] && [[ "$jobs" != *" $job "* ]] && alive=false ;; esac
+    if [ "$alive" == "true" ]; then
+        echo "TNRXJ|$node|$port|$token|$job|$started|$proj"
     elif [ $((now - started)) -gt 86400 ]; then
         rm -f "$f"
     fi
 done
+done
+} | sort -t'|' -k6 -rn | awk -F'|' '!seen[$2 "|" $3]++'
 exit 0
 REMOTE
 }
@@ -1335,16 +1621,109 @@ fmt_age() {
     fi
 }
 
+# --- Iniciar um Jupyter novo no servidor, a partir do laptop ---
+
+J_LAUNCH_PID=""
+J_PICKED=""
+
+launch_cancel() {
+    trap - INT TERM HUP
+    [ "$JSON_STREAM" == "true" ] || echo
+    if [ -n "$J_LAUNCH_PID" ]; then
+        if [ "$JSON_STREAM" == "true" ]; then json_event cancelled ""; else echo "🛑 Cancelando o Jupyter que estava sendo iniciado..."; fi
+        # O tnrx foi iniciado numa sessão própria (setsid): o grupo inteiro (tnrx + srun) recebe o TERM.
+        ssh -o ControlPath="$CTRL_PATH" -o BatchMode=yes "$HOST" "kill -TERM -- -$J_LAUNCH_PID" >/dev/null 2>&1
+        J_LAUNCH_PID=""
+    fi
+    exit 130
+}
+
+launch_jupyter() {
+    # Roda `tnrx uvslurm jupyter lab` na pasta $1 do servidor, fora de qualquer terminal
+    # (nohup + setsid no headnode), e espera o Jupyter registrar que está no ar.
+    # Deixa a linha do registro em J_PICKED. Ctrl-C enquanto espera cancela o job.
+    local project="$1" out ts tag msg phase st alive log waited=0 shown=-1 started
+    push_jupyter_token "$project" || json_fail prepare_failed "Não consegui preparar $HOST:$project (a pasta existe no servidor?)."
+    out=$(ssh -o ControlPath="$CTRL_PATH" "$HOST" "bash -s -- $(printf '%q' "$project")" 2>/dev/null <<'REMOTE'
+cd "$1" 2>/dev/null || { echo "TNRXERR|a pasta $1 não existe no servidor."; exit 0; }
+t=$(command -v tnrx 2>/dev/null)
+[ -z "$t" ] && [ -x "$HOME/.local/bin/tnrx" ] && t="$HOME/.local/bin/tnrx"
+[ -n "$t" ] || { echo "TNRXERR|o tnrx não foi encontrado no servidor (veja docs/tnrx.md, Instalação)."; exit 0; }
+command -v setsid >/dev/null 2>&1 || { echo "TNRXERR|setsid não encontrado no servidor."; exit 0; }
+umask 077; mkdir -p .tnrx/jupyter
+ts=$(date +%s)
+nohup setsid "$t" uvslurm jupyter lab > .tnrx/jupyter/launch.log 2>&1 < /dev/null &
+echo "TNRXL|$!|$ts"
+REMOTE
+)
+    out=$(printf '%s\n' "$out" | grep -E '^TNRX(L|ERR)\|' | tail -1)
+    IFS='|' read -r tag J_LAUNCH_PID ts <<< "$out"
+    if [ "$tag" != "TNRXL" ]; then
+        msg="${J_LAUNCH_PID:-sem resposta do servidor}"
+        J_LAUNCH_PID=""
+        json_fail launch_failed "Não consegui iniciar o Jupyter: $msg"
+    fi
+    case "$J_LAUNCH_PID$ts" in ""|*[!0-9]*) J_LAUNCH_PID=""; json_fail launch_failed "Resposta inesperada do servidor." ;; esac
+    trap launch_cancel INT TERM HUP
+    if [ "$JSON_STREAM" == "true" ]; then
+        json_event launching ",\"host\":$(json_str "$HOST"),\"project\":$(json_str "$project"),\"log\":$(json_str "$project/.tnrx/jupyter/launch.log")"
+    else
+        echo "🚀 Iniciando o Jupyter em $HOST:$project (tnrx uvslurm jupyter lab). Ctrl-C cancela."
+    fi
+
+    started=$(now_epoch)
+    while true; do
+        J_PICKED=$(discover_jupyters "$project" | grep '^TNRXJ|' |
+            awk -F'|' -v ts="$ts" '$6 >= ts' | sort -t'|' -k6 -rn | head -1)
+        [ -n "$J_PICKED" ] && break
+        st=$(ssh -o ControlPath="$CTRL_PATH" -o BatchMode=yes "$HOST" \
+            "kill -0 $J_LAUNCH_PID 2>/dev/null && echo ALIVE; tail -n 20 $(printf '%q' "$project/.tnrx/jupyter/launch.log") 2>/dev/null" 2>/dev/null)
+        alive=false
+        [ "$(printf '%s\n' "$st" | head -1)" == "ALIVE" ] && alive=true
+        log=$(printf '%s\n' "$st" | grep -v '^ALIVE$')
+        if [ "$alive" != "true" ]; then
+            # Pode ter registrado entre a busca e esta checagem.
+            J_PICKED=$(discover_jupyters "$project" | grep '^TNRXJ|' |
+                awk -F'|' -v ts="$ts" '$6 >= ts' | sort -t'|' -k6 -rn | head -1)
+            [ -n "$J_PICKED" ] && break
+            J_LAUNCH_PID=""
+            json_fail tnrx_failed "O tnrx terminou sem subir o Jupyter. Fim do log ($project/.tnrx/jupyter/launch.log):
+$(printf '%s\n' "$log" | tail -8 | sed 's/^/   /')"
+        fi
+        waited=$(( $(now_epoch) - started ))
+        if [ $((waited / 10)) -ne "$shown" ]; then
+            shown=$((waited / 10))
+            if printf '%s\n' "$log" | grep -q 'queued and waiting'; then phase=queued; msg="job na fila do Slurm"
+            elif printf '%s\n' "$log" | grep -qE 'has been allocated|Nó:'; then phase=starting; msg="job alocado, Jupyter subindo"
+            else phase=preparing; msg="preparando o job"
+            fi
+            if [ "$JSON_STREAM" == "true" ]; then
+                json_event waiting ",\"phase\":$(json_str "$phase"),\"elapsed\":$waited"
+            else
+                echo "⏳ $msg... (${waited}s)"
+            fi
+        fi
+        sleep "${TNRX_JUPYTER_START_POLL_SECS:-3}" &
+        wait $!
+    done
+    J_LAUNCH_PID=""
+    trap 'exit 130' INT TERM HUP
+    [ "$JSON_STREAM" == "true" ] || echo "✅ Jupyter no ar."
+}
+
 do_jupyter() {
     mkdir -p "$CONF_DIR" "$DATA_DIR"
     LOCAL_DIR=$(pwd -P)
     jupyter_defaults
 
-    if [ $# -gt 0 ]; then
-        do_jupyter_manual "$@"
-    else
-        do_jupyter_auto
-    fi
+    case "$1" in
+        list)    shift; do_jupyter_list "$@" ;;
+        start)   shift; do_jupyter_start "$@" ;;
+        connect) shift; do_jupyter_connect "$@" ;;
+        stop)    shift; do_cancel_job "$@" ;;
+        "")      do_jupyter_auto ;;
+        *)       do_jupyter_manual "$@" ;;
+    esac
 }
 
 do_jupyter_manual() {
@@ -1364,8 +1743,10 @@ do_jupyter_manual() {
     ensure_master
     trap cleanup_jupyter EXIT
     trap 'exit 130' INT TERM HUP
+    register_bridge
 
     open_bridge || exit 1
+    [ "$LOCAL_PORT" != "$J_PORT" ] && echo "   (a porta local $J_PORT já estava em uso; usando $LOCAL_PORT)"
     print_bridge "$J_PATH"
     echo "⏳ A ponte fica ativa enquanto este comando rodar. Ctrl-C fecha."
     echo "   Se der 'Connection refused': confira nó e porta e se o Jupyter ainda está rodando."
@@ -1373,7 +1754,8 @@ do_jupyter_manual() {
 }
 
 do_jupyter_auto() {
-    # Descobre os Jupyters do projeto que estão no ar e abre a ponte para o escolhido.
+    # Lista os Jupyters no ar (do projeto atual e dos outros projetos deste host que este
+    # laptop conhece) e conecta no escolhido, ou inicia um novo no projeto atual.
     local project
     if [ "$JUP_FROM_SESSION" == "true" ]; then
         HOST="$DEF_HOST"; project="$DEF_REMOTE"
@@ -1389,49 +1771,597 @@ do_jupyter_auto() {
         /*) ;;
         *) echo "❌ A pasta do projeto precisa ser um caminho absoluto (começando com /)." >&2; exit 1 ;;
     esac
+    [ "$project" != "/" ] && project="${project%/}"
     compute_ctrl_path
 
-    echo "🔎 Procurando servidores Jupyter no ar em $HOST:$project ..."
+    echo "🔎 Procurando servidores Jupyter no ar em $HOST ..."
     ensure_master
     trap cleanup_jupyter EXIT
     trap 'exit 130' INT TERM HUP
+    register_bridge
 
-    local -a lines=()
+    local -a projects=() lines=()
     local l
+    while IFS= read -r l; do projects+=("$l"); done < <(known_projects "$project")
     while IFS= read -r l; do
         [ -n "$l" ] && lines+=("$l")
-    done < <(discover_jupyters "$project" | grep '^TNRXJ|' | sort -t'|' -k6 -rn)
+    done < <(discover_jupyters "${projects[@]}" | grep '^TNRXJ|' | sort -t'|' -k6 -rn)
 
+    local name ans pick i=1 tag node port token job started proj mark
+    name=$(basename "$project")
+    J_PICKED=""
     if [ "${#lines[@]}" -eq 0 ]; then
-        echo "❌ Nenhum servidor Jupyter no ar neste projeto ($project)." >&2
-        echo "   Inicie um no servidor, na pasta do projeto: tnrx uvslurm jupyter lab" >&2
-        exit 1
-    fi
-
-    local pick=1 i=1 tag node port token job started
-    if [ "${#lines[@]}" -gt 1 ]; then
-        echo "Servidores Jupyter no ar (mais recente primeiro):"
+        echo "Nenhum servidor Jupyter no ar em $HOST (nos projetos que este laptop conhece)."
+        printf 'Iniciar um novo Jupyter em %s (%s)? [S/n]: ' "$name" "$project" >&2
+        if ! read -r ans; then ans=n; echo >&2; fi
+        case "$ans" in
+            ""|s|S|y|Y) launch_jupyter "$project" ;;
+            *)
+                echo "   Para iniciar um depois: tnrx-connect jupyter (ou, no servidor, tnrx uvslurm jupyter lab)." >&2
+                exit 1
+                ;;
+        esac
+    else
+        echo "Servidores Jupyter no ar em $HOST (mais recente primeiro):"
         for l in "${lines[@]}"; do
-            IFS='|' read -r tag node port token job started <<< "$l"
-            echo "  [$i] $node:$port  (job ${job:-?}, há $(fmt_age "$started"))"
+            IFS='|' read -r tag node port token job started proj <<< "$l"
+            mark=""
+            [ "$proj" == "$project" ] && mark="  ← este projeto"
+            echo "  [$i] $(basename "$proj")  $node:$port  (job ${job:-?}, há $(fmt_age "$started"))$mark"
             i=$((i + 1))
         done
+        echo "  [n] Iniciar um novo Jupyter em $name ($project)"
         pick=$(ask "Conectar em qual" "1")
         case "$pick" in
+            n|N) launch_jupyter "$project" ;;
             ''|*[!0-9]*) pick=1 ;;
         esac
-        if [ "$pick" -lt 1 ] || [ "$pick" -gt "${#lines[@]}" ]; then
-            echo "❌ Opção inválida: $pick." >&2
-            exit 1
+        if [ -z "$J_PICKED" ]; then
+            if [ "$pick" -lt 1 ] || [ "$pick" -gt "${#lines[@]}" ]; then
+                echo "❌ Opção inválida: $pick." >&2
+                exit 1
+            fi
+            J_PICKED="${lines[$((pick - 1))]}"
         fi
     fi
-    IFS='|' read -r tag node port token job started <<< "${lines[$((pick - 1))]}"
-    J_NODE="$node"; J_PORT="$port"
+    connect_picked
+}
 
-    open_bridge || exit 1
+connect_picked() {
+    # Abre a ponte pro Jupyter em J_PICKED, na porta local fixa do projeto dele.
+    local tag node port token job started proj want conf
+    IFS='|' read -r tag node port token job started proj <<< "$J_PICKED"
+    J_NODE="$node"; J_PORT="$port"
+    want=$(project_local_port "$proj")
+    open_bridge "$want" 2>/dev/null || json_fail bridge_failed "Não consegui abrir uma porta local a partir de $want (a conexão com $HOST está ativa?)."
+    if [ "$JSON_STREAM" == "true" ]; then
+        conf=$(conf_for_remote "$proj") && [ -z "$(conf_get "$conf" JUPYTER_PORT)" ] && conf_set "$conf" JUPYTER_PORT "$LOCAL_PORT"
+        json_event bridge ",\"host\":$(json_str "$HOST"),\"project\":$(json_str "$proj"),\"fixed_port\":$(json_bool "$([ "$LOCAL_PORT" == "$want" ] && echo true)"),\"label_url\":$(json_str "http://$J_NODE.$(host_label "$HOST").localhost:$LOCAL_PORT/lab?token=$token"),\"server\":$(server_json "$J_PICKED")"
+        bridge_wait watch 2>/dev/null
+        exit 0
+    fi
+    if conf=$(conf_for_remote "$proj"); then
+        if [ -z "$(conf_get "$conf" JUPYTER_PORT)" ]; then
+            conf_set "$conf" JUPYTER_PORT "$LOCAL_PORT"
+        elif [ "$LOCAL_PORT" != "$want" ]; then
+            echo "⚠️  A porta fixa deste projeto ($want) está em uso no laptop; usando $LOCAL_PORT só desta vez (a URL do VS Code muda)."
+        fi
+    elif [ "$LOCAL_PORT" != "$J_PORT" ]; then
+        echo "   (a porta local $J_PORT já estava em uso; usando $LOCAL_PORT)"
+    fi
     print_bridge "/lab?token=$token"
+    if [ "$token" == "$(jupyter_token "$HOST" "$proj")" ] && conf_for_remote "$proj" >/dev/null; then
+        echo "📌 Esta URL é fixa para $(basename "$proj"): no VS Code, configure uma vez (Existing Jupyter Server) e depois só escolha o servidor."
+    else
+        echo "ℹ️  Este Jupyter não usa a senha fixa do projeto (foi iniciado antes dela, ou o tnrx do servidor está desatualizado); a URL vale só para ele."
+    fi
     echo "⏳ A ponte fica ativa enquanto o Jupyter estiver no ar (job ${job:-?}). Ctrl-C fecha a ponte; o Jupyter continua no servidor."
+    echo "   Para encerrar o Jupyter: no terminal do servidor (tnrx-connect ssh), scancel ${job:-<job>}"
     bridge_wait watch
+}
+
+# --- Interface para ferramentas (--json): extensão do VS Code e afins ---
+#
+# Com --json nenhum comando pergunta nada nem autentica: sem conexão mestra viva o
+# erro é not_connected (a autenticação, com 2FA, é sempre num terminal: tnrx-connect
+# mount). Comandos de resposta única imprimem um objeto {"v":1,"ok":...}; os de longa
+# duração (jupyter start/connect) imprimem um evento JSON por linha. Contrato completo
+# em docs/tnrx-connect-json.md.
+
+JSON=false
+JSON_STREAM=false
+BRIDGE_END_REASON=""
+
+# Padrões do tnrx (servidor) quando o tnrx_slurm.conf não define a chave. Um teste
+# confere que continuam iguais aos DEFAULT_* do script tnrx.
+SLURM_KEYS="PARTITION GPUS CPUS MEM TIME"
+SLURM_DEFAULT_PARTITION="l40s"
+SLURM_DEFAULT_GPUS="1"
+SLURM_DEFAULT_CPUS="2"
+SLURM_DEFAULT_MEM="4G"
+SLURM_DEFAULT_TIME="00:10:00"
+
+json_str() {
+    local s="$1"
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}; s=${s//$'\r'/\\r}
+    s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')
+    printf '"%s"' "$s"
+}
+
+json_num() { if [[ "$1" =~ ^-?[0-9]+$ ]]; then printf '%s' "$1"; else printf 'null'; fi; }
+
+json_bool() { if [ "$1" == "true" ]; then printf 'true'; else printf 'false'; fi; }
+
+json_str_or_null() { if [ -n "$1" ]; then json_str "$1"; else printf 'null'; fi; }
+
+json_event() {
+    # $1 = nome do evento, $2 = campos extras já em JSON (",..." ou vazio)
+    printf '{"v":1,"event":%s%s}\n' "$(json_str "$1")" "$2"
+}
+
+json_fail() {
+    # $1 código, $2 mensagem, $3 código de saída (padrão 1). Em modo JSON também vai
+    # pro stdout (objeto de erro, ou evento "error" nos comandos de eventos).
+    if [ "$JSON_STREAM" == "true" ]; then
+        json_event error ",\"code\":$(json_str "$1"),\"message\":$(json_str "$2")"
+    elif [ "$JSON" == "true" ]; then
+        printf '{"v":1,"ok":false,"error":{"code":%s,"message":%s}}\n' "$(json_str "$1")" "$(json_str "$2")"
+    fi
+    echo "❌ $2" >&2
+    exit "${3:-1}"
+}
+
+master_alive() { ssh -O check -o ControlPath="$CTRL_PATH" "$HOST" >/dev/null 2>&1; }
+
+connect_master() {
+    # Em modo JSON nunca autentica: exige a conexão que o `mount` abriu.
+    compute_ctrl_path
+    if [ "$JSON" == "true" ]; then
+        master_alive || json_fail not_connected "Sem conexão com $HOST. Rode tnrx-connect mount numa pasta deste host (pede senha/2FA)." 3
+    else
+        ensure_master
+    fi
+}
+
+all_hosts() {
+    # Hosts de todos os .conf, sem repetir.
+    local f
+    for f in "$CONF_DIR"/*.conf; do
+        [ -f "$f" ] && conf_get "$f" HOST && echo
+    done | awk 'NF && !seen[$0]++'
+}
+
+mounted_hosts() {
+    # Hosts que têm alguma pasta montada agora (pelo lock: a mesma pasta local pode ter
+    # .conf de outros hosts, que não estão montados).
+    local f d ld
+    for f in "$CONF_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        d=$(conf_get "$f" LOCAL_DIR)
+        [ -n "$d" ] || continue
+        ld=$(lock_dir_for "$d")
+        lock_alive "$ld" && lock_get "$ld" HOST && echo
+    done | awk 'NF && !seen[$0]++'
+}
+
+parse_api_opts() {
+    # Opções comuns: --json, --host H, --project P, --job J. O resto fica em API_ARGS.
+    API_HOST=""; API_PROJECT=""; API_JOB=""; API_ARGS=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) JSON=true ;;
+            --host) API_HOST="$2"; shift ;;
+            --project) API_PROJECT="$2"; shift ;;
+            --job) API_JOB="$2"; shift ;;
+            *) API_ARGS+=("$1") ;;
+        esac
+        shift
+    done
+}
+
+resolve_api_host() {
+    # --host, ou o host da pasta montada onde o comando foi rodado.
+    if [ -n "$API_HOST" ]; then HOST="$API_HOST"; return 0; fi
+    LOCAL_DIR=$(pwd -P)
+    jupyter_defaults
+    if [ "$JUP_FROM_SESSION" == "true" ]; then
+        HOST="$DEF_HOST"
+        [ -z "$API_PROJECT" ] && API_PROJECT="$DEF_REMOTE"
+        return 0
+    fi
+    json_fail usage "Informe --host (ou rode dentro de uma pasta montada)." 2
+}
+
+read_quick() {
+    # Lê um arquivo da pasta montada sem travar se a conexão estiver ruim.
+    if command -v timeout >/dev/null 2>&1; then timeout 3 cat -- "$1" 2>/dev/null; else cat -- "$1" 2>/dev/null; fi
+}
+
+slurm_json() {
+    # Valores efetivos do tnrx_slurm.conf (arquivo + padrões do tnrx) de uma pasta montada.
+    local file="$1/tnrx_slurm.conf" content="" exists=false line k v out="" key def from
+    if content=$(read_quick "$file") && [ -e "$file" ]; then exists=true; fi
+    for key in $SLURM_KEYS; do
+        v=""; from=false
+        while IFS= read -r line; do
+            line="${line%%#*}"
+            [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+            k="${BASH_REMATCH[2]}"
+            [ "$k" == "$key" ] || continue
+            v="${BASH_REMATCH[3]}"
+            v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+            v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+            from=true
+        done <<< "$content"
+        def="SLURM_DEFAULT_$key"
+        [ "$from" == "true" ] || v="${!def}"
+        out+="${out:+,}$(json_str "$key"):{\"value\":$(json_str "$v"),\"from_file\":$(json_bool "$from")}"
+    done
+    printf '{"file":%s,"exists":%s,"values":{%s}}' "$(json_str "$file")" "$(json_bool "$exists")" "$out"
+}
+
+do_status_json() {
+    # Todas as pastas que este laptop conhece, com estado da montagem e da conexão.
+    local f d ld rp mine state connected mpid since first=true host checked="|" alive="|" h
+    printf '{"v":1,"ok":true,"mounts":['
+    for f in "$CONF_DIR"/*.conf; do
+        [ -f "$f" ] || continue
+        d=$(conf_get "$f" LOCAL_DIR)
+        HOST=$(conf_get "$f" HOST)
+        [ -n "$d" ] && [ -n "$HOST" ] || continue
+        compute_ctrl_path
+        if [[ "$checked" != *"|$HOST|"* ]]; then
+            checked+="$HOST|"
+            master_alive && alive+="$HOST|"
+        fi
+        connected=false
+        [[ "$alive" == *"|$HOST|"* ]] && connected=true
+        ld=$(lock_dir_for "$d")
+        rp=$(conf_get "$f" REMOTE_PATH)
+        mpid=""; since=""; mine=false
+        # A mesma pasta local pode ter configurações de hosts diferentes: só conta a do lock.
+        [ "$(lock_get "$ld" HOST)" == "$HOST" ] && [ "$(lock_get "$ld" REMOTE_PATH)" == "$rp" ] && mine=true
+        if [ -d "$ld" ] && [ "$mine" == "true" ] && pid_is_tnrx "$(lock_get "$ld" PID)"; then
+            state=mounting
+        elif lock_alive "$ld"; then
+            if [ "$mine" == "true" ]; then
+                state=mounted; mpid=$(lock_get "$ld" MOUNT_PID); since=$(lock_get "$ld" START)
+            else
+                state=unmounted
+            fi
+        elif is_mounted "$d" && { [ "$mine" == "true" ] || [ ! -d "$ld" ]; }; then
+            state=stale
+        else
+            state=unmounted
+        fi
+        [ "$first" == "true" ] || printf ','
+        first=false
+        printf '{"id":%s,"name":%s,"local_dir":%s,"host":%s,"remote_path":%s,"state":%s,"connected":%s,"rclone_pid":%s,"since":%s,"last_used":%s,"jupyter_port":%s,"log":%s,"slurm":' \
+            "$(json_str "$(basename "$f" .conf)")" "$(json_str "$(basename "$d")")" "$(json_str "$d")" \
+            "$(json_str "$HOST")" "$(json_str "$rp")" "$(json_str "$state")" \
+            "$(json_bool "$connected")" "$(json_num "$mpid")" "$(json_num "$since")" \
+            "$(json_num "$(conf_get "$f" LAST_USED)")" "$(json_num "$(conf_get "$f" JUPYTER_PORT)")" \
+            "$(json_str "$DATA_DIR/$(basename "$f" .conf)/mount.log")"
+        if [ "$state" == "mounted" ] && [ "$connected" == "true" ]; then slurm_json "$d"; else printf 'null'; fi
+        printf '}'
+    done
+    printf '],"hosts":['
+    first=true
+    while IFS= read -r h; do
+        [ "$first" == "true" ] || printf ','
+        first=false
+        printf '{"host":%s,"connected":%s}' "$(json_str "$h")" "$(json_bool "$([[ "$alive" == *"|$h|"* ]] && echo true)")"
+    done < <(printf '%s' "$checked" | tr '|' '\n' | awk 'NF')
+    printf ']}\n'
+}
+
+# --- Cluster: sinfo + meus jobs, pela conexão mestra ---
+
+cluster_query() {
+    # Saída bruta do servidor: P|partição|disponível|limite|A/I/O/T|gres, N|<scontrol show
+    # node -o>, J|id|partição|nome|estado|tempo|limite|motivo|pasta, E|erro, END|.
+    ssh -o ControlPath="$CTRL_PATH" -o BatchMode=yes "$HOST" "bash -s" 2>/dev/null <<'REMOTE'
+command -v sinfo >/dev/null 2>&1 || { echo "E|sinfo não encontrado no servidor"; echo "END|"; exit 0; }
+sinfo -h -o 'P|%P|%a|%l|%F|%G' 2>/dev/null
+scontrol show node -o 2>/dev/null | sed 's/^/N|/'
+squeue -h -u "$USER" -o 'J|%i|%P|%j|%T|%M|%l|%R|%Z' 2>/dev/null
+echo "END|"
+REMOTE
+}
+
+cluster_gpus() {
+    # GPUs por partição a partir das linhas N| (CfgTRES/AllocTRES gres/gpu): G|partição|total|usadas|indisponíveis
+    awk '
+    function gpu(s,   arr, k, n) { n = split(s, arr, ","); for (k = 1; k <= n; k++) if (arr[k] ~ /^gres\/gpu=/) { sub(/^gres\/gpu=/, "", arr[k]); return arr[k] + 0 } return 0 }
+    /^N\|/ {
+        part = ""; st = ""; cfg = 0; alloc = 0
+        n = split(substr($0, 3), kv, " ")
+        for (i = 1; i <= n; i++) {
+            eq = index(kv[i], "="); if (!eq) continue
+            key = substr(kv[i], 1, eq - 1); val = substr(kv[i], eq + 1)
+            if (key == "Partitions") part = val
+            else if (key == "State") st = val
+            else if (key == "CfgTRES") cfg = gpu(val)
+            else if (key == "AllocTRES") alloc = gpu(val)
+        }
+        bad = (st ~ /DOWN|DRAIN|FAIL|NOT_RESPONDING|MAINT|RESERVED|INVALID/)
+        np = split(part, ps, ",")
+        for (j = 1; j <= np; j++) {
+            p = ps[j]; seen[p] = 1; tot[p] += cfg
+            if (bad) un[p] += cfg - alloc; used[p] += alloc
+        }
+    }
+    END { for (p in seen) print "G|" p "|" tot[p] + 0 "|" used[p] + 0 "|" un[p] + 0 }'
+}
+
+cluster_host_json() {
+    # Um host: {"host","connected","ok",["error"],"partitions":[...],"jobs":[...]}
+    local raw err line tag name avail limit nodes gres def a i o t g gl gt gu gx first
+    local id part jname st elapsed jlimit reason wdir
+    compute_ctrl_path
+    if ! master_alive; then
+        printf '{"host":%s,"connected":false,"ok":false,"error":{"code":"not_connected","message":%s},"partitions":[],"jobs":[]}' \
+            "$(json_str "$HOST")" "$(json_str "Sem conexão com $HOST. Rode tnrx-connect mount numa pasta deste host.")"
+        return
+    fi
+    raw=$(cluster_query)
+    if ! printf '%s\n' "$raw" | grep -q '^END|'; then
+        printf '{"host":%s,"connected":true,"ok":false,"error":{"code":"query_failed","message":"o servidor não respondeu"},"partitions":[],"jobs":[]}' "$(json_str "$HOST")"
+        return
+    fi
+    err=$(printf '%s\n' "$raw" | sed -n 's/^E|//p' | head -1)
+    if [ -n "$err" ]; then
+        printf '{"host":%s,"connected":true,"ok":false,"error":{"code":"no_slurm","message":%s},"partitions":[],"jobs":[]}' "$(json_str "$HOST")" "$(json_str "$err")"
+        return
+    fi
+    gl=$(printf '%s\n' "$raw" | cluster_gpus)
+    # O sinfo quebra uma partição em várias linhas (uma por estado dos nós): soma por partição.
+    raw=$(printf '%s\n' "$raw" | awk -F'|' '
+        /^P\|/ {
+            name = $2; def = (name ~ /\*$/); sub(/\*$/, "", name)
+            if (!(name in seen)) { seen[name] = 1; order[++n] = name; av[name] = $3; lim[name] = $4; d[name] = def; g[name] = "" }
+            split($5, f, "/"); A[name] += f[1]; I[name] += f[2]; O[name] += f[3]; T[name] += f[4]
+            if ($6 != "(null)" && $6 != "" && index("," g[name] ",", "," $6 ",") == 0) g[name] = (g[name] == "" ? $6 : g[name] "," $6)
+            next
+        }
+        { print }
+        END { for (k = 1; k <= n; k++) { x = order[k]; print "P|" x (d[x] ? "*" : "") "|" av[x] "|" lim[x] "|" A[x] "/" I[x] "/" O[x] "/" T[x] "|" (g[x] == "" ? "(null)" : g[x]) } }')
+    printf '{"host":%s,"connected":true,"ok":true,"partitions":[' "$(json_str "$HOST")"
+    first=true
+    while IFS='|' read -r tag name avail limit nodes gres; do
+        [ "$tag" == "P" ] || continue
+        def=false
+        [[ "$name" == *"*" ]] && { def=true; name="${name%\*}"; }
+        IFS=/ read -r a i o t <<< "$nodes"
+        [ "$gres" == "(null)" ] && gres=""
+        g=$(printf '%s\n' "$gl" | awk -F'|' -v p="$name" '$2 == p { print $3 "|" $4 "|" $5; exit }')
+        [ "$first" == "true" ] || printf ','
+        first=false
+        printf '{"name":%s,"default":%s,"available":%s,"time_limit":%s,"nodes":{"allocated":%s,"idle":%s,"other":%s,"total":%s},"gres":%s,"gpus":' \
+            "$(json_str "$name")" "$(json_bool "$def")" "$(json_str "$avail")" "$(json_str "$limit")" \
+            "$(json_num "$a")" "$(json_num "$i")" "$(json_num "$o")" "$(json_num "$t")" "$(json_str_or_null "$gres")"
+        if [ -n "$g" ]; then
+            IFS='|' read -r gt gu gx <<< "$g"
+            printf '{"total":%s,"used":%s,"unavailable":%s,"free":%s}' "$gt" "$gu" "$gx" "$(( gt - gu - gx < 0 ? 0 : gt - gu - gx ))"
+        else
+            printf 'null'
+        fi
+        printf '}'
+    done <<< "$raw"
+    printf '],"jobs":['
+    first=true
+    while IFS='|' read -r tag id part jname st elapsed jlimit reason wdir; do
+        [ "$tag" == "J" ] || continue
+        [ "$first" == "true" ] || printf ','
+        first=false
+        printf '{"id":%s,"partition":%s,"name":%s,"state":%s,"elapsed":%s,"time_limit":%s,"reason":%s,"work_dir":%s}' \
+            "$(json_str "$id")" "$(json_str "$part")" "$(json_str "$jname")" "$(json_str "$st")" \
+            "$(json_str "$elapsed")" "$(json_str "$jlimit")" "$(json_str "$reason")" "$(json_str "$wdir")"
+    done <<< "$raw"
+    printf ']}'
+}
+
+print_cluster_text() {
+    # Versão de terminal, a partir do JSON de um host (sem depender de jq).
+    local raw="$1"
+    if ! command -v python3 >/dev/null 2>&1; then printf '%s\n' "$raw"; return; fi
+    printf '%s' "$raw" | python3 -c '
+import json, sys
+h = json.load(sys.stdin)
+print(h["host"])
+if not h["ok"]:
+    print("  ⚠️  " + h["error"]["message"]); sys.exit(0)
+print("  %-14s %-6s %-12s %-14s %s" % ("PARTIÇÃO", "ESTADO", "NÓS livres", "GPUs livres", "LIMITE"))
+for p in h["partitions"]:
+    n = p["nodes"]; g = p["gpus"]
+    gp = "%d/%d" % (g["free"], g["total"]) if g else "-"
+    print("  %-14s %-6s %-12s %-14s %s" % (p["name"] + ("*" if p["default"] else ""), p["available"], "%s/%s" % (n["idle"], n["total"]), gp, p["time_limit"]))
+if h["jobs"]:
+    print("  Meus jobs:")
+    for j in h["jobs"]:
+        print("    %-10s %-10s %-16s %-10s %-10s %s" % (j["id"], j["partition"], j["name"][:16], j["state"], j["elapsed"], j["reason"]))
+else:
+    print("  Meus jobs: nenhum")
+'
+}
+
+do_cluster() {
+    # tnrx-connect cluster [--host H] [--json]      -> sinfo + meus jobs
+    # tnrx-connect cluster cancel <job> [--host H] [--json]
+    mkdir -p "$CONF_DIR" "$DATA_DIR"
+    if [ "$1" == "cancel" ]; then
+        shift
+        do_cancel_job "$@"
+        return
+    fi
+    parse_api_opts "$@"
+    local -a hosts=()
+    local h out first=true
+    if [ -n "$API_HOST" ]; then
+        hosts=("$API_HOST")
+    else
+        while IFS= read -r h; do hosts+=("$h"); done < <(mounted_hosts)
+    fi
+    if [ "${#hosts[@]}" -eq 0 ] && [ "$JSON" != "true" ]; then
+        echo "Nenhuma pasta montada. Use --host <host> ou monte um projeto (tnrx-connect mount)."
+        return 0
+    fi
+    [ "$JSON" == "true" ] && printf '{"v":1,"ok":true,"hosts":['
+    for h in "${hosts[@]}"; do
+        HOST="$h"
+        out=$(cluster_host_json)
+        if [ "$JSON" == "true" ]; then
+            [ "$first" == "true" ] || printf ','
+            first=false
+            printf '%s' "$out"
+        else
+            print_cluster_text "$out"
+        fi
+    done
+    [ "$JSON" == "true" ] && printf ']}\n'
+    return 0
+}
+
+do_cancel_job() {
+    # Cancela um job seu (scancel) no host. Usado por `cluster cancel` e `jupyter stop`.
+    parse_api_opts "$@"
+    local job="${API_JOB:-${API_ARGS[0]}}" out
+    [[ "$job" =~ ^[0-9]+(_[0-9]+)?$ ]] || json_fail usage "Job inválido: '$job'." 2
+    resolve_api_host
+    connect_master
+    if ! out=$(ssh -o ControlPath="$CTRL_PATH" -o BatchMode=yes "$HOST" "scancel $job" 2>&1); then
+        json_fail scancel_failed "scancel $job falhou em $HOST: $out"
+    fi
+    if [ "$JSON" == "true" ]; then
+        printf '{"v":1,"ok":true,"host":%s,"job":%s}\n' "$(json_str "$HOST")" "$(json_str "$job")"
+    else
+        echo "🛑 Job $job cancelado em $HOST."
+    fi
+    [ "$MASTER_OWNED" == "true" ] && close_master_if_unused
+    return 0
+}
+
+# --- Jupyter para ferramentas: list / start / connect / stop ---
+
+bridge_for() {
+    # Porta local de uma ponte viva (de qualquer tnrx-connect jupyter) pra $HOST $1:$2.
+    local b pid
+    for b in "$DATA_DIR"/bridges/*; do
+        [ -f "$b" ] || continue
+        pid=$(basename "$b")
+        pid_is_tnrx "$pid" || continue
+        if [ "$(sed -n 1p "$b")" == "$HOST" ] && [ "$(sed -n 2p "$b")" == "$1" ] && [ "$(sed -n 3p "$b")" == "$2" ]; then
+            sed -n 4p "$b"
+            return 0
+        fi
+    done
+    return 1
+}
+
+server_json() {
+    # Um servidor (linha TNRXJ|...) em JSON, com a URL local (da ponte aberta, ou a fixa prevista).
+    local tag node port token job started proj lp open=false fixed=false
+    IFS='|' read -r tag node port token job started proj <<< "$1"
+    if lp=$(bridge_for "$node" "$port"); then open=true; else lp=$(J_PORT="$port" project_local_port "$proj"); fi
+    [ "$token" == "$(jupyter_token "$HOST" "$proj")" ] && fixed=true
+    printf '{"node":%s,"port":%s,"job":%s,"started":%s,"token":%s,"token_fixed":%s,"bridge_open":%s,"local_port":%s,"url":%s}' \
+        "$(json_str "$node")" "$(json_num "$port")" "$(json_str "$job")" "$(json_num "$started")" \
+        "$(json_str "$token")" "$(json_bool "$fixed")" "$(json_bool "$open")" "$(json_num "$lp")" \
+        "$(json_str "http://127.0.0.1:$lp/lab?token=$token")"
+}
+
+do_jupyter_list() {
+    # Jupyters no ar por host e por projeto (os projetos que este laptop conhece).
+    parse_api_opts "$@"
+    local -a hosts=() projects=() lines=()
+    local h p l f firsth=true firstp firsts ld
+    if [ -n "$API_HOST" ]; then hosts=("$API_HOST"); else while IFS= read -r h; do hosts+=("$h"); done < <(all_hosts); fi
+    [ "$JSON" == "true" ] && printf '{"v":1,"ok":true,"hosts":['
+    for h in "${hosts[@]}"; do
+        HOST="$h"; compute_ctrl_path
+        projects=(); lines=()
+        while IFS= read -r p; do [ -n "$p" ] && projects+=("$p"); done < <(known_projects "" | awk 'NF')
+        local connected=false
+        if master_alive; then
+            connected=true
+            [ "${#projects[@]}" -gt 0 ] && while IFS= read -r l; do lines+=("$l"); done < <(discover_jupyters "${projects[@]}" | grep '^TNRXJ|' | sort -t'|' -k6 -rn)
+        fi
+        if [ "$JSON" == "true" ]; then
+            [ "$firsth" == "true" ] || printf ','
+            firsth=false
+            printf '{"host":%s,"connected":%s,"projects":[' "$(json_str "$h")" "$(json_bool "$connected")"
+            firstp=true
+            for p in "${projects[@]}"; do
+                ld=""; f=$(conf_for_remote "$p") && ld=$(conf_get "$f" LOCAL_DIR)
+                [ "$firstp" == "true" ] || printf ','
+                firstp=false
+                printf '{"name":%s,"remote_path":%s,"local_dir":%s,"servers":[' "$(json_str "$(basename "$p")")" "$(json_str "$p")" "$(json_str_or_null "$ld")"
+                firsts=true
+                for l in "${lines[@]}"; do
+                    [ "$(printf '%s' "$l" | cut -d'|' -f7-)" == "$p" ] || continue
+                    [ "$firsts" == "true" ] || printf ','
+                    firsts=false
+                    server_json "$l"
+                done
+                printf ']}'
+            done
+            printf ']}'
+        else
+            echo "$h$([ "$connected" == "true" ] || echo ' (sem conexão)')"
+            for p in "${projects[@]}"; do
+                echo "  $(basename "$p")  ($p)"
+                for l in "${lines[@]}"; do
+                    [ "$(printf '%s' "$l" | cut -d'|' -f7-)" == "$p" ] || continue
+                    IFS='|' read -r _ node port _ job started _ <<< "$l"
+                    echo "    $node:$port  (job ${job:-?}, há $(fmt_age "$started"))"
+                done
+            done
+        fi
+    done
+    [ "$JSON" == "true" ] && printf ']}\n'
+    return 0
+}
+
+require_project() {
+    case "$API_PROJECT" in
+        /*) [ "$API_PROJECT" != "/" ] && API_PROJECT="${API_PROJECT%/}" ;;
+        *) json_fail usage "Informe --project <pasta remota absoluta> (ou rode dentro de uma pasta montada)." 2 ;;
+    esac
+}
+
+do_jupyter_start() {
+    # Inicia um Jupyter no projeto. Texto: inicia e conecta. JSON: eventos até "ready" (não abre ponte).
+    parse_api_opts "$@"
+    [ "$JSON" == "true" ] && JSON_STREAM=true
+    resolve_api_host
+    require_project
+    connect_master
+    trap cleanup_jupyter EXIT
+    trap 'exit 130' INT TERM HUP
+    launch_jupyter "$API_PROJECT"
+    if [ "$JSON" == "true" ]; then
+        json_event ready ",\"host\":$(json_str "$HOST"),\"project\":$(json_str "$API_PROJECT"),\"server\":$(server_json "$J_PICKED")"
+        exit 0
+    fi
+    register_bridge
+    connect_picked
+}
+
+do_jupyter_connect() {
+    # Abre a ponte (porta local fixa do projeto) pro Jupyter --job (ou o mais recente) do projeto.
+    parse_api_opts "$@"
+    [ "$JSON" == "true" ] && JSON_STREAM=true
+    resolve_api_host
+    require_project
+    connect_master
+    trap cleanup_jupyter EXIT
+    trap 'exit 130' INT TERM HUP
+    register_bridge
+    J_PICKED=$(discover_jupyters "$API_PROJECT" | grep '^TNRXJ|' | sort -t'|' -k6 -rn |
+        awk -F'|' -v j="$API_JOB" 'j == "" || $5 == j { print; exit }')
+    [ -n "$J_PICKED" ] || json_fail no_server "Nenhum Jupyter no ar em $HOST:$API_PROJECT${API_JOB:+ com o job $API_JOB}."
+    connect_picked
 }
 
 # --- Lógica de Entrada ---
@@ -1443,31 +2373,47 @@ done
 
 case "$1" in
     connect|"") shift; do_connect ;;
+    mount)      shift; do_mount ;;
+    ssh)        shift; do_ssh ;;
+    umount|unmount) shift; do_unmount "$@" ;;
     status)     shift; do_status "$@" ;;
+    cluster)    shift; do_cluster "$@" ;;
     refresh)    shift; do_refresh ;;
     jupyter)    shift; do_jupyter "$@" ;;
-    unmount)    shift; do_unmount "$@" ;;
     snapshot)   shift; do_snapshot "$@" ;;
     history)    shift; do_history "$@" ;;
     restore)    shift; do_restore "$@" ;;
+    __snapshot-loop) shift; do_snapshot_loop "$@" ;;
     rsync)      shift; do_connect_rsync ;;
     sync)       shift; do_sync ;;
     pull)       shift; do_pull ;;
     init)       shift; do_init ;;
-    uninstall)  shift; do_uninstall ;;
+    update)     shift; exec bash "$TNRX_DIR/install.sh" --update "$@" ;;
+    update-dev) shift; do_update_dev "$@" ;;
+    uninstall)  exec bash "$TNRX_DIR/install.sh" --uninstall ;;
+    version|--version|-V) do_version ;;
     *)
         echo "Uso: tnrx-connect [--debug|-x] <comando>"
         echo ""
-        echo "Modo mount (rclone) — rode dentro de uma pasta VAZIA:"
-        echo "  tnrx-connect                 -> Pergunta host/pasta remota, monta a pasta remota aqui e abre o SSH"
-        echo "  tnrx-connect status [pasta]  -> Estado da sessão, do mount, do cache e dos snapshots"
+        echo "Modo mount (rclone) — monte numa pasta VAZIA; ela fica montada até o umount:"
+        echo "  tnrx-connect                 -> Monta (se ainda não estiver montada) e abre o terminal SSH"
+        echo "  tnrx-connect mount           -> Pergunta host/pasta remota e monta a pasta remota aqui (devolve o prompt)"
+        echo "  tnrx-connect ssh             -> Abre o terminal SSH do servidor na pasta montada (sair não desmonta)"
+        echo "  tnrx-connect umount [-f] [pasta] -> Snapshot final e desmonta (-f = desmontagem preguiçosa)"
+        echo "  tnrx-connect status [pasta]  -> Estado da montagem, da conexão, do cache e dos snapshots"
         echo "  tnrx-connect refresh         -> Limpa o cache de diretórios (vê o que mudou no servidor agora)"
         echo "  tnrx-connect history [path]  -> Lista os snapshots (git sombra)"
         echo "  tnrx-connect restore <id> [path...] -> Restaura arquivos de um snapshot"
         echo "  tnrx-connect snapshot        -> Tira um snapshot agora"
-        echo "  tnrx-connect unmount [-f] [pasta] -> Desmonta um mount órfão (sessão que caiu)"
         echo "  tnrx-connect jupyter         -> Acha os Jupyters do projeto que estão no ar, você escolhe e ele abre a ponte"
         echo "  tnrx-connect jupyter <URL|nó:porta> -> Abre a ponte pra um Jupyter cuja URL você já tem"
+        echo "  tnrx-connect cluster [--host H] -> sinfo (GPUs livres por partição) e seus jobs, nos hosts montados"
+        echo ""
+        echo "Para ferramentas (VS Code), saída JSON, nunca pergunta nem autentica (docs/tnrx-connect-json.md):"
+        echo "  tnrx-connect status --json"
+        echo "  tnrx-connect cluster [--host H] --json  |  cluster cancel <job> --host H --json"
+        echo "  tnrx-connect jupyter list --json  |  jupyter start|connect --host H --project P [--job J] --json"
+        echo "  tnrx-connect jupyter stop <job> --host H --json"
         echo ""
         echo "Modo rsync (cópia local sincronizada, .tnrx_connect na pasta):"
         echo "  tnrx-connect rsync           -> Sincroniza em background e abre o SSH"
@@ -1475,6 +2421,11 @@ case "$1" in
         echo "  tnrx-connect pull            -> Puxa do servidor pro local uma vez, sem --delete"
         echo "  tnrx-connect init            -> Cria o .tnrx_connect deste projeto"
         echo ""
-        echo "  tnrx-connect uninstall       -> Remove o symlink local"
+        echo "Instalação:"
+        echo "  tnrx-connect update          -> Atualiza o tnrx e o tnrx-connect a partir do GitHub"
+        echo "  tnrx-connect update-dev [pasta] -> Instala a sua cópia de desenvolvimento (padrão: a pasta atual)"
+        echo "                                (update e update-dev aceitam --choose: pergunta de novo o que instalar)"
+        echo "  tnrx-connect version         -> Versão instalada"
+        echo "  tnrx-connect uninstall       -> Remove os comandos e a pasta da instalação"
         ;;
 esac

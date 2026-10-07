@@ -1,370 +1,329 @@
-# `tnrx-connect`: trabalhar no seu laptop com o projeto no servidor
+# `tnrx-connect`: o projeto do servidor no seu laptop
 
-> **Onde roda:** no **seu laptop/desktop/notebook**, não no servidor. O `tnrx-connect` é o companion do [`tnrx`](tnrx.md) (que roda no servidor). Visão geral das duas ferramentas: [README](../README.md).
+> **Onde roda:** no seu laptop. Ele leva você até o [`tnrx`](tnrx.md), que roda no servidor. Visão geral: [README](../README.md).
 
-Este manual é para você conseguir trabalhar **só lendo este arquivo**: primeiro como começar, depois **como fazer cada tarefa do dia a dia** (inclusive os comandos do `tnrx` que você roda no servidor), depois a referência completa e os problemas comuns. Quando precisar de mais detalhe sobre o `tnrx`, cada tarefa tem o link para a seção dele.
+O `tnrx-connect` monta a pasta de um projeto do servidor numa pasta do laptop. Você edita no laptop, com o seu editor ou o Claude Code, e roda no servidor, com o `tnrx`. Só existe uma cópia dos arquivos, a do servidor: o que você salva no laptop é o que o job usa.
 
-## Por que existe
+Ele não precisa de nada instalado no servidor: usa só `ssh` e SFTP. A senha e o 2FA são pedidos uma vez por sessão.
 
-Os nós de computação do Slurm não têm acesso à internet, e ferramentas como o Claude Code precisam de internet o tempo todo, então elas não podem rodar lá. Rodar essas ferramentas direto no headnode também não é uma boa ideia: é uma máquina compartilhada por todo o time, e um agente de coding facilmente a sobrecarrega. Um proxy de rede pelo headnode resolveria o problema tecnicamente, mas reabriria de propósito o isolamento de rede que os nós têm por motivo de segurança, e essa não é uma decisão para tomar dentro de um script.
+## Como funciona
 
-A solução é rodar a ferramenta no **seu laptop** (com internet plena) e deixar os arquivos do projeto no servidor. O `tnrx-connect` faz essa ponte, roda só no laptop e **não exige instalar nada no servidor** (usa `ssh` e o subsistema SFTP do `sshd`). Ele tem dois modos:
+| Peça | O que é | Comando |
+| --- | --- | --- |
+| **Montagem** | A pasta remota aparece numa pasta local, via `rclone`. Fica montada até você desmontar, mesmo que feche todos os terminais | `tnrx-connect mount` / `umount` |
+| **Terminal do servidor** | Um `ssh` aberto direto na pasta remota do projeto. É nele que você roda o `tnrx` | `tnrx-connect ssh` |
+| **Ponte do Jupyter** | Um túnel do laptop até o nó de GPU onde o Jupyter roda | `tnrx-connect jupyter` |
+| **Snapshots** | Cópias automáticas da pasta a cada minuto, num git separado no laptop, para desfazer edições | `tnrx-connect history` / `restore` |
+| **Conexão mestra** | Uma única conexão SSH autenticada, que todas as peças acima reaproveitam. É por isso que o 2FA é pedido uma vez só | (automática) |
 
-* **Modo mount (recomendado):** monta a pasta do projeto do servidor, via `rclone`, na pasta onde você rodou o comando. Só existe **uma cópia** dos arquivos (no servidor), então não há duas versões para divergir: editar no laptop ou no servidor é editar o mesmo arquivo.
-* **Modo rsync (alternativo):** mantém uma cópia local sincronizada com o servidor, só de ida (laptop → servidor). Veja [Modo alternativo: rsync](#modo-alternativo-rsync).
+A regra prática: **`tnrx ...` roda no terminal do servidor; `tnrx-connect ...` roda no laptop.**
 
-## Quem roda o quê
+Um dia normal usa duas abas no laptop:
 
-Você usa **duas abas de terminal** no laptop, mais o navegador:
-
-| Onde | O que roda lá |
+| Aba | O que roda |
 | --- | --- |
-| **Aba 1 do laptop** (a que rodou `tnrx-connect`) | Vira o **terminal do servidor**: é aqui que você roda os comandos `tnrx ...` (instalar bibliotecas, submeter jobs, iniciar o Jupyter, baixar modelos, fazer commit) |
-| **Aba 2 do laptop** | Editor e Claude Code na pasta montada, e os comandos do próprio `tnrx-connect` (`jupyter`, `refresh`, `history`, `restore`) |
-| **Navegador / VS Code** | O Jupyter, por uma ponte que o `tnrx-connect jupyter` abre |
+| **Terminal do servidor** (`tnrx-connect ssh`) | `tnrx uv add`, `tnrx uvslurm`, `squeue`, `git commit` |
+| **Laptop**, na pasta montada | O editor, o Claude Code e os comandos `tnrx-connect` (`jupyter`, `refresh`, `history`, `umount`) |
 
-A regra prática: **`tnrx ...` é sempre no terminal do servidor (aba 1); `tnrx-connect ...` é sempre no laptop.**
+Se você usa o VS Code, a [extensão](../vscode/README.md) mostra numa barra lateral as montagens, a configuração do Slurm, as GPUs livres e os Jupyters, e abre os terminais por você.
 
-## Primeiros passos
+## Instalação
 
-> **Status do modo mount:** ele já montou o Headnode com o `rclone` real e funciona. Ainda **não foram validados** num servidor real: senha/2FA pedidas uma única vez no Abaporu, escritas pendentes sobrevivendo a uma queda de rede, o desempenho de `git status`/buscas na pasta montada e o macOS. A lista de conferência está em [validacao-manual.md](validacao-manual.md).
+No laptop você precisa de:
 
-
-### Pré-requisitos e instalação (no laptop)
-
-* `ssh` (OpenSSH com `ControlMaster`), `rclone` e FUSE (`fuse3` no Linux; macFUSE no macOS, ainda não validado).
-* SFTP habilitado no servidor (confira com `sftp <host>`).
-* Uma cópia deste repositório **no laptop** (só o script `tnrx-connect` é usado lá; o restante do repositório é do [`tnrx`](tnrx.md), que roda no servidor). O `~/.local/bin` precisa estar no seu `PATH`.
-
-Na pasta do repositório clonado no laptop:
+* `ssh` (OpenSSH), `rclone` e FUSE (`fuse3` no Linux). O macOS ainda não é suportado.
+* Acesso SFTP ao servidor (confira com `sftp <servidor>`).
+* `git` e `~/.local/bin` no `PATH`.
 
 ```bash
-chmod +x tnrx-connect
-ln -sf "$(pwd)/tnrx-connect" ~/.local/bin/tnrx-connect
+curl -fsSL https://raw.githubusercontent.com/recod-ai/tnrx/main/install.sh | bash
 ```
 
-### Primeira sessão
+Ele pergunta o que instalar e, num laptop, já sugere o `tnrx-connect` e, se o comando `code` existir, a [extensão do VS Code](../vscode/README.md). Para atualizar: `tnrx-connect update`; versão instalada: `tnrx-connect version`. O instalador é o mesmo do servidor ([detalhes](tnrx.md#instalação)), e no servidor o `tnrx` também precisa estar instalado.
 
-Crie uma pasta **vazia** pro projeto, entre nela e rode:
-
-```bash
-mkdir -p ~/trabalho/meu-projeto && cd ~/trabalho/meu-projeto
-tnrx-connect
-```
+**Dica:** um alias no `~/.ssh/config` do laptop evita digitar usuário e endereço, e funciona com `ProxyJump`:
 
 ```
-Host (user@servidor ou alias do ~/.ssh/config) [abaporu]:
-Pasta remota [/home/marcos/proj] (Enter = manter, b = navegar):
+Host recod-headnode
+    HostName <endereço do servidor>
+    User <seu usuário>
 ```
 
-* **Toda execução pergunta de novo**, já com os valores da última vez: Enter aceita. Em `b` você navega pelas pastas do servidor (subir/descer) em vez de digitar o caminho.
-* O **host** pode ser `usuario@servidor.edu` ou um alias do seu `~/.ssh/config` (inclusive com `ProxyJump`).
-* Depois disso o comando autentica (senha/2FA uma única vez), monta o projeto em cima da pasta atual e **este terminal vira o terminal SSH do servidor** (já dentro da pasta do projeto).
-* Em **outra aba local**: `cd ~/trabalho/meu-projeto && claude`. Todo terminal que já estava **dentro** dessa pasta antes de montar (inclusive aquele em que você rodou o `tnrx-connect`, depois de sair) continua vendo a pasta vazia de antes, porque o diretório de trabalho dele aponta para a pasta local sem o mount: rode `cd .` (ou reabra o terminal) pra enxergar o conteúdo montado.
-* Ao sair do terminal SSH (`exit`/`Ctrl-D`), o comando tira um último snapshot, desmonta, espera o `rclone` terminar de enviar o que estava pendente e encerra a conexão.
+## Primeira sessão
 
-## Tarefas do dia a dia
-
-Cada receita diz **onde** rodar (aba 1 = terminal do servidor; aba 2 = laptop) e aponta para a seção do [`tnrx`](tnrx.md) com mais detalhes.
-
-### Abrir o projeto (e o terminal do servidor)
-
-No laptop, numa pasta **vazia**:
+Numa pasta **vazia** do laptop:
 
 ```bash
 mkdir -p ~/trabalho/meu-projeto && cd ~/trabalho/meu-projeto
 tnrx-connect
 ```
 
-Aceite o host e a pasta remota com Enter (ou `b` para navegar pelas pastas do servidor). Depois de autenticar, este terminal vira o terminal do servidor, já dentro da pasta do projeto. Detalhes: [Primeira sessão](#primeira-sessão).
+```
+Host (user@servidor ou alias do ~/.ssh/config) [recod-headnode]:
+Pasta remota [/home/marcos/meu-projeto] (Enter = manter, b = navegar):
+```
 
-### Editar o código com o Claude Code ou o seu editor
+* O host é um alias do `~/.ssh/config` ou `usuario@servidor`. Na pasta remota, `b` deixa você navegar pelas pastas do servidor em vez de digitar o caminho.
+* Ele pede a senha e o 2FA, monta a pasta e abre o terminal do servidor já na pasta do projeto.
+* Nas próximas vezes, as perguntas já vêm com as respostas anteriores: é só apertar Enter.
 
-Na **aba 2** do laptop:
+Em **outra aba**, abra o editor ou o Claude Code:
 
 ```bash
 cd ~/trabalho/meu-projeto
-claude          # ou abra o seu editor nessa pasta
+claude
 ```
 
-Os arquivos que você salva sobem para o servidor uns 5 segundos depois: o que você edita aqui é o que o `tnrx` roda lá. Se essa aba já estava aberta dentro da pasta antes de montar, rode `cd .` primeiro.
+Se a aba já estava dentro da pasta antes de montar, ela ainda vê a pasta vazia: rode `cd .` para enxergar o conteúdo montado.
 
-### Preparar um projeto novo no servidor (uma vez por projeto)
-
-Na **aba 1**:
+Se o projeto é novo no servidor, prepare-o no terminal do servidor ([detalhes](tnrx.md#preparar-um-projeto)):
 
 ```bash
-tnrx install uv               # instala o uv em ~/.local/bin
-tnrx install singularity      # baixa o .sif (a imagem do container) para a pasta do projeto
+tnrx uv init            # só se ainda não existe um pyproject.toml
+tnrx uv add torch       # na primeira vez, pergunta qual imagem do container usar (Enter = a padrão)
 ```
 
-O `.sif` precisa estar na pasta do projeto para qualquer comando `tnrx uv`/`tnrx uvslurm`. Mais em [tnrx.md, seção 1](tnrx.md#1-instalação-e-preparação). Se o `tnrx` recusar com `Hostname '...' não está configurado`, o servidor precisa de uma linha em `tnrx_hosts.conf`: [tnrx.md, seção 1.1](tnrx.md#11-particularidades-de-cada-servidor-tnrx_hostsconf).
+## Dia a dia
 
-### Instalar bibliotecas do projeto
-
-Na **aba 1** (o `tnrx uv` usa a internet do headnode e cria o `.venv` no servidor):
+### Abrir o projeto
 
 ```bash
-tnrx uv add numpy pandas      # adiciona bibliotecas
-tnrx uv remove pandas         # remove
-tnrx uv sync                  # recria o ambiente a partir do uv.lock
+cd ~/trabalho/meu-projeto && tnrx-connect
 ```
 
-O `.venv/` fica escondido do mount no laptop, e isso é normal. Mais em [tnrx.md, seção 2](tnrx.md#2-gestão-de-dependências-headnode).
+Numa pasta já montada, ele não pergunta nada e só abre o terminal do servidor. Pode fechar e reabrir esse terminal quantas vezes quiser (`tnrx-connect ssh`): a pasta continua montada. Dentro de uma subpasta, o terminal abre na subpasta correspondente do servidor.
 
-### Rodar um script na GPU
+### Instalar bibliotecas e rodar na GPU
 
-Na **aba 1**:
+No terminal do servidor:
 
 ```bash
-tnrx uvslurm python train.py          # usa o ambiente do .venv (recomendado)
-tnrx slurm nvidia-smi                 # para comandos genéricos, fora do uv
+tnrx uv add numpy pandas
+tnrx uvslurm python train.py
 ```
 
-Partição, número de GPUs, CPUs, memória e tempo saem do arquivo `tnrx_slurm.conf` da pasta do projeto, que você pode editar no laptop (é um arquivo do projeto como outro qualquer):
+Os recursos do job (partição, GPUs, memória, tempo) vêm do `tnrx_slurm.conf` do projeto, que você edita no laptop como qualquer arquivo ([detalhes](tnrx.md#configurar-os-recursos-tnrx_slurmconf)). Para ver as GPUs livres e os seus jobs sem sair do laptop:
 
 ```bash
-PARTITION=l40s
-GPUS=1
-CPUS=4
-MEM=16G
-TIME=02:00:00
+tnrx-connect cluster               # partições, GPUs livres e os seus jobs
+tnrx-connect cluster cancel <job>  # cancela um job
 ```
 
-Para ver a fila ou cancelar um job (comandos do Slurm, na aba 1): `squeue -u $USER` e `scancel <jobid>`. Mais em [tnrx.md, seções 3 e 5](tnrx.md#3-configuração-do-cluster-tnrx_slurmconf) e [5](tnrx.md#5-execução-no-slurm).
-
-### Abrir um Jupyter e usá-lo no navegador
-
-1. **Uma vez por projeto**, na aba 1: `tnrx uv add ipykernel`.
-2. Na **aba 1**, na pasta do projeto: `tnrx uvslurm jupyter lab`. Se o job ficar na fila, espere. Quando ele começar, aparece `🌐 [tnrx] Nó: dl-05 | porta: 8888` e os logs do Jupyter.
-3. Na **aba 2** do laptop, dentro da pasta do projeto:
-
-   ```bash
-   tnrx-connect jupyter
-   ```
-
-   Ele acha o Jupyter que está no ar, abre a ponte e imprime o link (com o token já dentro):
-
-   ```
-   🌐 Abra no navegador:  http://dl-05.recod-headnode.localhost:8888/lab?token=...
-      Programas que não resolvem *.localhost (ex.: VS Code): http://127.0.0.1:8888/lab?token=...
-   ```
-
-4. Abra o link no navegador. **No VS Code:** abra o `.ipynb`, clique em **Select Kernel → Existing Jupyter Server**, cole o link `127.0.0.1` e escolha o kernel `Python (TNRX-nome_da_pasta)`.
-5. Para encerrar: na aba 1, `Ctrl-C` **duas vezes em menos de 1 segundo** (o `srun` pede isso). A ponte fecha sozinha. `Ctrl-C` na aba da ponte fecha só a ponte; o Jupyter continua no servidor.
-
-Se aparecer `Nenhum servidor Jupyter no ar neste projeto`, veja [Problemas comuns](#problemas-comuns). Mais em [Jupyter no nó de computação](#jupyter-no-nó-de-computação) e [tnrx.md, seção 6](tnrx.md#6-jupyter-lab-e-vs-code).
-
-### Baixar um modelo ou dataset do Hugging Face
-
-Na **aba 1**, no headnode (os nós de computação não têm internet). Uma vez por usuário: instale o utilitário `download_huggingface` (o link simbólico da [seção 7-A do tnrx.md](tnrx.md#a-preparação-e-instalação-do-comando)) e configure o token no `~/.bashrc` do servidor (`export HF_TOKEN="hf_..."`). Depois:
-
-```bash
-tnrx hf model google/siglip1-base-patch16-224
-tnrx hf dataset jxie/flickr8k
-```
-
-Os arquivos vão para o diretório compartilhado do servidor (`HUB_ROOT`: `/data/huggingface_hub` no Abaporu, `/hadatasets/huggingface_hub` no Headnode), e seu código os carrega por esse caminho absoluto. Mais em [tnrx.md, seção 7](tnrx.md#7-hugging-face-shared-hub-central-de-modelosdatasets).
+O que você salva no laptop chega ao servidor uns **5 segundos** depois. Espere esse tempo antes de submeter um job que usa o arquivo recém-salvo.
 
 ### Ver no laptop o que o servidor gerou
 
-Um resultado salvo por um job (ou um notebook salvo pelo Jupyter) só aparece no laptop quando o cache de diretórios expira (30 s). Para ver na hora, na aba 2:
+Arquivos criados ou alterados no servidor (por um job, pelo Jupyter) aparecem no laptop em até **30 segundos**. Para ver na hora:
 
 ```bash
 tnrx-connect refresh
 ```
 
-Resultados de treino e logs grandes devem ir para o storage compartilhado (`/data`, `/hadatasets`), não para dentro da pasta do projeto.
-
-### Voltar atrás depois de uma edição errada
-
-Na aba 2. O `tnrx-connect` tira snapshots automáticos enquanto a sessão está aberta:
-
-```bash
-tnrx-connect history                    # lista os snapshots, o mais recente primeiro
-tnrx-connect restore <id> arquivo.py    # restaura um arquivo
-tnrx-connect restore <id>               # restaura a árvore toda
-```
-
-Mais em [Snapshots e rollback](#snapshots-e-rollback-git-sombra).
+Resultados grandes (checkpoints, logs de treino, datasets) devem ir para o armazenamento compartilhado (`/data`, `/hadatasets`), não para a pasta do projeto: assim não passam pelo cache do laptop nem pelos snapshots.
 
 ### Fazer commit
 
-Faça `git add` e `git commit` na **aba 1** (o terminal do servidor), não pela pasta montada: o pre-commit deste projeto usa o `./tnrx` do servidor, e o `git status` sobre o mount pode ser lento. Mais em [tnrx.md, seção 8](tnrx.md#8-qualidade-de-código-e-pre-commit).
+Faça o `git` no **terminal do servidor**. Pela pasta montada, o `git status` é lento (cada arquivo é consultado pela rede), e hooks de pre-commit que chamam o `tnrx` só funcionam no servidor.
 
-### Encerrar o dia e voltar amanhã
-
-Na aba 1, `exit` (ou `Ctrl-D`): o comando tira um último snapshot, desmonta, espera o `rclone` terminar de enviar o que estava pendente e fecha a conexão. Se a desmontagem falhar porque algo ainda usa a pasta (o Claude Code, um editor, um shell dentro dela), feche esses programas, saia da pasta (`cd ~`) e rode `tnrx-connect unmount ~/trabalho/meu-projeto`.
-
-Para voltar: `cd ~/trabalho/meu-projeto && tnrx-connect`, e Enter nas duas perguntas (o cache é persistente).
-
-
-## Referência do modo mount
-
-### Onde ficam as coisas
-
-| Caminho | Conteúdo | Persiste? |
-| --- | --- | --- |
-| `~/.config/tnrx-connect/<host>_<pasta>.conf` | `HOST`, `REMOTE_PATH`, `LOCAL_DIR` (a pasta local usada), `LAST_USED` | Sim |
-| `~/.local/share/tnrx-connect/<host>_<pasta>/vfs-*/` | Cache do `rclone` | **Sim — nunca é apagado automaticamente** |
-| `~/.local/share/tnrx-connect/<host>_<pasta>/shadow.git` | Snapshots (git sombra) | Sim |
-| `~/.local/share/tnrx-connect/<host>_<pasta>/mount.log` | Log do `rclone` e dos snapshots | Sim |
-| `~/.local/share/tnrx-connect/locks/` | Lock da sessão ativa por pasta | Só enquanto a sessão existe |
-
-O nome do `.conf` usa o nome da pasta local. Se duas pastas de caminhos diferentes tiverem o mesmo nome (`~/a/proj` e `~/b/proj`) com o mesmo host, a segunda ganha um sufixo curto de hash pra não colidir. Se uma pasta já foi usada com mais de um host, o comando lista as opções (a mais recente primeiro) e pergunta qual usar.
-
-### Regras
-
-* **A pasta precisa estar vazia** (o mount esconderia qualquer conteúdo local). Por isso a configuração fica em `~/.config`, e não dentro do projeto. O comando também recusa rodar em `/` e na sua home.
-* **Uma sessão por pasta:** se já houver uma sessão ativa naquela pasta, o comando recusa e mostra host, pasta remota, PID e desde quando. Esse bloqueio é **local** (desta máquina): não impede outra pessoa, em outro laptop, de montar o mesmo `REMOTE_PATH`. Se a mesma pasta remota já estiver montada em outra pasta desta máquina, ele só avisa.
-* **Sessão que caiu** (`kill -9`, queda de energia): na próxima execução naquela pasta o comando detecta o lock velho, desmonta o que sobrou e espera o `rclone` antigo terminar antes de remontar.
-* **O cache é persistente.** Ele guarda leituras e escritas em disco; se a conexão cair, o que ainda não subiu continua no cache. O único limite é `CACHE_MAX_SIZE` (padrão `20G`) — o `rclone` só descarta arquivos quando passa disso.
-* O `.venv/` fica escondido do mount (evita varrer diretórios enormes); ele continua existindo normalmente no servidor.
-
-### Senha + 2FA (ex.: Abaporu)
-
-Se o host exige senha e segundo fator, o comando pede isso **uma única vez**: ele abre uma conexão SSH "mestra" (multiplexada) e tudo depois — o mount, cada operação de listagem/leitura/escrita do `rclone` e o terminal interativo — reaproveita essa conexão já autenticada. Ela é compartilhada entre sessões do mesmo host e só é encerrada quando a última sessão termina.
-
-### Atualização e atraso de visibilidade
-
-O SFTP não avisa quando algo muda no servidor. Por isso:
-
-* O que **mudou no servidor** (um notebook salvo pelo Jupyter, o resultado de um job) só aparece no laptop quando o cache de diretórios expira (`DIR_CACHE_TIME`, padrão `30s`). Pra ver na hora: `tnrx-connect refresh`.
-* O que **você salva no laptop** vai primeiro pro cache local e sobe ao servidor uns 5 segundos depois. Um processo no servidor que leia o arquivo nesse intervalo ainda vê a versão antiga.
-* Se o **mesmo arquivo** for salvo ao mesmo tempo por você (via mount) e por outro processo (por exemplo o autosave do Jupyter no mesmo notebook), vale a última escrita — o `rclone` não faz merge. Na prática, mantenha um escritor por arquivo.
-
-### Snapshots e rollback (git sombra)
-
-Enquanto a sessão está aberta, um repositório git **separado** tira snapshots da pasta montada a cada `SNAPSHOT_INTERVAL` segundos (padrão `60`), só quando algo mudou. Ele fica em `~/.local/share/tnrx-connect/<host>_<pasta>/shadow.git`, **fora do projeto**, então não interfere no `.git` original (que continua no servidor, dentro do projeto).
+### Desfazer uma edição
 
 ```bash
-tnrx-connect history                    # lista os snapshots (mais recente primeiro)
+tnrx-connect history                    # snapshots, o mais recente primeiro
 tnrx-connect restore <id> arquivo.py    # restaura um arquivo
-tnrx-connect restore <id>               # restaura a árvore toda
+tnrx-connect restore <id>               # restaura a pasta toda
 ```
 
-* Respeita o `.gitignore` do projeto e as regras do `.git/info/exclude` dele.
-* Arquivos maiores que `SNAPSHOT_MAX_FILE_MB` (padrão `5`) ficam de fora — importante pra dados e pesos. Notebooks com muitas saídas engordam o repositório sombra (o `git gc` automático ajuda).
-* O primeiro snapshot só sai depois do primeiro intervalo, e lê os arquivos pelo mount (baixando-os pro cache), então pode ser lento em projetos grandes.
-* `restore` tira um snapshot de segurança **antes** de restaurar (o próprio restore é desfazível) e **não apaga** arquivos criados depois do snapshot escolhido. Se o arquivo estiver aberto no Jupyter, o autosave dele pode sobrescrever o restaurado.
-* Nunca tira snapshot com a pasta desmontada (senão gravaria "todos os arquivos apagados"), e ignora um snapshot em que mais da metade dos arquivos sumiu de uma vez (mount instável).
-* O repositório sombra vive no laptop: se o laptop for perdido, o histórico vai junto (os arquivos continuam no servidor).
+Veja [Snapshots](#snapshots).
 
-### Comandos
+### Encerrar
 
-| Comando | O que faz |
-| --- | --- |
-| `tnrx-connect` | Pergunta host/pasta remota, monta na pasta atual e abre o terminal SSH |
-| `tnrx-connect status [pasta]` | Sessão, mount, cache (tamanho) e snapshots |
-| `tnrx-connect refresh` | Limpa o cache de diretórios (vê o que mudou no servidor agora) |
-| `tnrx-connect history [caminho]` | Lista os snapshots |
-| `tnrx-connect restore <id> [caminho ...]` | Restaura arquivos de um snapshot |
-| `tnrx-connect snapshot` | Tira um snapshot agora |
-| `tnrx-connect unmount [-f] [pasta]` | Desmonta um mount que ficou órfão (sessão que caiu). `-f` = desmontagem preguiçosa |
-| `tnrx-connect jupyter` | Acha os Jupyters do projeto que estão no ar, você escolhe e ele abre a ponte (veja [Jupyter](#jupyter-no-nó-de-computação)) |
-| `tnrx-connect jupyter <URL\|nó:porta>` | Abre a ponte para um Jupyter cuja URL você já tem |
+Não é obrigatório desmontar: a pasta pode ficar montada por dias. Mas a conexão cai quando a rede cai ou o laptop hiberna, e aí é só [reconectar](#a-rede-caiu). Para desmontar, saia da pasta e rode:
 
-### Jupyter no nó de computação
+```bash
+cd ~ && tnrx-connect umount ~/trabalho/meu-projeto
+```
 
-O mount só traz **arquivos**. O Jupyter roda num nó de computação (ex.: `dl-05`), e o endereço `http://dl-05:8888` só é alcançável de dentro da rede do cluster. O `tnrx-connect jupyter` abre uma **ponte** (túnel SSH) do seu laptop até esse nó, pela mesma conexão já autenticada (sem novo 2FA). Ele não inicia nada no servidor: **você inicia o Jupyter no servidor, e o `tnrx-connect` só descobre qual está no ar e conecta**, sem você precisar copiar nó, porta e token.
+Ele tira um último snapshot, desmonta, espera terminar o envio do que estava pendente e fecha a conexão. Se algo ainda usa a pasta (o editor, o Claude Code, um terminal dentro dela), ele recusa e a pasta continua montada: feche o que a usa e rode de novo, ou use `-f` para desmontar mesmo assim.
 
-**Como ele descobre:** quando o Jupyter sobe, o `tnrx` do servidor grava `.tnrx/jupyter/<job>.env` na pasta do projeto (com nó, porta, token, job e horário). O registro só é gravado **depois que a porta responde**, então se o arquivo existe, o Jupyter estava no ar. O `tnrx-connect jupyter` lê esses arquivos pela conexão SSH, testa a partir do servidor se cada `nó:porta` ainda responde e ignora os que não respondem (os parados há mais de um dia são apagados).
+## Jupyter
+
+O Jupyter roda num nó de GPU, que o laptop não alcança diretamente. O `tnrx-connect jupyter` abre uma ponte até ele pela conexão já autenticada.
+
+Uma vez por projeto, no terminal do servidor: `tnrx uv add jupyterlab ipykernel`.
+
+No laptop, dentro da pasta montada:
 
 ```bash
 tnrx-connect jupyter
 ```
 
-* Dentro da pasta montada (ou de uma subpasta dela) ele usa o host e a pasta remota da sessão e **não pergunta nada**. Fora dela, pergunta o host e a pasta do projeto.
-* **Nenhum servidor no ar:** só avisa (`Nenhum servidor Jupyter no ar neste projeto`) e sai.
-* **Um servidor:** conecta direto. **Vários:** mostra um menu, o mais recente primeiro, com `nó:porta`, job e há quanto tempo está no ar:
+```
+Servidores Jupyter no ar em recod-headnode (mais recente primeiro):
+  [1] meu-projeto  dl-05:8888  (job 95272, há 3 min)  ← este projeto
+  [2] outro        dl-02:8889  (job 95190, há 2 h)
+  [n] Iniciar um novo Jupyter em meu-projeto (/home/marcos/meu-projeto)
+Conectar em qual [1]:
+```
+
+* Ele lista os Jupyters no ar deste projeto e dos outros projetos do mesmo servidor que o laptop conhece.
+* Com `n` (ou Enter, quando não há nenhum no ar), ele inicia o Jupyter no servidor (`tnrx uvslurm jupyter lab`), mostra se o job está na fila ou subindo, e conecta quando o Jupyter responde. `Ctrl-C` durante a espera cancela o job.
+* Conectado, ele mostra o link:
 
   ```
-  Servidores Jupyter no ar (mais recente primeiro):
-    [1] dl-05:8888  (job 95272, há 3 min)
-    [2] dl-02:8889  (job 95190, há 2 h)
-  Conectar em qual [1]:
+  🌐 Abra no navegador:  http://dl-05.recod-headnode.localhost:18342/lab?token=...
+     Programas que não resolvem *.localhost (ex.: VS Code): http://127.0.0.1:18342/lab?token=...
+  📌 Esta URL é fixa para meu-projeto: no VS Code, configure uma vez (Existing Jupyter Server) e depois só escolha o servidor.
   ```
 
-* **A ponte fica ativa enquanto o Jupyter estiver no ar.** Se ele terminar (ou a conexão SSH cair), o comando avisa e sai. `Ctrl-C` fecha só a ponte; o Jupyter continua no servidor.
-* **Porta local:** ele tenta usar o **mesmo número** da porta do servidor (o `tnrx` já escolhe uma porta livre lá). Se essa porta já estiver em uso no laptop (por outra ponte ou outro programa), usa a próxima livre e avisa. Assim duas pontes com a mesma porta remota não conflitam.
-* **O nome `nó.host.localhost` é só um rótulo.** Navegadores resolvem qualquer `*.localhost` para o seu próprio computador, então ele não muda para onde a ponte vai. Vale porque servidores Jupyter diferentes em `localhost` compartilham cookies (o `_xsrf`) e se atrapalham; com nomes diferentes, não. Se o navegador não abrir esse nome, use o link `127.0.0.1`.
-* Se a conexão mestra do host ainda não existir, o comando autentica (senha/2FA) e a fecha ao sair. Se ela veio de uma sessão do `tnrx-connect` aberta, reaproveita e não a fecha.
+* Deixe essa aba aberta enquanto usa o Jupyter. `Ctrl-C` fecha só a ponte: o Jupyter continua no servidor e você reconecta depois com o mesmo comando. Para encerrar o Jupyter: `tnrx-connect cluster cancel <job>`.
 
-**Requisitos e cuidados:**
+**A URL é fixa por projeto.** A porta local (entre 18000 e 18999) e a senha são sempre as mesmas para o mesmo projeto, mesmo que o Jupyter caia em outro nó. Assim, o VS Code lembra do servidor:
 
-* O `tnrx` do servidor precisa estar **atualizado** (`git pull` lá): é ele que gera o token e grava o registro.
-* Inicie o Jupyter **na raiz do projeto**: o registro fica na pasta onde você rodou `tnrx uvslurm jupyter lab`.
-* O registro tem o **token** do Jupyter. O arquivo tem permissão 600 e a pasta `.tnrx/` tem um `.gitignore` próprio que ignora tudo, então ele não vai para um `git add .`. Ele aparece na pasta montada do laptop, então um programa local que leia a pasta (como o Claude Code) pode vê-lo: o token só dá acesso àquele Jupyter no cluster.
-* Se o Jupyter demorar mais de 3 minutos para responder, o registro não é gravado (ajustável com `TNRX_JUPYTER_REGISTER_SECS` ao iniciar). Nesse caso, use a forma manual abaixo.
+1. Abra o `.ipynb` na pasta montada, clique em **Select Kernel → Existing Jupyter Server** e cole o link `127.0.0.1`.
+2. Escolha o kernel `Python (TNRX-<pasta do projeto>)`.
+3. Das próximas vezes, rode `tnrx-connect jupyter` e escolha no VS Code o servidor que ele já conhece.
 
-**Se você já tem a URL (forma manual):** `tnrx-connect jupyter <URL|nó:porta>` abre a ponte sem consultar o servidor. Aceita a URL que o Jupyter imprimiu (`http://dl-05:8888/lab?token=...`), `dl-05:8888`, `dl-05 8888` ou só `dl-05` (porta 8888). Se você passar a URL `127.0.0.1`, ele pergunta o nome do nó. Serve para um `tnrx` antigo, que não grava o registro.
+Use o notebook **só no VS Code**, com o kernel remoto. Se o mesmo notebook também estiver aberto no navegador, o autosave do Jupyter e o editor disputam o arquivo, e vale a última gravação.
 
-### Configuração opcional
+**Se você já tem a URL** (de um Jupyter iniciado à mão, por exemplo): `tnrx-connect jupyter <URL>` abre a ponte direto. Aceita a URL impressa pelo Jupyter, `dl-05:8888` ou só `dl-05`.
 
-Adicione linhas ao `.conf` da pasta (elas são preservadas a cada execução):
+<details>
+<summary>Como a descoberta, a senha e a porta funcionam</summary>
+
+* **Descoberta:** quando o Jupyter começa a responder, o `tnrx` grava `.tnrx/jupyter/<job>.env` (nó, porta, senha, job) na pasta do projeto. O `tnrx-connect` lê esses registros e testa, a partir do servidor, se cada um ainda responde. Registros parados há mais de um dia são apagados. Por isso o Jupyter precisa ser iniciado na raiz do projeto.
+* **Senha:** é derivada de um segredo aleatório do laptop (`~/.config/tnrx-connect/jupyter.secret`), do host e da pasta remota. O `tnrx-connect` a grava em `.tnrx/jupyter/token` no servidor (permissão 600, fora do git) ao montar e antes de iniciar um Jupyter, e o `tnrx` a usa, inclusive num Jupyter iniciado à mão. Para trocar as senhas de todos os projetos, apague o `jupyter.secret`.
+* **Porta:** escolhida na primeira conexão e guardada no `.conf` do projeto como `JUPYTER_PORT`. Se estiver ocupada no laptop, ele usa outra só daquela vez e avisa.
+* **O nome `nó.host.localhost`** é só um rótulo: o navegador resolve qualquer `*.localhost` para o próprio laptop. Ele existe porque Jupyters diferentes no mesmo `localhost` misturam os cookies. Se o navegador não abrir esse nome, use o link `127.0.0.1`.
+* **Segurança:** a senha fica em arquivos 600 que aparecem na pasta montada, então programas locais que leem a pasta (como o Claude Code) podem vê-la. Ela só dá acesso aos Jupyters daquele projeto. No nó, ela também aparece na linha de comando do Jupyter, visível para outros usuários do mesmo nó enquanto o job roda.
+* **A ponte fecha sozinha** quando o Jupyter termina (checado a cada ~30 s) ou quando a conexão cai.
+
+</details>
+
+## Snapshots
+
+Enquanto a pasta está montada, o `tnrx-connect` tira um snapshot a cada minuto, se algo mudou. Os snapshots ficam num repositório git **separado**, no laptop (`~/.local/share/tnrx-connect/<id>/shadow.git`), e não mexem no `.git` do projeto.
+
+* Seguem o `.gitignore` do projeto e ignoram arquivos maiores que 5 MB.
+* O `restore` tira um snapshot antes de restaurar, então ele mesmo pode ser desfeito. Ele não apaga arquivos criados depois do snapshot escolhido.
+* Nunca há snapshot com a pasta desmontada, e um snapshot em que mais da metade dos arquivos sumiu é descartado (sinal de montagem instável).
+* O histórico vive só no laptop. Os arquivos em si continuam no servidor.
+
+`tnrx-connect snapshot` tira um snapshot na hora.
+
+## Referência
+
+### Comandos
+
+| Comando | O que faz |
+| --- | --- |
+| `tnrx-connect` | Monta, se ainda não estiver montada, e abre o terminal do servidor |
+| `tnrx-connect mount` | Monta a pasta remota na pasta atual e devolve o prompt. Numa pasta já montada, só confere e reautentica se a conexão caiu |
+| `tnrx-connect ssh` | Abre o terminal do servidor na pasta remota correspondente. Sair dele não desmonta |
+| `tnrx-connect umount [-f] [pasta]` | Snapshot final, desmonta e fecha a conexão se nada mais a usa. `-f` desmonta mesmo com a pasta em uso |
+| `tnrx-connect status [pasta]` | Montagem, conexão, cache e snapshots |
+| `tnrx-connect refresh` | Mostra agora o que mudou no servidor |
+| `tnrx-connect history [caminho]` | Lista os snapshots |
+| `tnrx-connect restore <id> [caminho ...]` | Restaura arquivos de um snapshot |
+| `tnrx-connect snapshot` | Tira um snapshot agora |
+| `tnrx-connect jupyter` | Lista os Jupyters no ar, conecta ou inicia um novo |
+| `tnrx-connect jupyter <URL\|nó:porta>` | Abre a ponte para um Jupyter conhecido |
+| `tnrx-connect jupyter list` | Lista os Jupyters no ar, sem conectar |
+| `tnrx-connect cluster [--host H]` | Partições, GPUs livres e os seus jobs nos servidores com pasta montada |
+| `tnrx-connect cluster cancel <job>` | Cancela um job |
+| `tnrx-connect --debug <comando>` | Mostra os comandos reais (`ssh`, `rclone`) antes de rodá-los |
+| `tnrx-connect update` | Atualiza o `tnrx-connect` (e a extensão do VS Code) a partir do GitHub |
+| `tnrx-connect version` | Versão instalada |
+| `tnrx-connect uninstall` | Remove os comandos e a pasta da instalação |
+
+Os comandos `status`, `cluster` e `jupyter` também têm saída `--json`, para ferramentas: [tnrx-connect-json.md](tnrx-connect-json.md).
+
+### Onde ficam as coisas (no laptop)
+
+| Caminho | Conteúdo |
+| --- | --- |
+| `~/.config/tnrx-connect/<id>.conf` | Configuração de cada pasta: host, pasta remota, pasta local, porta do Jupyter, opções |
+| `~/.config/tnrx-connect/jupyter.secret` | Segredo das senhas fixas do Jupyter |
+| `~/.local/share/tnrx-connect/<id>/vfs-*/` | Cache do `rclone`. **Nunca é apagado automaticamente** |
+| `~/.local/share/tnrx-connect/<id>/shadow.git` | Snapshots |
+| `~/.local/share/tnrx-connect/<id>/mount.log` | Log do `rclone` e dos snapshots |
+
+O `<id>` é `<host>_<nome da pasta local>`. A configuração fica fora do projeto porque a pasta local precisa estar vazia para montar.
+
+### Opções
+
+Acrescente ao `.conf` da pasta (as linhas são preservadas):
 
 ```bash
 CACHE_MAX_SIZE=50G          # limite do cache em disco (padrão: 20G)
-DIR_CACHE_TIME=10s          # por quanto tempo confia na listagem de pastas (padrão: 30s)
+DIR_CACHE_TIME=10s          # tempo até ver mudanças feitas no servidor (padrão: 30s)
 SNAPSHOT_INTERVAL=30        # segundos entre snapshots (padrão: 60)
-SNAPSHOT_MAX_FILE_MB=10     # ignora arquivos maiores que isso nos snapshots (padrão: 5)
+SNAPSHOT_MAX_FILE_MB=10     # tamanho máximo de arquivo nos snapshots (padrão: 5)
 ```
 
-### Cuidados
+### Regras da montagem
 
-* **Desmontagem ocupada:** se algo ainda usa a pasta (o Claude Code, um editor, um shell dentro dela), a desmontagem falha, a montagem **continua ativa** e nada é perdido. Feche o que usa a pasta, saia dela (`cd ~`) e rode `tnrx-connect unmount <pasta>`.
-* **`rclone` ainda enviando escritas:** ao sair, o comando espera o `rclone` terminar (até 2 minutos) e não o mata. Se passar disso, as escritas pendentes ficam no cache e são retomadas na próxima montagem.
-* **Commits:** o pre-commit deste projeto depende do `./tnrx` no servidor, então faça `git add`/`git commit` pelo terminal SSH que o comando abriu, não pela pasta montada no laptop. O `git status` sobre o mount também pode ser lento.
-* **Rede caiu no meio da sessão:** a conexão mestra cai junto. Feche, rode `tnrx-connect` de novo (vai pedir senha/2FA de novo, é esperado) e ele recupera a sessão anterior.
+* **A pasta local precisa estar vazia**, porque a montagem esconde o que estava nela. O comando também recusa `/` e a sua home.
+* **Uma montagem por pasta.** Montar de novo uma pasta montada só confere a montagem. A trava é só deste laptop: outra pessoa pode montar a mesma pasta remota.
+* **O `.venv/` não aparece no laptop**, para não varrer milhares de arquivos. Ele continua existindo no servidor.
+* **Mesmo arquivo, dois escritores:** se o laptop e um processo no servidor salvam o mesmo arquivo ao mesmo tempo, vale a última gravação. Mantenha um escritor por arquivo.
+* **Montagem que caiu** (laptop reiniciado, `rclone` encerrado): o próximo `tnrx-connect mount` percebe e remonta sozinho, mesmo com programas ainda abertos na pasta antiga. Nada se perde: o que não tinha sido enviado continua no cache e é enviado na nova montagem.
+* **O cache é persistente:** guarda leituras e escritas em disco até `CACHE_MAX_SIZE`. Uma escrita que não subiu por causa de uma queda de rede sobe quando a conexão volta.
 
 ## Problemas comuns
 
-| Sintoma | Causa provável | O que fazer |
+### A rede caiu
+
+Com a rede fora ou o laptop hibernado, a conexão mestra cai e a pasta para de sincronizar. O que você salva fica no cache. Na pasta, rode:
+
+```bash
+tnrx-connect mount
+```
+
+Ele pede a senha e o 2FA de novo, e a pasta volta a sincronizar sem remontar. Se ela continuar travada: `tnrx-connect umount -f` e `tnrx-connect mount`.
+
+### Tabela
+
+| Sintoma | Causa | O que fazer |
 | --- | --- | --- |
-| A pasta montada aparece **vazia** | O terminal já estava dentro da pasta antes de montar | `cd .` ou reabra o terminal |
-| `... não está vazia` ao rodar `tnrx-connect` | O mount é feito **por cima** da pasta local e esconderia o conteúdo dela | Rode numa pasta vazia (`mkdir` uma nova) ou mova o conteúdo local; o que está no servidor pode ter arquivos à vontade |
-| `Já existe uma sessão do tnrx-connect ativa nesta pasta` | Outra sessão viva usa essa pasta | Use a aba dela, ou saia dela; se ela caiu, rode de novo (o lock velho é recuperado) |
-| Pede senha/2FA de novo | A conexão mestra caiu (rede) | É esperado: autentique de novo e rode `tnrx-connect` |
-| `Nenhum servidor Jupyter no ar neste projeto` | O Jupyter não está rodando, ainda está na fila, foi iniciado em **outra pasta**, ou o `tnrx` do servidor está desatualizado | Na aba 1, na raiz do projeto: `tnrx uvslurm jupyter lab` e espere subir; `git pull` no servidor; confira com `squeue -u $USER` |
-| O navegador mostra `Connection refused` | O Jupyter terminou ou o nó/porta mudou | Rode `tnrx-connect jupyter` de novo (ele lista só o que responde) |
-| O navegador não abre `nó.host.localhost` | O navegador ou o sistema não resolve `*.localhost` | Use o link `127.0.0.1` |
-| `Hostname '...' não está configurado` (do `tnrx`) | O servidor não está em `tnrx_hosts.conf` | Adicione uma linha: [tnrx.md, seção 1.1](tnrx.md#11-particularidades-de-cada-servidor-tnrx_hostsconf) |
-| `Nenhum arquivo .sif encontrado` (do `tnrx`) | Falta a imagem do container na pasta | `tnrx install singularity` |
-| `'apptainer'/'singularity' não foi encontrado nesta máquina` (do `tnrx`) | Você está numa máquina sem o runtime (ex.: o nó `ssh`, só de acesso) | Rode o `tnrx` no nó certo do servidor |
-| Salvei no laptop e o servidor ainda vê a versão antiga | O arquivo sobe uns 5 s depois de salvo | Espere alguns segundos antes de submeter o job |
-| O job não sai da fila | Faltam recursos na partição | `squeue -u $USER`; ajuste `PARTITION`/`GPUS` no `tnrx_slurm.conf` |
-| A desmontagem falha ao sair (`Ainda em uso`) | Algo ainda usa a pasta | Feche o editor/Claude Code, `cd ~`, e `tnrx-connect unmount <pasta>` |
+| A pasta montada aparece vazia | O terminal já estava na pasta antes de montar | `cd .` |
+| `... não está vazia` | A pasta local tem arquivos | Use uma pasta vazia |
+| `... não está montada` | A pasta foi desmontada | `tnrx-connect` |
+| `A conexão autenticada com ... caiu` | Rede ou hibernação | [Reconectar](#a-rede-caiu) |
+| Salvei no laptop e o job viu a versão antiga | O envio leva uns 5 s | Espere antes de submeter |
+| Não vejo no laptop um arquivo que o job criou | A listagem é atualizada a cada 30 s | `tnrx-connect refresh` |
+| `git status` lento | Cada arquivo é consultado pela rede | Use o `git` no terminal do servidor |
+| `Nenhum servidor Jupyter no ar` | Ainda na fila, iniciado fora da raiz do projeto, ou `tnrx` desatualizado no servidor | Inicie um novo pelo menu; `tnrx update` no servidor |
+| `O tnrx terminou sem subir o Jupyter` | Falha no servidor (projeto sem imagem, sem Jupyter no `.venv`, partição errada) | Leia o fim do log que ele mostra (`.tnrx/jupyter/launch.log`) |
+| A URL do Jupyter no VS Code mudou | A porta fixa estava ocupada no laptop | Feche o que usa a porta e reconecte |
+| O navegador não abre `nó.host.localhost` | O sistema não resolve `*.localhost` | Use o link `127.0.0.1` |
+| `umount` falha com `Ainda em uso` | Algo usa a pasta | Feche o editor/Claude Code, `cd ~`, rode de novo (ou `-f`) |
+| Erros do `tnrx` no terminal do servidor | | Veja [Problemas comuns do tnrx](tnrx.md#problemas-comuns) |
 
 ## Modo alternativo: rsync
 
-Use se o mount não funcionar no seu ambiente ou se você prefere ter uma **cópia local** do projeto. Aqui a sincronização é **só de ida** (laptop → servidor): o laptop é a fonte da verdade, então editar direto no servidor pode ser sobrescrito no próximo envio.
+Se a montagem não funciona no seu ambiente, ou você prefere uma **cópia local**, o modo rsync mantém a pasta do laptop sincronizada com o servidor, **só de ida** (laptop → servidor). O laptop é a fonte da verdade: uma edição feita direto no servidor pode ser sobrescrita no próximo envio.
 
 ```bash
-tnrx-connect init    # cria o .tnrx_connect deste projeto (HOST + navegação de pastas pro REMOTE_PATH)
-tnrx-connect rsync   # sincroniza em background e abre o terminal SSH
+tnrx-connect init     # cria o .tnrx_connect na raiz do projeto (host e pasta remota)
+tnrx-connect rsync    # sincroniza e abre o terminal do servidor; sincroniza a cada 3 s enquanto ele estiver aberto
 ```
 
-`.tnrx_connect` (na raiz do projeto, no `.gitignore`) segue o formato do template `.tnrx_connect.example`:
+O `.tnrx_connect` segue o modelo [`.tnrx_connect.example`](../.tnrx_connect.example):
 
 ```bash
-HOST=abaporu                                       # alvo SSH (user@servidor ou alias do ~/.ssh/config)
-REMOTE_PATH=/home/seu_usuario/projetos/seu_projeto # caminho absoluto no servidor
-# SYNC_DELETE=true    # espelha deleções locais no servidor (padrão: true)
+HOST=recod-headnode
+REMOTE_PATH=/home/seu_usuario/meu-projeto
+# SYNC_DELETE=true    # apaga no servidor o que você apagou no laptop (padrão: true)
 # POLL_INTERVAL=3     # segundos entre sincronizações (padrão: 3)
 ```
 
 | Comando | O que faz |
 | --- | --- |
-| `tnrx-connect rsync` | Sincroniza uma vez e abre o terminal SSH, mantendo o sync ativo em background enquanto a sessão estiver aberta |
-| `tnrx-connect sync` | Sincroniza uma vez (local → remoto), sem abrir SSH — útil antes de um `tnrx slurm`/`tnrx uvslurm` pontual |
-| `tnrx-connect pull` | Puxa do servidor pro local uma vez, sem apagar nada local |
-| `tnrx-connect init` | Cria o `.tnrx_connect` interativamente |
-| `tnrx-connect uninstall` | Remove o symlink local |
+| `tnrx-connect rsync` | Sincroniza e abre o terminal do servidor; continua sincronizando enquanto ele estiver aberto |
+| `tnrx-connect sync` | Sincroniza uma vez, laptop → servidor |
+| `tnrx-connect pull` | Traz do servidor uma vez, sem apagar nada local |
+| `tnrx-connect init` | Cria o `.tnrx_connect` |
 
-**Enquanto o terminal do `tnrx-connect rsync` estiver aberto, a sincronização roda sozinha, continuamente, em background** (um loop de `rsync` a cada `POLL_INTERVAL` segundos; não é instantâneo, mas o `rsync` faz diff incremental, então cada rodada é barata). Ao sair da sessão, o loop é encerrado automaticamente. Outros detalhes:
-
-* Usa o **`.gitignore` do projeto** como lista de exclusão do `rsync` — `.venv/`, `*.sif`, `slurm-*.out` etc. nunca são enviados nem apagados no servidor.
-* **`--delete` vem ligado** (`SYNC_DELETE=true`): arquivos apagados localmente somem do servidor no próximo envio. Um arquivo criado manualmente no servidor, dentro do projeto e fora do `.gitignore`, pode ser apagado — desative com `SYNC_DELETE=false`.
-* **Senha + 2FA:** mesma conexão mestra do modo mount — autentica uma vez. `sync`/`pull` usados sozinhos pedem senha/2FA a cada chamada, a menos que já exista uma sessão aberta pro mesmo host (aí reaproveitam).
-* Resultados de treino/logs devem ir pro storage compartilhado já montado (`/data`/`/hadatasets`, o mesmo `HUB_ROOT` do `tnrx hf`), não pra dentro do diretório do projeto.
-* Editou e disparou um job em seguida? O polling pode não ter processado ainda: rode `tnrx-connect sync` antes de um `tnrx slurm`/`tnrx uvslurm` pontual.
+* O `.gitignore` do projeto vale como lista de exclusão: `.venv/`, `*.sif` e o que mais estiver lá nunca são enviados nem apagados.
+* Com `SYNC_DELETE=true`, um arquivo criado à mão no servidor, dentro do projeto e fora do `.gitignore`, é apagado no próximo envio.
+* Editou e vai submeter um job logo em seguida? Rode `tnrx-connect sync` antes, para não depender do intervalo.

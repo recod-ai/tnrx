@@ -1,63 +1,80 @@
 # tnrx
 
-Este repositório tem **duas ferramentas independentes**, que rodam em máquinas diferentes:
+Ferramentas para trabalhar em projetos de Python com GPU nos servidores do laboratório (Abaporu, Headnode). São duas, e cada uma roda numa máquina:
 
 | | [`tnrx`](docs/tnrx.md) | [`tnrx-connect`](docs/tnrx-connect.md) |
 | --- | --- | --- |
-| **Onde roda** | No **servidor** (Abaporu, Headnode) | No **seu laptop/desktop/notebook** |
-| **Pra que serve** | Rodar código no cluster: unifica o isolamento do **Singularity**, a velocidade do **uv** e a orquestração do **Slurm** | Trabalhar com o projeto **do seu computador** (editor, Claude Code) enquanto os arquivos ficam no servidor |
-| **Precisa de internet?** | Só no headnode (instalar pacotes, baixar modelos) | Sim, é o ponto: roda onde há internet plena |
-| **Instalar algo no servidor?** | Sim: é o próprio `tnrx` | **Não**: usa só `ssh`/SFTP, que o servidor já tem |
-| **Documentação** | [docs/tnrx.md](docs/tnrx.md) | [docs/tnrx-connect.md](docs/tnrx-connect.md) |
-
-## Como as duas se encaixam
+| **Onde roda** | No **servidor** | No **seu laptop** |
+| **O que faz** | Executa o projeto: cria o container, instala as bibliotecas com o `uv` e submete os jobs no Slurm | Liga o laptop ao servidor: monta a pasta do projeto no laptop, abre o terminal do servidor e traz o Jupyter até o seu navegador ou VS Code |
+| **Instala algo no servidor?** | Sim, é o próprio `tnrx` | Não. Usa só `ssh` e SFTP, que o servidor já tem |
 
 ```
-   SEU LAPTOP                                    SERVIDOR (Abaporu / Headnode)
-┌──────────────────────┐                      ┌────────────────────────────────┐
-│  editor, Claude Code │   tnrx-connect       │  arquivos do projeto           │
-│  (com internet)      │ ───────────────────► │  tnrx slurm / tnrx uvslurm     │
-│                      │  mount ou rsync      │  (nós Slurm: sem internet)     │
-│  terminal SSH aberto │ ◄─────────────────── │  Jupyter, jobs de GPU, /data   │
-└──────────────────────┘   terminal do        └────────────────────────────────┘
-                           servidor
+   SEU LAPTOP (com internet)                     SERVIDOR
+┌──────────────────────────┐                  ┌─────────────────────────────────┐
+│ editor, Claude Code      │  pasta montada   │ headnode: arquivos do projeto,  │
+│ na pasta montada         │ ◄──────────────► │ tnrx uv, tnrx hf (tem internet) │
+│                          │                  │                                 │
+│ terminal do servidor     │  ssh             │ nós Slurm: tnrx uvslurm,        │
+│ (tnrx-connect ssh)       │ ───────────────► │ Jupyter, GPUs (sem internet)    │
+│                          │                  │                                 │
+│ navegador / VS Code      │  ponte do Jupyter│                                 │
+└──────────────────────────┘ ◄─────────────── └─────────────────────────────────┘
 ```
 
-* O **`tnrx`** é o que **executa** o trabalho: cria o ambiente, submete jobs no Slurm, sobe o Jupyter e baixa modelos do Hugging Face. Ele só existe no servidor.
-* O **`tnrx-connect`** é o que **liga o seu laptop ao servidor**: monta (ou sincroniza) a pasta do projeto no seu computador e abre um terminal SSH no servidor, onde você roda os comandos do `tnrx`.
+**Por que duas ferramentas:** os nós de computação não têm internet, e ferramentas como o Claude Code precisam dela o tempo todo. Rodá-las no headnode sobrecarrega uma máquina compartilhada, e um proxy pelo headnode desfaria o isolamento de rede do cluster. Então o editor e o Claude Code rodam no laptop, o código roda no servidor, e o `tnrx-connect` liga os dois.
 
-Por que duas ferramentas? Os nós de computação do Slurm não têm internet, e o Claude Code precisa dela o tempo todo. Rodá-lo no headnode sobrecarrega uma máquina compartilhada, e um proxy pelo headnode reabriria o isolamento de rede que o cluster mantém de propósito. Então o Claude Code roda **no laptop**, e o `tnrx-connect` faz a ponte até os arquivos no servidor.
+## Início rápido
 
-## Por onde começar
-
-**Vou rodar jobs no servidor** → [docs/tnrx.md](docs/tnrx.md), no servidor:
+**Instalação**, uma vez em cada máquina (servidores e laptop):
 
 ```bash
-chmod +x tnrx
-ln -sf "$(pwd)/tnrx" ~/.local/bin/tnrx
-tnrx install uv && tnrx install singularity
-tnrx uvslurm python deep_check.py
+curl -fsSL https://raw.githubusercontent.com/recod-ai/tnrx/main/install.sh | bash
 ```
 
-**Quero editar no meu laptop (ex.: com o Claude Code)** → [docs/tnrx-connect.md](docs/tnrx-connect.md), no laptop:
+O mesmo comando serve para as duas. Ele pergunta o que instalar (`tnrx`, `download_huggingface`, `tnrx-connect` e a extensão do VS Code), já sugerindo o que faz sentido para a máquina: num servidor, o `tnrx`; num laptop, o `tnrx-connect`. Para atualizar depois: `tnrx update` (ou `tnrx-connect update`). Detalhes em [docs/tnrx.md](docs/tnrx.md#instalação).
+
+**Para cada projeto**, no laptop:
 
 ```bash
-chmod +x tnrx-connect
-ln -sf "$(pwd)/tnrx-connect" ~/.local/bin/tnrx-connect
 mkdir -p ~/trabalho/meu-projeto && cd ~/trabalho/meu-projeto
-tnrx-connect
+tnrx-connect          # pergunta o servidor e a pasta remota, monta e abre o terminal do servidor
 ```
 
-> O modo mount do `tnrx-connect` já montou o Headnode com o `rclone` real e funciona. Ainda não foram validados num servidor real: o 2FA do Abaporu, escritas pendentes após queda de rede, o desempenho de `git status`/buscas na pasta montada e o macOS; a lista de conferência está em [docs/validacao-manual.md](docs/validacao-manual.md). O manual com o passo a passo das tarefas do dia a dia está em [docs/tnrx-connect.md](docs/tnrx-connect.md#tarefas-do-dia-a-dia).
+No terminal do servidor que abriu:
+
+```bash
+tnrx uv init                           # só se o projeto ainda não tem pyproject.toml
+tnrx uv add torch                      # na primeira vez, pergunta qual imagem usar (Enter = a padrão)
+tnrx uvslurm python deep_check.py      # roda na GPU
+```
+
+Em outra aba do laptop, na mesma pasta, abra o editor ou o Claude Code. O que você salva ali é o que roda no servidor.
+
+## Documentação
+
+| Documento | Para quê |
+| --- | --- |
+| [docs/tnrx.md](docs/tnrx.md) | Manual do `tnrx`: imagem do container, bibliotecas, Slurm, Jupyter, Hugging Face |
+| [docs/tnrx-connect.md](docs/tnrx-connect.md) | Manual do `tnrx-connect`: montar o projeto, tarefas do dia a dia, Jupyter, snapshots |
+| [vscode/README.md](vscode/README.md) | Extensão do VS Code: barra lateral com montagens, Slurm, cluster e Jupyter |
+| [docs/tnrx-connect-json.md](docs/tnrx-connect-json.md) | Interface `--json` do `tnrx-connect`, para quem escreve ferramentas em cima dele |
+| [docs/desenvolvimento.md](docs/desenvolvimento.md) | Para quem mexe neste repositório: testes, pre-commit, organização do código |
+| [docs/validacao-manual.md](docs/validacao-manual.md) | O que ainda precisa ser conferido num servidor real |
+
+> **Estado:** o `tnrx` está em uso no Abaporu e no Headnode. O `tnrx-connect` já monta o Headnode com o `rclone` real. Ainda falta conferir num servidor real o 2FA do Abaporu, escritas pendentes depois de uma queda de rede, o desempenho de `git status` na pasta montada, o build da imagem a partir do `tnrx.def` e o macOS. A lista completa está em [docs/validacao-manual.md](docs/validacao-manual.md).
 
 ## O que tem no repositório
 
-| Arquivo | Pertence a | O que é |
+| Arquivo | Ferramenta | O que é |
 | --- | --- | --- |
-| [`tnrx`](tnrx) | `tnrx` (servidor) | O wrapper Singularity + uv + Slurm |
-| [`tnrx_hosts.conf`](tnrx_hosts.conf) | `tnrx` (servidor) | Particularidades de cada servidor (bind path, runtime, `HUB_ROOT`); veja [docs/tnrx.md](docs/tnrx.md#11-particularidades-de-cada-servidor-tnrx_hostsconf) |
-| [`tnrx_slurm.conf`](tnrx_slurm.conf) | `tnrx` (servidor) | Partição, GPUs, CPUs, memória e tempo dos jobs |
-| [`download_huggingface`](download_huggingface) | `tnrx` (servidor) | Utilitário de download do Hugging Face Hub, usado por `tnrx hf` |
-| [`tnrx-connect`](tnrx-connect) | `tnrx-connect` (laptop) | Monta/sincroniza o projeto do servidor no laptop e abre o terminal SSH |
-| [`.tnrx_connect.example`](.tnrx_connect.example) | `tnrx-connect` (laptop) | Template de config do modo rsync (o modo mount não usa) |
-| [`test_tnrx.sh`](test_tnrx.sh), [`test_tnrx_connect.sh`](test_tnrx_connect.sh) | ambas | Testes de cada ferramenta; rodam a cada commit via pre-commit (ver [docs/tnrx.md](docs/tnrx.md#8-qualidade-de-código-e-pre-commit)) |
+| [`install.sh`](install.sh) | ambas | O instalador: instalar, atualizar, `update-dev` e desinstalar |
+| [`tnrx`](tnrx) | `tnrx` | O script |
+| [`tnrx_hosts.conf`](tnrx_hosts.conf) | `tnrx` | O que muda de um servidor para outro: bind path, runtime do container, pasta do Hugging Face |
+| [`tnrx.def`](tnrx.def) | `tnrx` | Modelo da imagem do container, para copiar para um projeto que precise de pacotes do sistema |
+| [`tnrx_slurm.conf`](tnrx_slurm.conf) | `tnrx` | Exemplo de configuração do Slurm de um projeto |
+| [`download_huggingface`](download_huggingface) | `tnrx` | Usado por `tnrx hf` para baixar modelos e datasets |
+| [`deep_check.py`](deep_check.py), [`deep_check_jax.py`](deep_check_jax.py), [`load_model.py`](load_model.py) | `tnrx` | Scripts de exemplo para conferir a GPU com PyTorch e JAX, e carregar um modelo baixado |
+| [`tnrx-connect`](tnrx-connect) | `tnrx-connect` | O script |
+| [`.tnrx_connect.example`](.tnrx_connect.example) | `tnrx-connect` | Modelo de configuração do modo rsync (o modo mount não usa) |
+| [`vscode/`](vscode/) | `tnrx-connect` | A extensão do VS Code |
+| [`test_tnrx.sh`](test_tnrx.sh), [`test_tnrx_connect.sh`](test_tnrx_connect.sh) | ambas | Testes; veja [docs/desenvolvimento.md](docs/desenvolvimento.md) |

@@ -1,0 +1,28 @@
+# tnrx.def
+#
+# Definition file padrão do tnrx (formato do Apptainer/Singularity).
+# Para customizar a imagem de um projeto, copie este arquivo para a pasta do
+# projeto, edite e rode `tnrx install singularity`: ele gera a imagem (build
+# com --fakeroot) no banco ~/.tnrx/sifs e liga o projeto a ela.
+#
+# A imagem só traz o sistema (CUDA, cuDNN, ferramentas de linha de comando).
+# O Python e as bibliotecas ficam com o uv no .venv do projeto: o uv baixa a
+# versão de Python pedida no pyproject.toml, então ela não precisa estar aqui.
+
+Bootstrap: docker
+From: nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
+
+%labels
+    Description Imagem base do tnrx: CUDA 12.6 + cuDNN 9 (runtime), Ubuntu 24.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    # git: dependências do uv vindas de repositórios git
+    # ca-certificates/curl: downloads via HTTPS (uv, Hugging Face)
+    apt-get install -y --no-install-recommends ca-certificates curl git
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8

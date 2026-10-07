@@ -259,7 +259,8 @@ test_missing_sif_error() {
 
     # Try to run tnrx without .sif file with timeout
     # Use timeout to prevent hanging on srun
-    output=$(timeout 3 "$TNRX_SCRIPT" uv add test 2>&1)
+    setup_fake_runtime
+    output=$(PATH="$FAKE_PATH" TNRX_SIF_DIR="$FAKE_STORE" timeout 3 "$TNRX_SCRIPT" uv add test </dev/null 2>&1)
     local exit_code=$?
 
     # Either timeout or find_sif error should occur
@@ -282,7 +283,8 @@ test_multiple_sif_error() {
     touch dummy1.sif dummy2.sif
 
     # Use timeout to prevent hanging on srun
-    output=$(timeout 3 "$TNRX_SCRIPT" uv add test 2>&1)
+    setup_fake_runtime
+    output=$(PATH="$FAKE_PATH" TNRX_SIF_DIR="$FAKE_STORE" timeout 3 "$TNRX_SCRIPT" uv add test </dev/null 2>&1)
     local exit_code=$?
 
     # Either timeout or find_sif error should occur
@@ -594,10 +596,260 @@ FAKEUV
         if [[ -z "$(git status --porcelain --untracked-files=all 2>/dev/null | grep '\.tnrx')" ]]; then pass_test "git não enxerga o .tnrx"; else fail_test "git enxerga o .tnrx" "$(git status --porcelain --untracked-files=all)"; fi
     fi
 
+    # Senha fixa: com .tnrx/jupyter/token (gravado pelo tnrx-connect), usa ela
+    rm -rf .tnrx
+    mkdir -p .tnrx/jupyter
+    printf '%s\n' "0123456789abcdef0123456789abcdef0123456789abcdef" > .tnrx/jupyter/token
+    out=$(SLURM_JOB_ID=4244 TNRX_JUPYTER_REGISTER_SECS=2 TNRX_JUPYTER_PORT=47902 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+    assert_contains "$out" "--IdentityProvider.token=0123456789abcdef0123456789abcdef0123456789abcdef" "usa a senha fixa de .tnrx/jupyter/token"
+    printf 'curta\n' > .tnrx/jupyter/token
+    out=$(SLURM_JOB_ID=4245 TNRX_JUPYTER_REGISTER_SECS=2 TNRX_JUPYTER_PORT=47903 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
+    flag_token=$(printf '%s\n' "$out" | sed -n 's/.*--IdentityProvider.token=\([0-9a-f]*\).*/\1/p' | head -1)
+    if [[ ${#flag_token} -eq 48 ]]; then pass_test "senha inválida no arquivo: gera uma aleatória"; else fail_test "token inesperado" "$flag_token"; fi
+
     rm -rf .tnrx
     out=$(SLURM_JOB_ID=4243 TNRX_JUPYTER_REGISTER_SECS=2 TNRX_JUPYTER_PORT=47901 HOME="$PWD/home" PATH="$fake_path" timeout 20 "$TNRX_SCRIPT" uvslurm jupyter lab 2>&1)
     sleep 3
     if [[ ! -e .tnrx/jupyter/4243.env ]]; then pass_test "sem Jupyter respondendo, nada é registrado"; else fail_test "registrou sem o Jupyter subir"; fi
+
+    cleanup_test_env
+}
+
+# Ambiente falso para os testes do banco de imagens: hostname do Abaporu, um
+# singularity que cria o arquivo pedido no pull/build (e falha com FAKE_RUNTIME_FAIL)
+# e um banco vazio em ./store.
+setup_fake_runtime() {
+    mkdir -p bin store home/.local/bin
+    printf '#!/bin/sh\necho abaporu\n' > bin/hostname
+    cat > bin/singularity <<'FAKERT'
+#!/bin/bash
+echo "RUNTIME-ARGS: $*"
+[ -n "$FAKE_RUNTIME_FAIL" ] && { echo "FATAL: fakeroot not available"; exit 255; }
+case "$1" in
+    pull|build) out="${@: -2:1}"; echo fake > "$out" ;;
+    exec) shift; while [ "$1" = "--bind" ]; do shift 2; done; [ "$1" = "--nv" ] && shift; echo "EXEC-IMAGE: $1" ;;
+esac
+FAKERT
+    printf '#!/bin/bash\necho "UV: $*"\n' > home/.local/bin/uv
+    chmod +x bin/* home/.local/bin/uv
+    FAKE_PATH="$PWD/bin:$PATH"
+    FAKE_STORE="$PWD/store"
+}
+
+test_install_singularity() {
+    log_test "install singularity: imagem no banco, link na pasta"
+    setup_test_env
+    setup_fake_runtime
+    mkdir proj && cd proj || return
+    local default_name="nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" out
+
+    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
+    assert_contains "$out" "pull $FAKE_STORE/.tmp-" "sem tnrx.def: pull da imagem padrão para o banco"
+    assert_file_exists "$FAKE_STORE/$default_name" "nome da imagem vem da origem docker"
+    if [[ -L "$default_name" && "$(readlink "$default_name")" == "$FAKE_STORE/$default_name" ]]; then
+        pass_test "link na pasta com o mesmo nome, apontando para o banco"
+    else
+        fail_test "link na pasta" "$(ls -la)"
+    fi
+    assert_contains "$out" "cp $SCRIPT_DIR/tnrx.def ." "sem tnrx.def: sugere copiar o modelo"
+    if ls "$FAKE_STORE"/.tmp-* >/dev/null 2>&1; then fail_test "sobrou arquivo temporário no banco"; else pass_test "sem temporários no banco"; fi
+
+    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
+    assert_not_contains "$out" "RUNTIME-ARGS" "imagem já no banco: não baixa de novo"
+    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity --force </dev/null 2>&1)
+    assert_contains "$out" "RUNTIME-ARGS: pull" "--force: baixa de novo"
+
+    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity docker://ubuntu:24.04 </dev/null 2>&1)
+    assert_file_exists "$FAKE_STORE/ubuntu_24.04.sif" "origem explícita: ubuntu_24.04.sif"
+    if [[ -L ubuntu_24.04.sif && ! -e "$default_name" && ! -L "$default_name" ]]; then
+        pass_test "o link novo substitui o antigo (um .sif por pasta)"
+    else
+        fail_test "troca de link" "$(ls -la)"
+    fi
+
+    cp "$SCRIPT_DIR/tnrx.def" .
+    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
+    local def_name="nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04__def-$(sha256sum tnrx.def | cut -c1-8).sif"
+    if [ "$(id -u)" -ne 0 ]; then
+        assert_contains "$out" "build --fakeroot $FAKE_STORE/.tmp-" "com tnrx.def: build com --fakeroot"
+    fi
+    assert_file_exists "$FAKE_STORE/$def_name" "imagem do .def: nome da base + hash do conteúdo"
+    echo "# mudança" >> tnrx.def
+    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity </dev/null 2>&1)
+    assert_contains "$out" "RUNTIME-ARGS: build" ".def editado: gera uma imagem nova"
+
+    out=$(TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity ausente.def </dev/null 2>&1)
+    assert_contains "$out" "Definition file não encontrado: ausente.def" ".def inexistente: erro"
+
+    rm -f ./*.sif tnrx.def
+    echo real > proprio.sif
+    out=$(echo n | TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity 2>&1)
+    if [[ -f proprio.sif && ! -L proprio.sif ]]; then pass_test ".sif próprio e resposta 'n': mantido"; else fail_test ".sif próprio apagado"; fi
+    out=$(echo y | TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity 2>&1)
+    if [[ ! -e proprio.sif && -L "$default_name" ]]; then pass_test ".sif próprio e resposta 'y': trocado pelo link"; else fail_test "troca do .sif próprio" "$(ls -la)"; fi
+
+    rm -f ./*.sif
+    out=$(FAKE_RUNTIME_FAIL=1 TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity docker://falha:1 </dev/null 2>&1)
+    assert_exit_code 1 $? "download falho: exit 1"
+    if [[ ! -e "$FAKE_STORE/falha_1.sif" ]] && ! ls "$FAKE_STORE"/.tmp-* >/dev/null 2>&1; then
+        pass_test "download falho não deixa imagem nem temporário no banco"
+    else
+        fail_test "restos de download falho" "$(ls -la "$FAKE_STORE")"
+    fi
+    cp "$SCRIPT_DIR/tnrx.def" .
+    out=$(FAKE_RUNTIME_FAIL=1 TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install singularity tnrx.def --force </dev/null 2>&1)
+    assert_contains "$out" "gere a imagem em outra máquina" "build falho: explica a alternativa"
+
+    cleanup_test_env
+}
+
+test_missing_sif_prompt() {
+    log_test "Pasta sem .sif: oferece as imagens do banco e cria o link"
+    setup_test_env
+    setup_fake_runtime
+    mkdir proj && cd proj || return
+    local default_name="nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" out
+
+    out=$(HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync </dev/null 2>&1)
+    assert_contains "$out" "Nenhum arquivo .sif encontrado" "sem terminal: erro, sem perguntar"
+
+    out=$(echo n | TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync 2>&1)
+    assert_contains "$out" "[1] $default_name  (padrão; será baixada)" "menu: padrão primeiro, avisando que vai baixar"
+    assert_contains "$out" "Cancelado" "'n' cancela"
+    assert_not_contains "$out" "UV:" "cancelado: o comando não roda"
+
+    echo fake > "$FAKE_STORE/outra_imagem_1.0.sif"
+    out=$(echo 2 | TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync 2>&1)
+    assert_contains "$out" "[2] outra_imagem_1.0.sif" "menu: lista as outras imagens do banco"
+    assert_contains "$out" "EXEC-IMAGE: outra_imagem_1.0.sif" "escolha: cria o link e o comando segue com ela"
+
+    rm -f ./*.sif
+    out=$(echo | TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync 2>&1)
+    assert_contains "$out" "RUNTIME-ARGS: pull" "Enter: baixa a padrão"
+    assert_contains "$out" "EXEC-IMAGE: $default_name" "Enter: liga a padrão e segue"
+
+    rm -f "$FAKE_STORE/$default_name"
+    out=$(TNRX_INTERACTIVE=1 HOME="$PWD/../home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" uv sync </dev/null 2>&1)
+    assert_contains "$out" "aponta para uma imagem que não existe mais" "link quebrado: avisa"
+
+    cleanup_test_env
+}
+
+test_install_setup() {
+    log_test "tnrx install (servidor): uv e a imagem padrão no banco"
+    setup_test_env
+    setup_fake_runtime
+    local out
+    out=$(HOME="$PWD/home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install </dev/null 2>&1)
+    assert_contains "$out" "uv já instalado" "uv existente: não reinstala"
+    assert_file_exists "$FAKE_STORE/nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" "imagem padrão no banco"
+    out=$(HOME="$PWD/home" TNRX_SIF_DIR="$FAKE_STORE" PATH="$FAKE_PATH" "$TNRX_SCRIPT" install </dev/null 2>&1)
+    assert_not_contains "$out" "RUNTIME-ARGS" "segunda vez: não baixa de novo"
+    cleanup_test_env
+}
+
+test_installer() {
+    log_test "install.sh: instalar, update, update-dev e uninstall (repositório git local no lugar do GitHub)"
+    setup_test_env
+    if ! command -v git >/dev/null 2>&1; then
+        pass_test "git ausente: teste do instalador ignorado"
+        cleanup_test_env
+        return
+    fi
+    setup_fake_runtime
+    local g=(git -c user.name=t -c user.email=t@t -c init.defaultBranch=main) out
+    mkdir remote
+    (cd "$SCRIPT_DIR" && git ls-files -z -co --exclude-standard | xargs -0 tar -cf - --) | tar -xf - -C remote
+    (cd remote && "${g[@]}" init -q && "${g[@]}" add -A && "${g[@]}" commit -qm "versão 1")
+    mkdir laptop-bin
+    printf '#!/bin/sh\necho meu-laptop\n' > laptop-bin/hostname
+    chmod +x laptop-bin/hostname
+    local env_laptop=(env HOME="$PWD/home" PATH="$PWD/laptop-bin:$PATH" TNRX_REPO="file://$PWD/remote" TNRX_SKIP_VSCODE=1)
+    local inst="$PWD/home/.local/share/tnrx" bin="$PWD/home/.local/bin"
+
+    # Primeira instalação: responde às perguntas (tnrx, download_huggingface, tnrx-connect).
+    out=$(printf 's\ns\n\n' | "${env_laptop[@]}" TNRX_INTERACTIVE=1 TMPDIR="$PWD/tmp" bash -c 'mkdir -p "$TMPDIR"; bash "$0"' "$SCRIPT_DIR/install.sh" 2>&1)
+    assert_contains "$out" "Instalado em $inst" "primeira instalação (curl | bash) clona e instala"
+    assert_contains "$out" "tnrx: roda os projetos no cluster (servidor) [s/N]" "laptop: tnrx vem desmarcado por padrão"
+    assert_contains "$out" "tnrx-connect: trabalha no projeto do servidor a partir do laptop [S/n]" "laptop: tnrx-connect vem marcado por padrão"
+    assert_contains "$out" "não está em tnrx_hosts.conf: o tnrx só roda" "tnrx escolhido num laptop: avisa que ele só roda nos servidores"
+    assert_not_contains "$out" "Servidor reconhecido" "laptop: não prepara o servidor"
+    if [ -z "$(ls -A tmp)" ]; then pass_test "o clone temporário é apagado"; else fail_test "sobrou o clone temporário" "$(ls -A tmp)"; fi
+    if [[ "$(readlink "$bin/tnrx")" == "$inst/tnrx" && "$(readlink "$bin/tnrx-connect")" == "$inst/tnrx-connect" && "$(readlink "$bin/download_huggingface")" == "$inst/download_huggingface" ]]; then
+        pass_test "links em ~/.local/bin apontam para a pasta da instalação"
+    else
+        fail_test "links" "$(ls -la "$bin")"
+    fi
+    local v1
+    v1=$(git -C remote rev-parse --short HEAD)
+    out=$("${env_laptop[@]}" "$bin/tnrx" version 2>&1)
+    assert_contains "$out" "tnrx $v1" "tnrx version mostra o commit"
+    out=$("${env_laptop[@]}" "$bin/tnrx-connect" --version 2>&1)
+    assert_contains "$out" "tnrx-connect $v1" "tnrx-connect --version mostra o commit"
+
+    echo "# nova linha" >> remote/README.md
+    (cd remote && "${g[@]}" commit -qam "versão 2: muda o README")
+    out=$("${env_laptop[@]}" "$bin/tnrx-connect" update </dev/null 2>&1)
+    assert_not_contains "$out" "O que instalar" "update repete a escolha, sem perguntar"
+    assert_contains "$out" "Atualizado em $inst: $v1 -> $(git -C remote rev-parse --short HEAD)" "update instala o commit novo"
+    assert_contains "$out" "versão 2: muda o README" "update mostra o que mudou"
+    assert_contains "$(tail -1 "$inst/README.md")" "# nova linha" "update troca os arquivos"
+    if ls -d "$inst".old.* "$inst".new.* >/dev/null 2>&1; then
+        fail_test "sobraram pastas temporárias" "$(ls -d "$inst"* )"
+    else
+        pass_test "sem pastas temporárias depois do update"
+    fi
+    out=$("${env_laptop[@]}" "$bin/tnrx" update </dev/null 2>&1)
+    assert_contains "$out" "Já estava na versão mais nova" "update sem novidade avisa"
+    out=$(env HOME="$PWD/home" PATH="$PWD/laptop-bin:$PATH" TNRX_SKIP_VSCODE=1 "$bin/tnrx" update </dev/null 2>&1)
+    assert_contains "$out" "Baixando file://$PWD/remote" "update sem TNRX_REPO usa o repositório da instalação"
+
+    "${g[@]}" clone -q remote dev
+    echo "# mudança local" >> dev/tnrx_hosts.conf
+    mkdir -p dev/.venv && touch dev/.venv/lixo dev/imagem.sif
+    out=$(cd dev && "${env_laptop[@]}" "$bin/tnrx" update-dev </dev/null 2>&1)
+    assert_contains "$out" "Atualizado em $inst" "update-dev (pasta atual) instala a cópia local"
+    assert_contains "$(tail -1 "$inst/tnrx_hosts.conf")" "# mudança local" "update-dev leva mudanças não commitadas"
+    if [[ ! -e "$inst/.venv" && ! -e "$inst/imagem.sif" ]]; then pass_test "update-dev respeita o .gitignore (.venv, *.sif)"; else fail_test "copiou arquivos ignorados"; fi
+    out=$("${env_laptop[@]}" "$bin/tnrx" version 2>&1)
+    assert_contains "$out" "dev:$(cd dev && pwd -P) (com mudanças não commitadas)" "version mostra que é uma cópia de desenvolvimento"
+    out=$("${env_laptop[@]}" "$bin/tnrx-connect" update-dev "$PWD/remote/docs" </dev/null 2>&1)
+    assert_contains "$out" "não é o repositório do tnrx" "update-dev numa pasta errada: erro"
+
+    out=$(env HOME="$PWD/home" PATH="$FAKE_PATH" TNRX_SIF_DIR="$FAKE_STORE" TNRX_REPO="file://$PWD/remote" bash "$inst/install.sh" --update </dev/null 2>&1)
+    assert_contains "$out" "Servidor reconhecido (abaporu)" "servidor: reconhece pelo tnrx_hosts.conf"
+    assert_file_exists "$FAKE_STORE/nvidia_cuda_12.6.3-cudnn-runtime-ubuntu24.04.sif" "servidor: baixa a imagem padrão para o banco"
+
+    out=$(env HOME="$PWD/home2" PATH="$PWD/laptop-bin:$PATH" bash "$SCRIPT_DIR/install.sh" --uninstall </dev/null 2>&1)
+    assert_exit_code 0 $? "sem TNRX_REPO e sem instalação anterior: o instalador não aborta"
+    out=$(printf 's\nn\nn\n' | "${env_laptop[@]}" TNRX_INTERACTIVE=1 "$bin/tnrx" update --choose 2>&1)
+    assert_contains "$out" "O que instalar" "update --choose pergunta de novo"
+    if [[ -L "$bin/tnrx" && ! -e "$bin/tnrx-connect" && ! -e "$bin/download_huggingface" ]]; then
+        pass_test "componentes desmarcados perdem o link"
+    else
+        fail_test "links depois do --choose" "$(ls -la "$bin")"
+    fi
+    assert_contains "$(cat "$inst/VERSION")" "COMPONENTS=tnrx" "a escolha fica gravada em VERSION"
+
+    out=$(printf 'n\nn\n' | env HOME="$PWD/home4" PATH="$PWD/laptop-bin:$PATH" TNRX_INTERACTIVE=1 TNRX_SKIP_VSCODE=1 bash "$inst/install.sh" --from "$PWD/dev" 2>&1)
+    assert_contains "$out" "Nada escolhido" "nada escolhido: não instala"
+    if [ ! -e "$PWD/home4/.local/share/tnrx" ]; then pass_test "nada escolhido: pasta não criada"; else fail_test "instalou sem nada escolhido"; fi
+
+    if command -v setsid >/dev/null 2>&1; then
+        out=$(env HOME="$PWD/home3" PATH="$PWD/laptop-bin:$PATH" TNRX_SKIP_VSCODE=1 setsid -w bash "$inst/install.sh" --from "$PWD/dev" </dev/null 2>&1)
+        assert_contains "$out" "Sem terminal para perguntar: instalando o padrão desta máquina (tnrx-connect)" "sem terminal: padrão do laptop"
+        out=$(env HOME="$PWD/home5" PATH="$FAKE_PATH" TNRX_SIF_DIR="$FAKE_STORE" TNRX_SKIP_SETUP=1 setsid -w bash "$inst/install.sh" --from "$PWD/dev" </dev/null 2>&1)
+        assert_contains "$out" "instalando o padrão desta máquina (tnrx download_huggingface)" "sem terminal: padrão do servidor"
+    fi
+    out=$(env HOME="$PWD/home6" PATH="$PWD/laptop-bin:$PATH" TNRX_COMPONENTS="tnrx-connect,download_huggingface" bash "$inst/install.sh" --from "$PWD/dev" </dev/null 2>&1)
+    if [[ -L "$PWD/home6/.local/bin/tnrx-connect" && -L "$PWD/home6/.local/bin/download_huggingface" && ! -e "$PWD/home6/.local/bin/tnrx" ]]; then
+        pass_test "TNRX_COMPONENTS escolhe sem perguntar"
+    else
+        fail_test "TNRX_COMPONENTS" "$out"
+    fi
+
+    out=$("${env_laptop[@]}" "$bin/tnrx" uninstall </dev/null 2>&1)
+    if [[ ! -e "$bin/tnrx" && ! -L "$bin/tnrx-connect" && ! -d "$inst" ]]; then pass_test "uninstall remove os comandos e a pasta"; else fail_test "uninstall" "$out"; fi
 
     cleanup_test_env
 }
@@ -636,6 +888,12 @@ run_all_tests() {
     test_load_env_vars_wired_into_commands
     test_env_var_parsing_logic
     test_runtime_env_injection
+
+    # Imagem do container
+    test_install_singularity
+    test_missing_sif_prompt
+    test_install_setup
+    test_installer
 
     # Jupyter
     test_jupyter_display_url
