@@ -1,4 +1,4 @@
-# TNRX para VS Code
+# tnrx para VS Code
 
 Barra lateral com o estado do [`tnrx-connect`](../docs/tnrx-connect.md): o que está montado, a configuração de cada projeto (`tnrx.conf`), as GPUs livres no cluster e os Jupyters no ar. E os Jupyters dos projetos no seletor de kernel dos notebooks, sem colar URL. Ela só mostra o que o `tnrx-connect --json` informa ([contrato](../docs/tnrx-connect-json.md)): toda a lógica continua no `tnrx-connect`.
 
@@ -10,11 +10,11 @@ Requer o `tnrx-connect` instalado no laptop ([instruções](../docs/tnrx-connect
 
 ```bash
 cd vscode
-python3 build-vsix.py                                  # gera dist/tnrx-0.1.0.vsix
-code --install-extension dist/tnrx-0.1.0.vsix
+python3 build-vsix.py                                  # gera dist/tnrx-0.2.1.vsix
+code --install-extension dist/tnrx-0.2.1.vsix
 ```
 
-Recarregue a janela (*Developer: Reload Window*). O ícone **TNRX** aparece na barra de atividades. Para atualizar, gere e instale de novo.
+Recarregue a janela (*Developer: Reload Window*). O ícone **tnrx** aparece na barra de atividades. Para atualizar, gere e instale de novo. Ao mudar a extensão, suba a `version` do `package.json`: com a mesma versão, o VS Code reaproveita o que guardou em cache (o ícone, por exemplo, fica o antigo).
 
 ## Os quatro blocos
 
@@ -29,7 +29,7 @@ Montagens e Jupyter atualizam a cada 30 s (o Jupyter só com o bloco visível); 
 
 ## Jupyter no seletor de kernel
 
-Com a extensão Jupyter (`ms-toolsai.jupyter`) instalada, os Jupyters dos projetos aparecem em **Select Kernel → TNRX** num `.ipynb`:
+Com a extensão Jupyter (`ms-toolsai.jupyter`) instalada, os Jupyters dos projetos aparecem em **Select Kernel → tnrx (recod jupyter kernels)** num `.ipynb`:
 
 * **Um servidor por projeto com Jupyter no ar** (o mais recente, como no `tnrx-connect jupyter connect`). Ao escolher, a extensão abre a ponte (`tnrx-connect jupyter connect`, que fica rodando com a janela) e passa a senha do Jupyter por baixo. Se a ponte já estiver aberta (num terminal ou em outra janela), ela só usa.
 * **Iniciar um Jupyter num projeto…**, na mesma lista: escolhe o projeto e roda `tnrx-connect jupyter start` (o `tnrx.conf` do projeto define partição, GPUs e tempo), com o andamento numa notificação que dá para cancelar. Quando o Jupyter sobe, o seletor já conecta nele.
@@ -47,7 +47,7 @@ A extensão só registra a lista quando a extensão Jupyter já está ativa ou q
 | `tnrx.refreshInterval` | `30` | Segundos entre atualizações de Montagens e Jupyter |
 | `tnrx.clusterRefreshInterval` | `300` | Segundos entre consultas ao Cluster; `0` = só no botão |
 
-Os erros do `tnrx-connect` aparecem no próprio bloco e no painel **Output → TNRX**.
+Os erros do `tnrx-connect` aparecem no próprio bloco e no painel **Output → tnrx**.
 
 **Apagar montagem** apaga deste computador a configuração, o cache e os snapshots da pasta (o mesmo que `tnrx-connect forget`). Os arquivos no servidor e a pasta local ficam. Se o cache tiver arquivos que ainda não chegaram ao servidor, ela oferece montar a pasta de novo, para enviá-los, antes de apagar.
 

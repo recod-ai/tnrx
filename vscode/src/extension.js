@@ -1,5 +1,5 @@
 'use strict';
-// Extensão TNRX: barra lateral com quatro blocos (Montagens, Configuração do projeto,
+// Extensão tnrx: barra lateral com quatro blocos (Montagens, Configuração do projeto,
 // Cluster, Jupyter) sobre o `tnrx-connect --json`, e os Jupyters dos projetos no seletor de
 // kernel do VS Code (sem colar URL). Ela nunca autentica: login (senha/2FA), montar e o terminal
 // do servidor são sempre num terminal integrado rodando o tnrx-connect.
@@ -59,7 +59,7 @@ class Tnrx {
         this.jupyterCollection = null;
         this.timers = [];
         this.watchers = [];
-        this.output = vscode.window.createOutputChannel('TNRX');
+        this.output = vscode.window.createOutputChannel('tnrx');
     }
 
     // --- Configuração ---
@@ -192,7 +192,7 @@ class Tnrx {
         const key = `${sub}:${dir}`;
         let term = this.terminals.get(key);
         if (!term || term.exitStatus !== undefined) {
-            term = vscode.window.createTerminal({ name: `TNRX ${label}: ${path.basename(dir)}`, cwd: dir });
+            term = vscode.window.createTerminal({ name: `tnrx ${label}: ${path.basename(dir)}`, cwd: dir });
             this.terminals.set(key, term);
         }
         term.show();
@@ -275,7 +275,7 @@ class Tnrx {
 
     // --- Jupyter no seletor de kernel ---
     //
-    // A extensão Jupyter deixa outra extensão fornecer servidores ("Select Kernel → TNRX"). Cada
+    // A extensão Jupyter deixa outra extensão fornecer servidores ("Select Kernel → tnrx"). Cada
     // projeto com Jupyter no ar vira um servidor; ao escolher, a ponte abre (jupyter connect) e o
     // token vai junto, por baixo: nada de colar URL, nem uma entrada nova por servidor, nem senha.
 
@@ -287,7 +287,7 @@ class Tnrx {
         const register = (api) => {
             if (this.jupyterCollection || !api || typeof api.createJupyterServerCollection !== 'function') return;
             try {
-                const c = api.createJupyterServerCollection('tnrx', 'TNRX (Jupyters do cluster)', {
+                const c = api.createJupyterServerCollection('tnrx', 'tnrx (recod jupyter kernels)', {
                     onDidChangeServers: this.serversChanged.event,
                     provideJupyterServers: () => this.provideJupyterServers(),
                     resolveJupyterServer: (server) => this.resolveJupyterServer(server),
@@ -330,7 +330,7 @@ class Tnrx {
             entry = model.jupyterServers(await this.freshJupyterList(0)).find((e) => e.id === server.id);
         }
         if (!entry) {
-            throw new Error(`O Jupyter de ${server.label.split(' · ')[0]} não está mais no ar (ou o servidor está sem conexão). Inicie outro em Select Kernel → TNRX.`);
+            throw new Error(`O Jupyter de ${server.label.split(' · ')[0]} não está mais no ar (ou o servidor está sem conexão). Inicie outro em Select Kernel → tnrx.`);
         }
         if (entry.server.bridge_open) {
             // Ponte aberta por outro tnrx-connect (um terminal, outra janela): é só usar.
@@ -400,7 +400,7 @@ class Tnrx {
         const list = await this.freshJupyterList();
         const items = model.jupyterStartable(list);
         if (!items.length) {
-            vscode.window.showWarningMessage('Nenhum projeto com conexão: monte um projeto (ou reconecte) na barra lateral do TNRX.');
+            vscode.window.showWarningMessage('Nenhum projeto com conexão: monte um projeto (ou reconecte) na barra lateral do tnrx.');
             return undefined;
         }
         const pick = await vscode.window.showQuickPick(items, { title: 'Iniciar um Jupyter em qual projeto?', placeHolder: 'Usa o tnrx.conf do projeto (partição, GPUs, tempo)' });

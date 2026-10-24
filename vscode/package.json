@@ -1,8 +1,8 @@
 {
   "name": "tnrx",
-  "displayName": "TNRX",
+  "displayName": "tnrx",
   "description": "Montagens do tnrx-connect, configuração do projeto (tnrx.conf), cluster e Jupyter dos projetos no servidor, na barra lateral.",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "publisher": "tnrx",
   "icon": "media/icon.png",
   "license": "UNLICENSED",
@@ -29,7 +29,7 @@
       "activitybar": [
         {
           "id": "tnrx",
-          "title": "TNRX",
+          "title": "tnrx",
           "icon": "media/tnrx.svg"
         }
       ]
@@ -64,97 +64,97 @@
       {
         "command": "tnrx.refresh",
         "title": "Atualizar",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(refresh)"
       },
       {
         "command": "tnrx.mountNew",
         "title": "Montar uma pasta…",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(add)"
       },
       {
         "command": "tnrx.mount",
         "title": "Montar (abre o terminal)",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(play)"
       },
       {
         "command": "tnrx.reconnect",
         "title": "Reconectar (login no terminal)",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(key)"
       },
       {
         "command": "tnrx.ssh",
         "title": "Abrir terminal do servidor",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(terminal)"
       },
       {
         "command": "tnrx.unmount",
         "title": "Desmontar",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(debug-disconnect)"
       },
       {
         "command": "tnrx.openFolder",
         "title": "Abrir pasta em nova janela",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(folder-opened)"
       },
       {
         "command": "tnrx.openLog",
         "title": "Ver log da montagem",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(output)"
       },
       {
         "command": "tnrx.openSlurm",
         "title": "Abrir tnrx.conf",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(go-to-file)"
       },
       {
         "command": "tnrx.reconnectHost",
         "title": "Reconectar (login no terminal)",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(key)"
       },
       {
         "command": "tnrx.jupyterTerminal",
         "title": "Jupyter no terminal (listar, iniciar, conectar)",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(terminal)"
       },
       {
         "command": "tnrx.copyJupyterUrl",
         "title": "Copiar URL do Jupyter",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(copy)"
       },
       {
         "command": "tnrx.editConfigKey",
         "title": "Mudar valor…",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(edit)"
       },
       {
         "command": "tnrx.resetConfigKey",
         "title": "Voltar ao padrão",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(discard)"
       },
       {
         "command": "tnrx.renameMount",
         "title": "Renomear…",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(edit)"
       },
       {
         "command": "tnrx.forgetMount",
         "title": "Apagar montagem…",
-        "category": "TNRX",
+        "category": "tnrx",
         "icon": "$(trash)"
       }
     ],
@@ -303,7 +303,7 @@
       ]
     },
     "configuration": {
-      "title": "TNRX",
+      "title": "tnrx",
       "properties": {
         "tnrx.connectPath": {
           "type": "string",

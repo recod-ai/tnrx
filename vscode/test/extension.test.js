@@ -316,7 +316,7 @@ test('erro do tnrx-connect vira mensagem na vista, sem derrubar as outras', asyn
 
 const collection = () => fake.jupyter.collections.find((c) => c.id === 'tnrx');
 
-test('jupyter: registra a coleção TNRX na extensão Jupyter, um servidor por projeto no ar', async () => {
+test('jupyter: registra a coleção tnrx na extensão Jupyter, um servidor por projeto no ar', async () => {
     assert.ok(collection(), 'coleção registrada');
     const servers = await collection().provider.provideJupyterServers();
     // só o projeto conectado com Jupyter no ar, pelo mais recente (dl-05); o id não depende do job
