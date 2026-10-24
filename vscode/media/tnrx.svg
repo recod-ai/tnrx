@@ -1,10 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-  <rect x="3" y="3" width="13" height="5" rx="1"/>
-  <rect x="3" y="10" width="13" height="5" rx="1"/>
-  <circle cx="6" cy="5.5" r="0.6" fill="currentColor"/>
-  <circle cx="6" cy="12.5" r="0.6" fill="currentColor"/>
-  <path d="M9.5 15v3.5H6"/>
-  <rect x="2" y="17" width="4" height="4" rx="0.8"/>
-  <path d="M19 12v6.5a2.5 2.5 0 0 1-2.5 2.5H12"/>
-  <path d="M19 9.5l2 2.5h-4z" fill="currentColor"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round"><path stroke="currentColor" d="M1.35 12.00L4.25 17.42 M1.35 12.00L9.09 17.38 M1.35 12.00L10.06 6.62 M1.35 12.00L3.28 6.58 M4.25 17.42L12.00 22.80 M4.25 17.42L12.97 12.05 M4.25 17.42L6.19 12.00 M9.09 17.38L12.00 22.80 M9.09 17.38L17.81 12.00 M9.09 17.38L11.03 11.95 M12.00 22.80L20.72 17.42 M12.00 22.80L13.94 17.38 M10.06 6.62L12.97 12.05 M10.06 6.62L17.81 12.00 M10.06 6.62L12.00 1.20 M12.97 12.05L20.72 17.42 M12.97 12.05L14.91 6.62 M17.81 12.00L20.72 17.42 M17.81 12.00L19.75 6.58 M20.72 17.42L22.65 12.00 M3.28 6.58L6.19 12.00 M3.28 6.58L11.03 11.95 M3.28 6.58L12.00 1.20 M6.19 12.00L13.94 17.38 M6.19 12.00L14.91 6.62 M11.03 11.95L13.94 17.38 M11.03 11.95L19.75 6.58 M13.94 17.38L22.65 12.00 M12.00 1.20L14.91 6.62 M12.00 1.20L19.75 6.58 M14.91 6.62L22.65 12.00 M19.75 6.58L22.65 12.00"/></svg>

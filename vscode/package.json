@@ -4,6 +4,7 @@
   "description": "Montagens do tnrx-connect, configuração do projeto (tnrx.conf), cluster e Jupyter dos projetos no servidor, na barra lateral.",
   "version": "0.1.0",
   "publisher": "tnrx",
+  "icon": "media/icon.png",
   "license": "UNLICENSED",
   "private": true,
   "engines": {
@@ -16,7 +17,9 @@
     "ui"
   ],
   "main": "./src/extension.js",
-  "activationEvents": [],
+  "activationEvents": [
+    "onNotebook:jupyter-notebook"
+  ],
   "scripts": {
     "test": "node --test test/",
     "package": "python3 build-vsix.py"

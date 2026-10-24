@@ -6,13 +6,22 @@
 const Module = require('module');
 
 function makeFake() {
-    const calls = { terminals: [], messages: [], executed: [], clipboard: null, opened: [], inputs: [], picks: [] };
+    const calls = { terminals: [], messages: [], executed: [], clipboard: null, opened: [], inputs: [], picks: [], progress: [], cancel: null };
     // input/pick: um valor fixo, ou uma função (que recebe as opções/itens) para respostas em sequência.
     const answers = { warning: undefined, error: undefined, info: undefined, openDialog: undefined, input: undefined, pick: undefined };
     const commands = new Map();
     const views = new Map();
     const settings = {};
-    const listeners = { windowState: [], closeTerminal: [], config: [] };
+    const listeners = { windowState: [], closeTerminal: [], config: [], notebook: [] };
+    // A extensão Jupyter falsa: guarda as coleções de servidores que a extensão registra.
+    const jupyter = { collections: [], ext: null };
+    jupyter.api = {
+        createJupyterServerCollection(id, label, provider) {
+            const c = { id, label, provider, commandProvider: undefined, dispose() {} };
+            jupyter.collections.push(c);
+            return c;
+        },
+    };
 
     class EventEmitter {
         constructor() {
@@ -41,7 +50,7 @@ function makeFake() {
         ThemeIcon: class { constructor(id, color) { this.id = id; this.color = color; } },
         ThemeColor: class { constructor(id) { this.id = id; } },
         ProgressLocation: { Notification: 15 },
-        Uri: { file: (p) => ({ fsPath: p, scheme: 'file' }) },
+        Uri: { file: (p) => ({ fsPath: p, scheme: 'file' }), parse: (u) => ({ toString: () => u, scheme: u.split(':')[0] }) },
         window: {
             createTreeView(id, opts) {
                 const vis = new EventEmitter();
@@ -69,7 +78,7 @@ function makeFake() {
                 return typeof a === 'string' ? items.find((i) => i.label === a) : a;
             },
             showTextDocument: async (uri) => { calls.opened.push(uri.fsPath); },
-            withProgress: async (_opts, fn) => fn(),
+            withProgress: async (_opts, fn) => fn({ report: (r) => calls.progress.push(r) }, { onCancellationRequested: (h) => { calls.cancel = h; } }),
             onDidChangeWindowState: (h) => { listeners.windowState.push(h); return { dispose() {} }; },
             onDidCloseTerminal: (h) => { listeners.closeTerminal.push(h); return { dispose() {} }; },
         },
@@ -87,11 +96,14 @@ function makeFake() {
         workspace: {
             getConfiguration: () => ({ get: (k, d) => (k in settings ? settings[k] : d) }),
             onDidChangeConfiguration: (h) => { listeners.config.push(h); return { dispose() {} }; },
+            onDidOpenNotebookDocument: (h) => { listeners.notebook.push(h); return { dispose() {} }; },
+            notebookDocuments: [],
         },
+        extensions: { getExtension: (id) => (id === 'ms-toolsai.jupyter' ? jupyter.ext : undefined) },
         env: { clipboard: { writeText: async (t) => { calls.clipboard = t; } } },
     };
 
-    return { vscode, calls, answers, commands, views, settings, listeners };
+    return { vscode, calls, answers, commands, views, settings, listeners, jupyter };
 }
 
 function install() {

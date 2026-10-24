@@ -1862,7 +1862,7 @@ connect_picked() {
     fi
     print_bridge "/lab?token=$token"
     if [ "$token" == "$(jupyter_token "$HOST" "$proj")" ] && conf_for_remote "$proj" >/dev/null; then
-        echo "📌 Esta URL é fixa para $(project_label "$proj"): no VS Code, configure uma vez (Existing Jupyter Server) e depois só escolha o servidor."
+        echo "📌 No VS Code com a extensão TNRX: Select Kernel → TNRX (sem colar URL). Sem a extensão, a URL 127.0.0.1 é fixa para $(project_label "$proj"): configure uma vez em Existing Jupyter Server."
     else
         echo "ℹ️  Este Jupyter não usa a senha fixa do projeto (foi iniciado antes dela, ou o tnrx do servidor está desatualizado); a URL vale só para ele."
     fi

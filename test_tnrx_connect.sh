@@ -1316,7 +1316,8 @@ test_jupyter_start_new_with_fixed_url() {
     assert_contains "$out" "Iniciar um novo Jupyter em proj" "pergunta se inicia um novo"
     assert_contains "$out" "job na fila do Slurm" "mostra o progresso (fila)"
     assert_contains "$out" "Jupyter no ar" "avisa quando subiu"
-    assert_contains "$out" "Esta URL é fixa" "explica que a URL é fixa"
+    assert_contains "$out" "Select Kernel → TNRX" "aponta o seletor de kernel do VS Code"
+    assert_contains "$out" "a URL 127.0.0.1 é fixa" "explica que a URL é fixa"
 
     local token conf port
     token=$(cat "$remote/.tnrx/jupyter/token" 2>/dev/null)

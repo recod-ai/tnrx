@@ -1,15 +1,17 @@
 'use strict';
 // Extensão TNRX: barra lateral com quatro blocos (Montagens, Configuração do projeto,
-// Cluster, Jupyter) sobre o `tnrx-connect --json`. Ela nunca autentica: login (senha/2FA), montar e
-// o terminal do servidor são sempre num terminal integrado rodando o tnrx-connect.
+// Cluster, Jupyter) sobre o `tnrx-connect --json`, e os Jupyters dos projetos no seletor de
+// kernel do VS Code (sem colar URL). Ela nunca autentica: login (senha/2FA), montar e o terminal
+// do servidor são sempre num terminal integrado rodando o tnrx-connect.
 
 const vscode = require('vscode');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const model = require('./model');
-const { resolveConnect, runJson, runPlain, shellQuote } = require('./cli');
+const { resolveConnect, runJson, runPlain, runEvents, shellQuote } = require('./cli');
 
+const JUPYTER_EXTENSION = 'ms-toolsai.jupyter';
 const VIEWS = { mounts: 'tnrx.mounts', slurm: 'tnrx.slurm', cluster: 'tnrx.cluster', jupyter: 'tnrx.jupyter' };
 
 class Provider {
@@ -52,6 +54,9 @@ class Tnrx {
         this.loading = {};
         this.lastFetch = {};
         this.terminals = new Map();
+        this.bridges = new Map(); // id do servidor -> { child, conn }: pontes abertas por esta janela
+        this.serversChanged = new vscode.EventEmitter(); // a lista do seletor de kernel mudou
+        this.jupyterCollection = null;
         this.timers = [];
         this.watchers = [];
         this.output = vscode.window.createOutputChannel('TNRX');
@@ -113,6 +118,7 @@ class Tnrx {
         if (!force && !this.views.jupyter.visible) return;
         await this.fetch('jupyter', ['jupyter', 'list', '--json']);
         this.providers.jupyter.refresh();
+        this.serversChanged.fire();
         this.updateMessages();
     }
 
@@ -265,6 +271,164 @@ class Tnrx {
     mountForHost(host) {
         const ms = (this.status && this.status.mounts) || [];
         return ms.find((m) => m.host === host && m.state === 'mounted') || ms.find((m) => m.host === host);
+    }
+
+    // --- Jupyter no seletor de kernel ---
+    //
+    // A extensão Jupyter deixa outra extensão fornecer servidores ("Select Kernel → TNRX"). Cada
+    // projeto com Jupyter no ar vira um servidor; ao escolher, a ponte abre (jupyter connect) e o
+    // token vai junto, por baixo: nada de colar URL, nem uma entrada nova por servidor, nem senha.
+
+    registerJupyterServers() {
+        // Só com a extensão Jupyter já ativa (ou ao abrir um notebook): ativá-la à toa pesa.
+        if (this.jupyterCollection) return;
+        const ext = vscode.extensions.getExtension(JUPYTER_EXTENSION);
+        if (!ext) return;
+        const register = (api) => {
+            if (this.jupyterCollection || !api || typeof api.createJupyterServerCollection !== 'function') return;
+            try {
+                const c = api.createJupyterServerCollection('tnrx', 'TNRX (Jupyters do cluster)', {
+                    onDidChangeServers: this.serversChanged.event,
+                    provideJupyterServers: () => this.provideJupyterServers(),
+                    resolveJupyterServer: (server) => this.resolveJupyterServer(server),
+                });
+                c.commandProvider = {
+                    provideCommands: () => [{ label: 'Iniciar um Jupyter num projeto…', description: 'tnrx uvslurm jupyter lab' }],
+                    handleCommand: () => this.startJupyterFromPicker(),
+                };
+                this.jupyterCollection = c;
+                this.context.subscriptions.push(c);
+            } catch (e) {
+                this.output.appendLine(`não consegui registrar os servidores no Jupyter: ${e.message}`);
+            }
+        };
+        if (ext.isActive) register(ext.exports);
+        else ext.activate().then(register, (e) => this.output.appendLine(`extensão Jupyter não ativou: ${e.message}`));
+    }
+
+    async freshJupyterList(maxAgeSecs = 10) {
+        if (!this.jupyter || !this.lastFetch.jupyter || Date.now() - this.lastFetch.jupyter > maxAgeSecs * 1000) {
+            await this.refreshJupyter(true);
+        }
+        return this.jupyter;
+    }
+
+    async provideJupyterServers() {
+        const list = await this.freshJupyterList();
+        return model.jupyterServers(list).map((e) => ({ id: e.id, label: e.label }));
+    }
+
+    connection(localPort, token) {
+        return { baseUrl: vscode.Uri.parse(`http://127.0.0.1:${localPort}/`), token };
+    }
+
+    async resolveJupyterServer(server) {
+        const held = this.bridges.get(server.id);
+        if (held && held.conn) return { ...server, connectionInformation: held.conn };
+        let entry = model.jupyterServers(this.jupyter).find((e) => e.id === server.id);
+        if (!entry || !entry.server.bridge_open) {
+            entry = model.jupyterServers(await this.freshJupyterList(0)).find((e) => e.id === server.id);
+        }
+        if (!entry) {
+            throw new Error(`O Jupyter de ${server.label.split(' · ')[0]} não está mais no ar (ou o servidor está sem conexão). Inicie outro em Select Kernel → TNRX.`);
+        }
+        if (entry.server.bridge_open) {
+            // Ponte aberta por outro tnrx-connect (um terminal, outra janela): é só usar.
+            return { ...server, connectionInformation: this.connection(entry.server.local_port, entry.server.token) };
+        }
+        const conn = await this.openBridge(entry);
+        return { ...server, connectionInformation: conn };
+    }
+
+    openBridge(entry) {
+        // `jupyter connect` fica rodando enquanto a ponte existir: o processo fica com a janela.
+        const { host, project } = entry;
+        const args = ['jupyter', 'connect', '--host', host, '--project', project.remote_path, '--json'];
+        return vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: `Abrindo a ponte para o Jupyter de ${project.name}…` },
+            () => new Promise((resolve, reject) => {
+                let settled = false;
+                const held = { child: null, conn: null };
+                const { child, done } = runEvents(this.bin(), args, (ev) => {
+                    if (ev.event === 'bridge' && !settled) {
+                        settled = true;
+                        held.conn = this.connection(ev.server.local_port, ev.server.token);
+                        this.bridges.set(entry.id, held);
+                        this.output.appendLine(`ponte aberta: ${project.name} -> 127.0.0.1:${ev.server.local_port}`);
+                        resolve(held.conn);
+                    } else if (ev.event === 'error' && !settled) {
+                        settled = true;
+                        reject(this.bridgeError(host, ev.code, ev.message));
+                    } else if (ev.event === 'closed') {
+                        this.output.appendLine(`ponte fechada (${project.name}): ${ev.reason}`);
+                        if (ev.reason === 'connection_lost') this.offerReconnect(host, `A conexão com ${host} caiu e a ponte do Jupyter de ${project.name} fechou.`);
+                    }
+                });
+                held.child = child;
+                done.then(({ code, stderr }) => {
+                    if (this.bridges.get(entry.id) === held) this.bridges.delete(entry.id);
+                    if (!settled) {
+                        settled = true;
+                        reject(this.bridgeError(host, 'exit', (stderr || '').trim().split('\n').pop() || `tnrx-connect saiu com ${code}`));
+                    }
+                    this.refreshJupyter(true);
+                }, (e) => {
+                    if (!settled) {
+                        settled = true;
+                        reject(e);
+                    }
+                });
+            }));
+    }
+
+    bridgeError(host, code, message) {
+        if (code === 'not_connected') {
+            this.offerReconnect(host, `Sem conexão com ${host}: faça o login para abrir a ponte do Jupyter.`);
+        }
+        return new Error(message || 'Não consegui abrir a ponte do Jupyter.');
+    }
+
+    async offerReconnect(host, text) {
+        const pick = await vscode.window.showWarningMessage(text, 'Reconectar (login no terminal)');
+        const m = pick && this.mountForHost(host);
+        if (m) this.openTerminal(m.local_dir, 'mount', 'mount');
+    }
+
+    async startJupyterFromPicker() {
+        // "Iniciar um Jupyter num projeto…" no seletor: escolhe o projeto, roda `jupyter start`
+        // (pode esperar na fila do Slurm) e devolve o servidor, que o seletor então conecta.
+        const list = await this.freshJupyterList();
+        const items = model.jupyterStartable(list);
+        if (!items.length) {
+            vscode.window.showWarningMessage('Nenhum projeto com conexão: monte um projeto (ou reconecte) na barra lateral do TNRX.');
+            return undefined;
+        }
+        const pick = await vscode.window.showQuickPick(items, { title: 'Iniciar um Jupyter em qual projeto?', placeHolder: 'Usa o tnrx.conf do projeto (partição, GPUs, tempo)' });
+        if (!pick) return undefined;
+        const { host, project } = pick;
+        const args = ['jupyter', 'start', '--host', host, '--project', project.remote_path, '--json'];
+        const PHASES = { preparing: 'preparando', queued: 'na fila do Slurm', starting: 'job alocado, Jupyter subindo' };
+        const ok = await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: `Iniciando um Jupyter em ${project.name}`, cancellable: true },
+            (progress, cancel) => new Promise((resolve) => {
+                let failure = null;
+                const { child, done } = runEvents(this.bin(), args, (ev) => {
+                    if (ev.event === 'waiting') progress.report({ message: PHASES[ev.phase] || ev.phase });
+                    else if (ev.event === 'error') failure = ev.message || ev.code;
+                });
+                if (cancel) cancel.onCancellationRequested(() => child && child.kill('SIGTERM'));
+                done.then(({ code, stderr }) => {
+                    if (code === 0) return resolve(true);
+                    if (code !== 130) vscode.window.showErrorMessage(`Não consegui iniciar o Jupyter em ${project.name}.`, { modal: true, detail: failure || stderr });
+                    resolve(false);
+                }, (e) => {
+                    vscode.window.showErrorMessage(e.message);
+                    resolve(false);
+                });
+            }));
+        if (!ok) return undefined;
+        const entry = model.jupyterServers(await this.freshJupyterList(0)).find((e) => e.id === model.jupyterServerId(host, project.remote_path));
+        return entry ? { id: entry.id, label: entry.label } : undefined;
     }
 
     // --- Comandos ---
@@ -449,9 +613,12 @@ class Tnrx {
                 setTimeout(() => this.refreshAll(), 500);
             }),
             vscode.workspace.onDidChangeConfiguration((e) => e.affectsConfiguration('tnrx') && (this.startTimers(), this.refreshAll())),
+            vscode.workspace.onDidOpenNotebookDocument(() => this.registerJupyterServers()),
             { dispose: () => this.dispose() },
         );
         this.registerCommands();
+        const jupyterExt = vscode.extensions.getExtension(JUPYTER_EXTENSION);
+        if ((jupyterExt && jupyterExt.isActive) || vscode.workspace.notebookDocuments.length) this.registerJupyterServers();
         this.watchState();
         this.startTimers();
         this.refreshStatus().then(() => {
@@ -461,6 +628,7 @@ class Tnrx {
     }
 
     dispose() {
+        for (const b of this.bridges.values()) b.child && b.child.kill('SIGTERM'); // fecha as pontes desta janela
         for (const t of this.timers) clearInterval(t);
         for (const w of this.watchers) w.close();
         this.output.dispose();

@@ -284,4 +284,48 @@ function jupyterTree(list, now) {
     return out.sort((a, b) => (b.children[0].server ? 1 : 0) - (a.children[0].server ? 1 : 0) || a.label.localeCompare(b.label));
 }
 
-module.exports = { fmtAge, fmtDate, mountsTree, slurmTree, clusterTree, jupyterTree, projectOfJob, mountStatus, SLURM_ORDER, KEY_HELP, validateConfigValue };
+// --- Jupyter no seletor de kernel do VS Code ---
+
+function jupyterServers(list) {
+    // Um servidor por projeto com Jupyter no ar: o mais recente (o mesmo que o `jupyter connect`
+    // sem --job abre). O id é host+projeto, não o job: a porta local e o token são fixos por
+    // projeto, então o notebook continua ligado ao "mesmo" servidor quando o job muda.
+    const out = [];
+    if (!list || !list.hosts) return out;
+    for (const h of list.hosts) {
+        if (!h.connected) continue;
+        for (const p of h.projects) {
+            const servers = [...(p.servers || [])].sort((a, b) => (b.started || 0) - (a.started || 0));
+            if (!servers.length) continue;
+            const s = servers[0];
+            out.push({
+                id: jupyterServerId(h.host, p.remote_path),
+                label: `${p.name} · ${s.node} (job ${s.job})`,
+                host: h.host,
+                project: p,
+                server: s,
+            });
+        }
+    }
+    return out.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function jupyterServerId(host, remotePath) {
+    return `${host}|${remotePath}`;
+}
+
+function jupyterStartable(list) {
+    // Projetos onde dá para iniciar um Jupyter: host conectado (o login é no terminal, não aqui).
+    const out = [];
+    if (!list || !list.hosts) return out;
+    for (const h of list.hosts) {
+        if (!h.connected) continue;
+        for (const p of h.projects) {
+            const running = (p.servers || []).length;
+            out.push({ host: h.host, project: p, label: p.name, description: `${h.host}${running ? ` · ${running} no ar` : ''}`, detail: p.remote_path });
+        }
+    }
+    return out.sort((a, b) => a.label.localeCompare(b.label));
+}
+
+module.exports = { fmtAge, fmtDate, mountsTree, slurmTree, clusterTree, jupyterTree, jupyterServers, jupyterServerId, jupyterStartable, projectOfJob, mountStatus, SLURM_ORDER, KEY_HELP, validateConfigValue };

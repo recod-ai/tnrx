@@ -29,7 +29,14 @@ echo "$*" >> '${callsLog}'
 case "$1" in
   status) cat '${tmp}/status.json' ;;
   cluster) cat '${tmp}/cluster.json' ;;
-  jupyter) cat '${tmp}/jupyter.json' ;;
+  jupyter) case "$2" in
+      connect) if [ -f '${tmp}/connect_err' ]; then echo '{"v":1,"event":"error","code":"not_connected","message":"Sem conexão com recod-headnode."}'; exit 3; fi
+               trap 'echo "{\"v\":1,\"event\":\"closed\",\"reason\":\"signal\"}"; exit 130' TERM
+               echo '{"v":1,"event":"bridge","host":"recod-headnode","project":"/home/u/proj","fixed_port":true,"server":{"node":"dl-02","port":8889,"job":"104400","token":"bb","bridge_open":true,"local_port":18342}}'
+               sleep 30 & wait ;;
+      start) echo '{"v":1,"event":"launching"}'; echo '{"v":1,"event":"waiting","phase":"queued"}'; echo '{"v":1,"event":"ready","server":{}}' ;;
+      *) cat '${tmp}/jupyter.json' ;;
+    esac ;;
   umount) rc=$(cat '${tmp}/umount_rc' 2>/dev/null || echo 0); [ "$rc" != 0 ] && echo "❌ Ainda em uso." >&2; exit "$rc" ;;
   config) if [ -f '${tmp}/config_err' ]; then echo '{"v":1,"ok":false,"error":{"code":"invalid_value","message":"GPUS: use um número inteiro."}}'; exit 2; fi
           echo '{"v":1,"ok":true,"dir":"x","slurm":null}' ;;
@@ -53,6 +60,8 @@ let tnrx;
 const roots = (id) => fake.views.get(id).provider.getChildren();
 const item = (id, label) => roots(id).find((n) => n.label === label);
 const calls = () => (fs.existsSync(callsLog) ? fs.readFileSync(callsLog, 'utf8').split('\n').filter(Boolean) : []);
+
+fake.jupyter.ext = { isActive: true, exports: fake.jupyter.api }; // a extensão Jupyter já está ativa
 
 test.before(async () => {
     tnrx = ext.activate(context);
@@ -301,4 +310,75 @@ test('erro do tnrx-connect vira mensagem na vista, sem derrubar as outras', asyn
     writeFakeCli();
     await tnrx.refreshCluster(true);
     assert.equal(fake.views.get('tnrx.cluster').message, undefined);
+});
+
+// --- Jupyter no seletor de kernel ---
+
+const collection = () => fake.jupyter.collections.find((c) => c.id === 'tnrx');
+
+test('jupyter: registra a coleção TNRX na extensão Jupyter, um servidor por projeto no ar', async () => {
+    assert.ok(collection(), 'coleção registrada');
+    const servers = await collection().provider.provideJupyterServers();
+    // só o projeto conectado com Jupyter no ar, pelo mais recente (dl-05); o id não depende do job
+    assert.deepEqual(servers, [{ id: 'recod-headnode|/home/u/proj', label: 'proj · dl-05 (job 104472)' }]);
+});
+
+test('jupyter: servidor com ponte aberta conecta direto, com o token, sem rodar o connect', async () => {
+    const before = calls().length;
+    const s = await collection().provider.resolveJupyterServer({ id: 'recod-headnode|/home/u/proj', label: 'proj' });
+    assert.equal(s.connectionInformation.baseUrl.toString(), 'http://127.0.0.1:18342/');
+    assert.equal(s.connectionInformation.token, 'aa');
+    assert.ok(!calls().slice(before).some((c) => c.startsWith('jupyter connect')));
+});
+
+test('jupyter: sem ponte, abre com jupyter connect e mantém o processo até fechar a janela', async () => {
+    const j = JSON.parse(JSON.stringify(fx.jupyter));
+    j.hosts[0].projects[1].servers = [j.hosts[0].projects[1].servers[1]]; // só o dl-02, sem ponte
+    fs.writeFileSync(path.join(tmp, 'jupyter.json'), JSON.stringify(j));
+    await tnrx.refreshJupyter(true);
+    const s = await collection().provider.resolveJupyterServer({ id: 'recod-headnode|/home/u/proj', label: 'proj · dl-02' });
+    assert.equal(s.connectionInformation.baseUrl.toString(), 'http://127.0.0.1:18342/');
+    assert.equal(s.connectionInformation.token, 'bb');
+    assert.ok(calls().includes('jupyter connect --host recod-headnode --project /home/u/proj --json'));
+    const held = tnrx.bridges.get('recod-headnode|/home/u/proj');
+    assert.ok(held && held.child.exitCode === null, 'a ponte continua aberta');
+    // escolher de novo reaproveita a ponte desta janela
+    const again = await collection().provider.resolveJupyterServer({ id: 'recod-headnode|/home/u/proj', label: 'proj' });
+    assert.equal(again.connectionInformation.token, 'bb');
+    assert.equal(calls().filter((c) => c.startsWith('jupyter connect')).length, 1);
+    const exited = new Promise((r) => held.child.on('close', r));
+    tnrx.dispose(); // fechar a janela fecha a ponte
+    await exited;
+    writeFakeCli();
+});
+
+test('jupyter: sem conexão, o erro do connect vira erro do seletor e oferece reconectar', async () => {
+    const j = JSON.parse(JSON.stringify(fx.jupyter));
+    j.hosts[0].projects[1].servers = [j.hosts[0].projects[1].servers[1]];
+    fs.writeFileSync(path.join(tmp, 'jupyter.json'), JSON.stringify(j));
+    fs.writeFileSync(path.join(tmp, 'connect_err'), '');
+    tnrx.bridges.clear();
+    await tnrx.refreshJupyter(true);
+    await assert.rejects(collection().provider.resolveJupyterServer({ id: 'recod-headnode|/home/u/proj', label: 'proj' }), /Sem conexão/);
+    assert.ok(fake.calls.messages.some(([kind, msg]) => kind === 'warning' && /login/.test(msg)));
+    fs.rmSync(path.join(tmp, 'connect_err'));
+    writeFakeCli();
+    await tnrx.refreshJupyter(true);
+});
+
+test('jupyter: projeto que saiu do ar dá erro claro', async () => {
+    await assert.rejects(collection().provider.resolveJupyterServer({ id: 'recod-headnode|/home/u/outro', label: 'outro' }), /não está mais no ar/);
+});
+
+test('jupyter: "Iniciar um Jupyter num projeto…" roda jupyter start e devolve o servidor', async () => {
+    const cmds = await collection().commandProvider.provideCommands();
+    assert.equal(cmds.length, 1);
+    fake.answers.pick = 'proj';
+    const server = await collection().commandProvider.handleCommand(cmds[0]);
+    fake.answers.pick = undefined;
+    assert.ok(calls().includes('jupyter start --host recod-headnode --project /home/u/proj --json'));
+    assert.ok(fake.calls.progress.some((p) => p.message === 'na fila do Slurm'));
+    assert.deepEqual(server, { id: 'recod-headnode|/home/u/proj', label: 'proj · dl-05 (job 104472)' });
+    // só projetos de hosts conectados aparecem para escolher
+    assert.deepEqual(fake.calls.picks.at(-1).items.map((i) => i.label), ['outro', 'proj']);
 });

@@ -20,6 +20,7 @@ CONTENT_TYPES = """<?xml version="1.0" encoding="utf-8"?>
   <Default Extension=".js" ContentType="application/javascript"/>
   <Default Extension=".md" ContentType="text/markdown"/>
   <Default Extension=".svg" ContentType="image/svg+xml"/>
+  <Default Extension=".png" ContentType="image/png"/>
   <Default Extension=".vsixmanifest" ContentType="text/xml"/>
 </Types>
 """
@@ -27,6 +28,10 @@ CONTENT_TYPES = """<?xml version="1.0" encoding="utf-8"?>
 
 def manifest(pkg):
     kind = ",".join(pkg.get("extensionKind", ["workspace"]))
+    # o ícone da página da extensão (o logo do recod.ai, colorido)
+    icon = f"\n    <Icon>extension/{escape(pkg['icon'])}</Icon>" if pkg.get("icon") else ""
+    icon_asset = (f'\n    <Asset Type="Microsoft.VisualStudio.Services.Icons.Default" Path="extension/{escape(pkg["icon"])}" Addressable="true"/>'
+                  if pkg.get("icon") else "")
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <PackageManifest Version="2.0.0" xmlns="http://schemas.microsoft.com/developer/vsx-schema/2011" xmlns:d="http://schemas.microsoft.com/developer/vsx-schema-design/2011">
   <Metadata>
@@ -35,7 +40,7 @@ def manifest(pkg):
     <Description xml:space="preserve">{escape(pkg['description'])}</Description>
     <Tags></Tags>
     <Categories>{escape(",".join(pkg.get("categories", [])))}</Categories>
-    <GalleryFlags>Public</GalleryFlags>
+    <GalleryFlags>Public</GalleryFlags>{icon}
     <Properties>
       <Property Id="Microsoft.VisualStudio.Code.Engine" Value="{escape(pkg['engines']['vscode'])}"/>
       <Property Id="Microsoft.VisualStudio.Code.ExtensionDependencies" Value=""/>
@@ -50,7 +55,7 @@ def manifest(pkg):
   <Dependencies/>
   <Assets>
     <Asset Type="Microsoft.VisualStudio.Code.Manifest" Path="extension/package.json" Addressable="true"/>
-    <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>
+    <Asset Type="Microsoft.VisualStudio.Services.Content.Details" Path="extension/README.md" Addressable="true"/>{icon_asset}
   </Assets>
 </PackageManifest>
 """

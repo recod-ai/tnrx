@@ -201,12 +201,20 @@ Conectar em qual [1]:
   ```
   🌐 Abra no navegador:  http://dl-05.recod-headnode.localhost:18342/lab?token=...
      Programas que não resolvem *.localhost (ex.: VS Code): http://127.0.0.1:18342/lab?token=...
-  📌 Esta URL é fixa para meu-projeto: no VS Code, configure uma vez (Existing Jupyter Server) e depois só escolha o servidor.
+  📌 No VS Code com a extensão TNRX: Select Kernel → TNRX (sem colar URL). Sem a extensão, a URL 127.0.0.1 é fixa para meu-projeto: configure uma vez em Existing Jupyter Server.
   ```
 
 * Deixe essa aba aberta enquanto usa o Jupyter. `Ctrl-C` fecha só a ponte: o Jupyter continua no servidor e você reconecta depois com o mesmo comando. Para encerrar o Jupyter: `tnrx-connect cluster cancel <job>`.
 
-**A URL é fixa por projeto.** A porta local (entre 18000 e 18999) e a senha são sempre as mesmas para o mesmo projeto, mesmo que o Jupyter caia em outro nó. Assim, o VS Code lembra do servidor:
+**No VS Code, com a [extensão TNRX](../vscode/README.md#jupyter-no-seletor-de-kernel), não há URL para colar.** Abra o `.ipynb` na pasta montada e clique em **Select Kernel → TNRX**:
+
+1. Escolha o projeto na lista (cada projeto com Jupyter no ar aparece uma vez). A extensão abre a ponte e passa a senha sozinha.
+2. Escolha o kernel `Python (TNRX-<pasta do projeto>)`.
+3. Sem Jupyter no ar, **Iniciar um Jupyter num projeto…**, na mesma lista, faz o mesmo que o `n` acima.
+
+O VS Code guarda a escolha por projeto, não por job: quando o Jupyter cai em outro nó, o notebook continua no mesmo servidor TNRX. A ponte aberta pela extensão fecha junto com a janela do VS Code.
+
+**Sem a extensão, a URL é fixa por projeto.** A porta local (entre 18000 e 18999) e a senha são sempre as mesmas para o mesmo projeto, mesmo que o Jupyter caia em outro nó. Assim, o VS Code lembra do servidor:
 
 1. Abra o `.ipynb` na pasta montada, clique em **Select Kernel → Existing Jupyter Server** e cole o link `127.0.0.1`.
 2. Escolha o kernel `Python (TNRX-<pasta do projeto>)`.

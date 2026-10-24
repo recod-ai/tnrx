@@ -1,7 +1,7 @@
 'use strict';
 // Chama o `tnrx-connect` (no laptop). Toda a lógica fica nele; aqui só se roda e lê o JSON.
 
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -81,8 +81,43 @@ function runPlain(bin, args, { timeoutMs = 180000, env = process.env } = {}) {
     });
 }
 
+function runEvents(bin, args, onEvent, { env = process.env } = {}) {
+    // Comandos de eventos (`jupyter start`/`jupyter connect` com --json): chama onEvent com cada
+    // objeto, uma linha por vez, e devolve { child, done }. done resolve com o código de saída;
+    // para parar, mande SIGTERM ao child (o tnrx-connect cancela/fecha e sai com 130).
+    if (!bin) {
+        const err = new CliError('not_found', 'tnrx-connect não encontrado. Configure tnrx.connectPath.');
+        return { child: null, done: Promise.reject(err) };
+    }
+    const child = spawn(bin, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let buf = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) {
+            const line = buf.slice(0, nl).trim();
+            buf = buf.slice(nl + 1);
+            if (!line.startsWith('{')) continue;
+            try {
+                onEvent(JSON.parse(line));
+            } catch {
+                // linha que não é JSON (não deveria haver com --json): ignora
+            }
+        }
+    });
+    child.stderr.on('data', (chunk) => {
+        stderr = (stderr + chunk).slice(-4000);
+    });
+    const done = new Promise((resolve) => {
+        child.on('error', (e) => resolve({ code: 127, stderr: e.message }));
+        child.on('close', (code, signal) => resolve({ code: code === null ? (signal ? 130 : 1) : code, stderr }));
+    });
+    return { child, done };
+}
+
 function shellQuote(s) {
     return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }
 
-module.exports = { resolveConnect, runJson, runPlain, shellQuote, CliError };
+module.exports = { resolveConnect, runJson, runPlain, runEvents, shellQuote, CliError };

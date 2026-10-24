@@ -90,6 +90,11 @@ Os testes carregam a extensão com um `vscode` falso, e o `.vsix` foi aceito pel
 | ☐ | Editar a configuração | No bloco Configuração do projeto, clique em `PARTITION`, `GPUS` e `IMAGE` | A lista de partições mostra as GPUs livres; o valor muda no `tnrx.conf` da pasta montada e o bloco atualiza; um valor inválido é recusado na própria caixa |
 | ☐ | Renomear | Menu de contexto de uma montagem → Renomear | O nome novo aparece em Montagens, Configuração e Jupyter |
 | ☐ | Apagar montagem | Numa pasta desmontada: menu de contexto → Apagar montagem | Pede confirmação e some da lista; a pasta local e os arquivos no servidor continuam |
+| ☐ | Jupyter no seletor de kernel | Com um Jupyter no ar: abra um `.ipynb` → Select Kernel → TNRX → o projeto | A ponte abre sozinha (sem colar URL nem digitar senha) e os kernels do projeto aparecem |
+| ☐ | Iniciar pelo seletor | Sem Jupyter no ar: Select Kernel → TNRX → Iniciar um Jupyter num projeto… | Notificação com "na fila do Slurm"/"job alocado"; cancelar cancela o job; ao subir, o seletor conecta |
+| ☐ | Mesmo servidor depois de trocar o job | `scancel` o Jupyter, inicie outro (pode cair em outro nó), reabra o notebook | O notebook volta ao mesmo servidor TNRX, sem entrada nova na lista |
+| ☐ | Sem conexão | Derrube a conexão e escolha um servidor TNRX | Erro claro no seletor e o aviso com Reconectar |
+| ☐ | Ícone do recod | Barra de atividades (tema claro e escuro) e a página da extensão | O hipercubo na barra; o logo colorido na página |
 
 ## 5. `tnrx` no servidor
 
